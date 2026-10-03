@@ -11,6 +11,7 @@
   --b-canvas: #F4F6F5;
   --b-forest-dark: #051C12;
   --b-forest-medium: #072F1F;
+  --b-forest-light: #1A3E30;
   --b-lime: #B4F105;
   --b-lime-hover: #c1f824;
   --b-lime-translucent: rgba(180, 241, 5, 0.18);
@@ -297,9 +298,12 @@ body.brand-ui-dark #sysModalOk:hover {
 }
 
 /* ============ Общие акценты по всему приложению (дашборд/ноды/настройки) ============
-   Применяется везде через .brand-ui, но НЕ трогает индиго/зелёный/фиолетовые
-   акценты КОНКРЕТНЫХ метрик (CPU=indigo, RAM=purple text-purple-600 на цифрах
-   статов, Disk=green) — те остаются смысловыми, не декоративными. Здесь только
+   Применяется везде через .brand-ui. Disk остаётся зелёным (совпадает с
+   --sys-green реальной панели vk-pepe.ru). CPU(indigo)/RAM(purple) НИЖЕ
+   переопределены отдельно — проверил живую палитру vk-pepe.ru: там нет ни
+   indigo, ни purple вообще (только forest/lime + blue #2563EB + sys-green/
+   orange/red строго для статусов) — так что эти два были не "семантикой",
+   а дефолтным Tailwind, который просто никогда не трогали. Здесь только
    голубая/синяя "primary action" семья, которая реально декоративна. */
 body.brand-ui:not(#main-card) .text-blue-500,
 body.brand-ui .text-blue-600 {
@@ -388,4 +392,58 @@ html.dark body.brand-ui > nav .bg-blue-500\/10 {
 body.brand-ui > nav button:focus-visible {
   outline: 2px solid var(--b-lime) !important;
   outline-offset: 2px;
+}
+
+/* ============ Dashboard quick-stats: карточка ПРОЦЕССОР (было indigo) ============
+   Яркий лайм — основной сигнальный акцент бренда. Работает и как "нормальное"
+   состояние, и как "активное" до срабатывания порога (applyAgentWarning сам
+   переключает на orange/red при превышении, эти классы не трогаем). */
+body.brand-ui .text-indigo-600 {
+  color: var(--b-forest-dark) !important;
+}
+html.dark body.brand-ui .text-indigo-400 {
+  color: var(--b-lime) !important;
+}
+body.brand-ui .bg-indigo-100 {
+  background-color: var(--b-lime-translucent) !important;
+}
+html.dark body.brand-ui .bg-indigo-500\/20 {
+  background-color: rgba(180, 241, 5, 0.18) !important;
+}
+body.brand-ui .bg-indigo-500 {
+  background-color: var(--b-lime) !important;
+}
+body.brand-ui .bg-indigo-500\/10 {
+  background-color: var(--b-lime-translucent) !important;
+}
+body.brand-ui .group:hover .group-hover\:bg-indigo-500\/20 {
+  background-color: rgba(180, 241, 5, 0.3) !important;
+}
+
+/* ============ Dashboard quick-stats: карточка ОЗУ (было purple) ============
+   Тёмный forest-тон вместо лайма — чтобы визуально отличаться от соседней
+   карточки CPU, оставаясь строго в палитре бренда (forest-medium/forest-dark). */
+body.brand-ui .text-purple-600 {
+  color: var(--b-forest-medium) !important;
+}
+html.dark body.brand-ui .text-purple-400 {
+  color: #EAF7D8 !important;
+}
+body.brand-ui .bg-purple-100 {
+  background-color: var(--b-lime-translucent) !important;
+}
+html.dark body.brand-ui .bg-purple-500\/20 {
+  background-color: var(--b-forest-medium) !important;
+}
+body.brand-ui .bg-purple-500 {
+  background-color: var(--b-forest-medium) !important;
+}
+html.dark body.brand-ui .bg-purple-500 {
+  background-color: var(--b-forest-light, #1A3E30) !important;
+}
+body.brand-ui .bg-purple-500\/10 {
+  background-color: var(--b-lime-translucent) !important;
+}
+body.brand-ui .group:hover .group-hover\:bg-purple-500\/20 {
+  background-color: rgba(180, 241, 5, 0.3) !important;
 }
