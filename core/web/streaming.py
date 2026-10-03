@@ -125,6 +125,9 @@ async def _is_allowed_terminal_host(host: str) -> bool:
     return normalized_host in allowed_node_ips
 
 
+_PROC_CPU_CACHE: dict[int, Any] = {}
+
+
 def _get_top_processes(metric: str) -> list[str]:
     import psutil
 
@@ -136,22 +139,35 @@ def _get_top_processes(metric: str) -> list[str]:
         return f"{num:.1f} PB"
 
     try:
-        attrs = ["pid", "name", "cpu_percent", "memory_percent"]
+        attrs = ["pid", "name", "memory_percent"]
         if metric == "disk":
             attrs.append("io_counters")
 
         processes: list[dict[str, Any]] = []
+        seen_pids: set[int] = set()
         for proc in psutil.process_iter(attrs):
             try:
                 info = proc.info
+                pid = info["pid"]
+                seen_pids.add(pid)
                 info["name"] = str(info.get("name", ""))[:15]
+                if metric == "cpu":
+                    # psutil needs the SAME Process instance across two calls to
+                    # compute a real delta - a fresh object (as process_iter yields
+                    # every tick) always reports 0.0% on its first read. Cache the
+                    # instance per pid so the next tick sees a meaningful value.
+                    cached_proc = _PROC_CPU_CACHE.setdefault(pid, proc)
+                    info["cpu_percent"] = cached_proc.cpu_percent(None)
                 processes.append(info)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
 
         if metric == "cpu":
+            for pid in list(_PROC_CPU_CACHE):
+                if pid not in seen_pids:
+                    del _PROC_CPU_CACHE[pid]
             sorted_processes = sorted(processes, key=lambda p: p.get("cpu_percent", 0), reverse=True)[:5]
-            return [f"{p['name']} ({p.get('cpu_percent', 0)}%)" for p in sorted_processes]
+            return [f"{p['name']} ({round(p.get('cpu_percent', 0), 1)}%)" for p in sorted_processes]
 
         if metric == "ram":
             sorted_processes = sorted(processes, key=lambda p: p.get("memory_percent", 0), reverse=True)[:5]
@@ -247,9 +263,6 @@ async def handle_sse_stream(request: web.Request) -> web.StreamResponse:
                 mem = psutil.virtual_memory()
                 disk = psutil.disk_usage(get_host_path("/"))
                 freq = psutil.cpu_freq()
-                proc_cpu = await asyncio.to_thread(_get_top_processes, "cpu")
-                proc_ram = await asyncio.to_thread(_get_top_processes, "ram")
-                proc_disk = await asyncio.to_thread(_get_top_processes, "disk")
                 current_stats.update(
                     {
                         "net_sent": tx_total,
@@ -260,14 +273,18 @@ async def handle_sse_stream(request: web.Request) -> web.StreamResponse:
                         "disk_total": disk.total,
                         "disk_free": disk.free,
                         "cpu_freq": freq.current if freq else 0,
-                        "process_cpu": proc_cpu,
-                        "process_ram": proc_ram,
-                        "process_disk": proc_disk,
                         "interfaces": {key: value._asdict() for key, value in net_if.items()},
                     }
                 )
             except Exception:
-                logging.debug("Agent stats collection skipped", exc_info=True)
+                logging.warning("Agent stats collection (system) failed", exc_info=True)
+
+            try:
+                current_stats["process_cpu"] = await asyncio.to_thread(_get_top_processes, "cpu")
+                current_stats["process_ram"] = await asyncio.to_thread(_get_top_processes, "ram")
+                current_stats["process_disk"] = await asyncio.to_thread(_get_top_processes, "disk")
+            except Exception:
+                logging.warning("Agent stats collection (top processes) failed", exc_info=True)
 
             if shared_state.AGENT_HISTORY:
                 latest = shared_state.AGENT_HISTORY[-1]

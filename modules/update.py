@@ -86,7 +86,7 @@ def compare_versions(ver1, ver2):
 
 
 async def get_remote_version_github(branch="main"):
-    url = f"https://raw.githubusercontent.com/jatixs/tgbotvpscp/{branch}/README.md"
+    url = f"https://raw.githubusercontent.com/Spakieone/statusweb/{branch}/README.md"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=5) as response:
@@ -106,7 +106,7 @@ async def get_changelog_entry(branch: str, lang: str) -> str:
     filename = "CHANGELOG.en.md" if lang == "en" else "CHANGELOG.md"
     code, out, err = await run_command("git", "show", f"origin/{branch}:{filename}")
     if code != 0 or not out:
-        url = f"https://raw.githubusercontent.com/jatixs/tgbotvpscp/{branch}/{filename}"
+        url = f"https://raw.githubusercontent.com/Spakieone/statusweb/{branch}/{filename}"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=5) as response:

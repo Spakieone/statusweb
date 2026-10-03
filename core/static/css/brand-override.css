@@ -1,0 +1,391 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+
+/* Брендинг под стиль нашей панели (vk-pepe.ru): лес+лайм вместо дефолтного Tailwind blue/purple.
+   darkMode: 'class' у них задан на <html> (theme_init.js) — поэтому любое тёмное
+   переопределение должно идти через префикс "html.dark", иначе оно сработает
+   безусловно и ломает контраст в тёмном режиме (так уже случилось один раз с тостами).
+   Семантические цвета состояния (зелёный=secure, красный=insecure, жёлтый=warning) не трогаем —
+   только акцентные/decorative цвета интерфейса (синий/фиолетовый -> lime/forest). */
+
+:root {
+  --b-canvas: #F4F6F5;
+  --b-forest-dark: #051C12;
+  --b-forest-medium: #072F1F;
+  --b-lime: #B4F105;
+  --b-lime-hover: #c1f824;
+  --b-lime-translucent: rgba(180, 241, 5, 0.18);
+  --b-text-main: #0B130F;
+  --b-text-muted: #6C7E75;
+  --b-border-light: #E9EFEF;
+  --b-shadow-lg: 0 20px 50px rgba(11, 19, 15, 0.1);
+  --b-shadow-sm: 0 6px 16px rgba(11, 19, 15, 0.08);
+}
+
+/* ============ Канва страницы ============
+   .brand-ui-dark — для инструментов, которые должны ОСТАТЬСЯ тёмными всегда
+   (терминал и подобные) — им нужен только шрифт + акцентные цвета, не смена канвы. */
+body.brand-ui:not(.brand-ui-dark) {
+  background-color: var(--b-canvas) !important;
+  color: var(--b-text-main) !important;
+}
+body.brand-ui {
+  font-family: 'Plus Jakarta Sans', ui-sans-serif, system-ui, sans-serif !important;
+}
+body.brand-ui * {
+  font-family: inherit;
+}
+body.brand-ui h1,
+body.brand-ui h3,
+body.brand-ui button,
+body.brand-ui .font-bold {
+  font-weight: 700 !important;
+  letter-spacing: -0.01em;
+}
+body.brand-ui .font-medium {
+  font-weight: 500 !important;
+}
+html.dark body.brand-ui:not(.brand-ui-dark) {
+  background-color: var(--b-forest-dark) !important;
+  color: #EAF2EC !important;
+}
+
+/* ============ Декоративные фоновые пятна ============ */
+body.brand-ui .bg-blue-300,
+body.brand-ui .bg-purple-300 {
+  background-color: var(--b-lime) !important;
+  opacity: 0.22 !important;
+}
+html.dark body.brand-ui .dark\:bg-blue-600\/30,
+html.dark body.brand-ui .dark\:bg-purple-600\/30 {
+  background-color: var(--b-lime) !important;
+  opacity: 0.12 !important;
+}
+
+/* ============ Верхние круглые кнопки (perf-mode / a11y-mode) ============ */
+body.brand-ui [data-action="toggle-perf-mode"],
+body.brand-ui [data-action="toggle-a11y-mode"] {
+  color: var(--b-forest-medium) !important;
+  --tw-ring-color: var(--b-lime) !important;
+}
+html.dark body.brand-ui [data-action="toggle-perf-mode"],
+html.dark body.brand-ui [data-action="toggle-a11y-mode"] {
+  color: var(--b-lime) !important;
+}
+body.brand-ui [data-action="toggle-perf-mode"]:hover,
+body.brand-ui [data-action="toggle-a11y-mode"]:hover {
+  color: var(--b-forest-dark) !important;
+}
+html.dark body.brand-ui [data-action="toggle-perf-mode"]:hover,
+html.dark body.brand-ui [data-action="toggle-a11y-mode"]:hover {
+  color: var(--b-lime-hover) !important;
+}
+
+/* ============ Переключатель языка ============ */
+body.brand-ui #lang-slider-bg {
+  background-color: var(--b-forest-dark) !important;
+}
+
+/* ============ Основная карточка входа ============ */
+body.brand-ui #main-card {
+  background-color: #FFFFFF !important;
+  border-color: var(--b-border-light) !important;
+  box-shadow: var(--b-shadow-lg) !important;
+}
+html.dark body.brand-ui #main-card {
+  background-color: #0E2318 !important;
+  border-color: rgba(180, 241, 5, 0.12) !important;
+}
+
+/* Иконка-бейдж логотипа */
+body.brand-ui #main-card .bg-gradient-to-tr.from-blue-500.to-purple-600 {
+  background: var(--b-forest-dark) !important;
+}
+body.brand-ui #main-card .bg-gradient-to-tr.from-blue-500.to-purple-600 svg {
+  color: var(--b-lime) !important;
+}
+
+/* Заголовок/подписи внутри карточки — таргетим структурно, не по глобальным utility-классам */
+body.brand-ui #main-card h1,
+body.brand-ui #main-card h3 {
+  color: var(--b-text-main) !important;
+}
+html.dark body.brand-ui #main-card h1,
+html.dark body.brand-ui #main-card h3 {
+  color: #F2FAE8 !important;
+}
+body.brand-ui #main-card .text-gray-500,
+body.brand-ui #main-card .text-gray-400,
+body.brand-ui #main-card .text-gray-600 {
+  color: var(--b-text-muted) !important;
+}
+
+/* Поля ввода */
+body.brand-ui #main-card input {
+  background-color: #FAFBFA !important;
+  border-color: var(--b-border-light) !important;
+  color: var(--b-text-main) !important;
+}
+html.dark body.brand-ui #main-card input {
+  background-color: rgba(255, 255, 255, 0.04) !important;
+  border-color: rgba(255, 255, 255, 0.1) !important;
+  color: #F2FAE8 !important;
+}
+body.brand-ui #main-card input:focus {
+  box-shadow: 0 0 0 4px var(--b-lime-translucent) !important;
+  border-color: var(--b-forest-medium) !important;
+}
+
+/* Разделители/бордеры внутри карточки */
+body.brand-ui #main-card .border-gray-200,
+body.brand-ui #main-card .border-gray-100 {
+  border-color: var(--b-border-light) !important;
+}
+html.dark body.brand-ui #main-card .dark\:border-white\/10 {
+  border-color: rgba(255, 255, 255, 0.08) !important;
+}
+
+/* Основная кнопка (Telegram login / Password login submit) */
+body.brand-ui #main-card button[type="submit"] {
+  background: var(--b-lime) !important;
+  background-image: none !important;
+  color: var(--b-forest-dark) !important;
+  box-shadow: 0 10px 25px rgba(180, 241, 5, 0.25) !important;
+  transition: background-color 0.2s ease, transform 0.15s ease !important;
+}
+body.brand-ui #main-card button[type="submit"]:hover {
+  background: var(--b-lime-hover) !important;
+}
+body.brand-ui #main-card button[type="submit"]:active {
+  transform: scale(0.98);
+}
+
+/* Вторичная кнопка (Password Login toggle) */
+body.brand-ui #password-login-toggle-btn {
+  color: var(--b-forest-medium) !important;
+  border-color: var(--b-border-light) !important;
+  background-color: #FFFFFF !important;
+}
+body.brand-ui #password-login-toggle-btn:hover {
+  background-color: var(--b-canvas) !important;
+}
+html.dark body.brand-ui #password-login-toggle-btn {
+  color: #CFEFAE !important;
+  background-color: rgba(255, 255, 255, 0.04) !important;
+  border-color: rgba(255, 255, 255, 0.1) !important;
+}
+
+/* Ссылка "Forgot?" */
+body.brand-ui #main-card .text-blue-500,
+body.brand-ui #main-card .text-blue-600 {
+  color: var(--b-forest-medium) !important;
+}
+html.dark body.brand-ui #main-card .text-blue-500,
+html.dark body.brand-ui #main-card .text-blue-600 {
+  color: var(--b-lime) !important;
+}
+
+/* Плоские синие кнопки (cookie consent OK, system modal OK) */
+body.brand-ui .bg-blue-600:not(.bg-gradient-to-r) {
+  background-color: var(--b-forest-dark) !important;
+}
+body.brand-ui .bg-blue-600:not(.bg-gradient-to-r):hover {
+  background-color: var(--b-forest-medium) !important;
+}
+
+/* Плавающие кружки GitHub/Support внизу — тень под бренд */
+body.brand-ui .mt-8 a,
+body.brand-ui .mt-8 button {
+  box-shadow: var(--b-shadow-sm) !important;
+}
+
+/* ============ Тосты (common.js: showToast / .app-toast) ============
+   Это ГЛОБАЛЬНЫЙ компонент (используется на всех страницах), поэтому
+   переопределяем его более широко — на всякий случай тоже под .brand-ui,
+   пока override.css подключён только на логине, но сам паттерн уже готов
+   к переносу на остальные страницы без изменений. */
+body.brand-ui .app-toast {
+  background-color: #FFFFFF !important;
+  border-color: var(--b-border-light) !important;
+  box-shadow: var(--b-shadow-lg) !important;
+}
+body.brand-ui .app-toast p {
+  color: var(--b-text-main) !important;
+}
+html.dark body.brand-ui .app-toast {
+  background-color: #0E2318 !important;
+  border-color: rgba(180, 241, 5, 0.15) !important;
+}
+html.dark body.brand-ui .app-toast p {
+  color: #EAF7D8 !important;
+}
+body.brand-ui .app-toast [data-action="close-toast"] {
+  color: var(--b-text-muted) !important;
+}
+body.brand-ui .app-toast [data-action="close-toast"]:hover {
+  background-color: var(--b-canvas) !important;
+  color: var(--b-text-main) !important;
+}
+body.brand-ui .app-toast .bg-blue-100 {
+  background-color: var(--b-lime-translucent) !important;
+  color: var(--b-forest-medium) !important;
+}
+html.dark body.brand-ui .app-toast .dark\:bg-blue-500\/20 {
+  background-color: rgba(180, 241, 5, 0.18) !important;
+  color: var(--b-lime) !important;
+}
+
+/* ============ Терминал (остаётся тёмным, только акценты под бренд) ============ */
+body.brand-ui-dark .text-blue-400,
+body.brand-ui-dark .text-blue-300,
+body.brand-ui-dark .text-blue-500 {
+  color: var(--b-lime) !important;
+}
+body.brand-ui-dark .bg-blue-600,
+body.brand-ui-dark .bg-blue-500 {
+  background-color: var(--b-forest-medium) !important;
+  color: var(--b-lime) !important;
+}
+body.brand-ui-dark .bg-blue-600:hover,
+body.brand-ui-dark .bg-blue-500:hover {
+  background-color: var(--b-forest-dark) !important;
+}
+body.brand-ui-dark .focus\:ring-blue-500:focus,
+body.brand-ui-dark .focus\:ring-blue-500\/50:focus {
+  --tw-ring-color: var(--b-lime) !important;
+}
+
+/* ============ Reset Password (всегда тёмная, прямые не dark: классы) ============ */
+body.brand-ui-dark .bg-blue-600\/20,
+body.brand-ui-dark .bg-purple-600\/20,
+body.brand-ui-dark .bg-pink-600\/20 {
+  background-color: var(--b-lime) !important;
+  opacity: 0.12 !important;
+}
+body.brand-ui-dark .bg-gradient-to-r.from-blue-500.via-purple-500.to-pink-500,
+body.brand-ui-dark .bg-gradient-to-r.from-blue-500.to-purple-500 {
+  background: var(--b-lime) !important;
+}
+body.brand-ui-dark .bg-gradient-to-br.from-blue-500.to-purple-600 {
+  background: var(--b-forest-medium) !important;
+}
+body.brand-ui-dark .bg-gradient-to-br.from-blue-500.to-purple-600 svg {
+  color: var(--b-lime) !important;
+}
+body.brand-ui-dark h1.bg-clip-text {
+  background-image: none !important;
+  -webkit-text-fill-color: #FFFFFF !important;
+}
+body.brand-ui-dark button.bg-gradient-to-r.from-blue-600.to-purple-600 {
+  background: var(--b-lime) !important;
+  background-image: none !important;
+  color: var(--b-forest-dark) !important;
+}
+body.brand-ui-dark button.bg-gradient-to-r.from-blue-600.to-purple-600:hover {
+  background: var(--b-lime-hover) !important;
+}
+body.brand-ui-dark input:focus,
+body.brand-ui-dark .focus\:ring-blue-500\/50:focus {
+  --tw-ring-color: var(--b-lime) !important;
+}
+body.brand-ui-dark #sysModalOk,
+body.brand-ui-dark .bg-blue-600:not(.bg-gradient-to-r) {
+  background-color: var(--b-forest-medium) !important;
+  color: var(--b-lime) !important;
+}
+body.brand-ui-dark #sysModalOk:hover {
+  background-color: var(--b-forest-dark) !important;
+}
+
+/* ============ Общие акценты по всему приложению (дашборд/ноды/настройки) ============
+   Применяется везде через .brand-ui, но НЕ трогает индиго/зелёный/фиолетовые
+   акценты КОНКРЕТНЫХ метрик (CPU=indigo, RAM=purple text-purple-600 на цифрах
+   статов, Disk=green) — те остаются смысловыми, не декоративными. Здесь только
+   голубая/синяя "primary action" семья, которая реально декоративна. */
+body.brand-ui:not(#main-card) .text-blue-500,
+body.brand-ui .text-blue-600 {
+  color: var(--b-forest-medium) !important;
+}
+html.dark body.brand-ui .text-blue-400,
+html.dark body.brand-ui .text-blue-300,
+html.dark body.brand-ui .text-blue-500 {
+  color: var(--b-lime) !important;
+}
+body.brand-ui .border-blue-500,
+body.brand-ui .border-blue-400 {
+  border-color: var(--b-lime) !important;
+}
+body.brand-ui .bg-blue-500,
+body.brand-ui .bg-blue-600 {
+  background-color: var(--b-forest-medium) !important;
+}
+html.dark body.brand-ui .bg-blue-500,
+html.dark body.brand-ui .bg-blue-600 {
+  background-color: var(--b-lime) !important;
+  color: var(--b-forest-dark) !important;
+}
+body.brand-ui .bg-blue-100,
+body.brand-ui .bg-blue-50,
+body.brand-ui .bg-blue-50\/50,
+body.brand-ui .bg-blue-100\/50,
+body.brand-ui .bg-blue-500\/10,
+body.brand-ui .bg-blue-500\/20 {
+  background-color: var(--b-lime-translucent) !important;
+}
+html.dark body.brand-ui .bg-blue-900\/50,
+html.dark body.brand-ui .bg-blue-900\/30,
+html.dark body.brand-ui .bg-blue-900\/10 {
+  background-color: rgba(180, 241, 5, 0.1) !important;
+}
+body.brand-ui .focus\:ring-blue-500:focus,
+body.brand-ui .focus\:ring-blue-500\/50:focus {
+  --tw-ring-color: var(--b-lime) !important;
+}
+
+/* ============ Дашборд: верхний navbar ============ */
+body.brand-ui > nav {
+  background-color: rgba(255, 255, 255, 0.85) !important;
+  border-color: var(--b-border-light) !important;
+}
+html.dark body.brand-ui > nav {
+  background-color: rgba(5, 28, 18, 0.9) !important;
+  border-color: rgba(180, 241, 5, 0.1) !important;
+}
+
+/* Название бренда — убираем градиент (AI-aesthetic), сплошной цвет под бренд */
+body.brand-ui > nav .bg-clip-text {
+  background-image: none !important;
+  -webkit-text-fill-color: var(--b-forest-dark) !important;
+  color: var(--b-forest-dark) !important;
+}
+html.dark body.brand-ui > nav .bg-clip-text {
+  -webkit-text-fill-color: var(--b-lime) !important;
+  color: var(--b-lime) !important;
+}
+
+/* Бейдж версии */
+body.brand-ui > nav .border-blue-500\/30 {
+  border-color: rgba(180, 241, 5, 0.4) !important;
+  background-color: var(--b-lime-translucent) !important;
+  color: var(--b-forest-medium) !important;
+}
+html.dark body.brand-ui > nav .border-blue-500\/30 {
+  color: var(--b-lime) !important;
+}
+
+/* Кнопки VNC / Edit UI / Notif в navbar */
+body.brand-ui > nav .bg-blue-500\/10 {
+  background-color: var(--b-lime-translucent) !important;
+  color: var(--b-forest-medium) !important;
+}
+body.brand-ui > nav .bg-blue-500\/10:hover {
+  background-color: rgba(180, 241, 5, 0.28) !important;
+}
+html.dark body.brand-ui > nav .bg-blue-500\/10 {
+  color: var(--b-lime) !important;
+}
+
+/* Общие focus-кольца navbar (кроме явно жёлтых/голубых toggle, уже перекрашенных выше) */
+body.brand-ui > nav button:focus-visible {
+  outline: 2px solid var(--b-lime) !important;
+  outline-offset: 2px;
+}

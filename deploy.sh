@@ -29,7 +29,7 @@ DOCKER_COMPOSE_FILE="${BOT_INSTALL_PATH}/docker-compose.yml"
 ENV_FILE="${BOT_INSTALL_PATH}/.env"
 LEGACY_SECURITY_KEY_FILE="${BOT_INSTALL_PATH}/config/security.key"
 
-GITHUB_REPO="jatixs/tgbotvpscp"
+GITHUB_REPO="Spakieone/statusweb"
 GITHUB_REPO_URL="https://github.com/${GITHUB_REPO}.git"
 
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'; C_CYAN='\033[0;36m'; C_BOLD='\033[1m'

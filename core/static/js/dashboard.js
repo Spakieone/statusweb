@@ -591,8 +591,8 @@ function renderNextNodeBatch() {
     const lblRam = (typeof I18N !== 'undefined' && I18N.web_label_ram) ? I18N.web_label_ram : "RAM";
     const lblDisk = (typeof I18N !== 'undefined' && I18N.web_label_disk) ? I18N.web_label_disk : "DISK";
     const lblStatus = (typeof I18N !== 'undefined' && I18N.web_label_status) ? I18N.web_label_status : "STATUS";
-    const lblRx = (typeof I18N !== 'undefined' && I18N.web_label_rx) ? I18N.web_label_rx : "ВХ";
-    const lblTx = (typeof I18N !== 'undefined' && I18N.web_label_tx) ? I18N.web_label_tx : "ИСХ";
+    const lblRx = (typeof I18N !== 'undefined' && I18N.web_label_rx) ? I18N.web_label_rx : "Загрузка";
+    const lblTx = (typeof I18N !== 'undefined' && I18N.web_label_tx) ? I18N.web_label_tx : "Отдача";
 
     const sortMode = localStorage.getItem('dashboardSortMode') || 'custom';
     const dragHandleClass = (sortMode === 'custom' && window.isActivelySorting) ? '' : 'hidden ';
@@ -1131,14 +1131,14 @@ function renderAgentChart(history) {
             data: {
                 labels,
                 datasets: [{
-                    label: (typeof I18N !== 'undefined' && I18N.web_label_rx) ? I18N.web_label_rx : 'ВХ',
+                    label: (typeof I18N !== 'undefined' && I18N.web_label_rx) ? I18N.web_label_rx : 'Загрузка',
                     data: netRx,
                     borderColor: '#22c55e',
                     borderWidth: 2,
                     backgroundColor: rxGrad,
                     fill: true
                 }, {
-                    label: (typeof I18N !== 'undefined' && I18N.web_label_tx) ? I18N.web_label_tx : 'ИСХ',
+                    label: (typeof I18N !== 'undefined' && I18N.web_label_tx) ? I18N.web_label_tx : 'Отдача',
                     data: netTx,
                     borderColor: '#3b82f6',
                     borderWidth: 2,
@@ -1950,14 +1950,14 @@ function renderCharts(history) {
             data: {
                 labels,
                 datasets: [{
-                    label: (typeof I18N !== 'undefined' && I18N.web_label_rx) ? I18N.web_label_rx : 'ВХ',
+                    label: (typeof I18N !== 'undefined' && I18N.web_label_rx) ? I18N.web_label_rx : 'Загрузка',
                     data: netRx,
                     borderColor: '#22c55e',
                     borderWidth: 2,
                     backgroundColor: rxGrad,
                     fill: true
                 }, {
-                    label: (typeof I18N !== 'undefined' && I18N.web_label_tx) ? I18N.web_label_tx : 'ИСХ',
+                    label: (typeof I18N !== 'undefined' && I18N.web_label_tx) ? I18N.web_label_tx : 'Отдача',
                     data: netTx,
                     borderColor: '#ef4444',
                     borderWidth: 2,

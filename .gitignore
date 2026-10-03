@@ -211,7 +211,13 @@ __marimo__/
 config/nodes.db
 config/security.key
 config/bot.db
+config/node.db
+config/node.db-shm
+config/node.db-wal
+config/iperf_servers_ru_cache.yml
 config/*.bak
 *.bak
 .env.*
 !.env.example
+logs/
+installstate

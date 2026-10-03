@@ -482,7 +482,7 @@ async def handle_node_add(request: web.Request) -> web.StreamResponse:
         lang = get_user_lang(int(user["id"]))
         script = "deploy_en.sh" if lang == "en" else "deploy.sh"
         command = (
-            f"bash <(wget -qO- https://raw.githubusercontent.com/jatixs/tgbotvpscp/main/{script}) "
+            f"bash <(wget -qO- https://raw.githubusercontent.com/Spakieone/statusweb/main/{script}) "
             f"--agent={proto}://{host} --token={token}"
         )
 

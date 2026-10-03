@@ -774,23 +774,23 @@ html.dark .services-blur-overlay {
 
 /* Monitor link button */
 .monitor-link-btn {
-	background-color: #faf5ff;
-	border: 1px solid #e9d5ff;
-	color: #9333ea;
+	background-color: rgba(180, 241, 5, 0.18);
+	border: 1px solid rgba(5, 28, 18, 0.15);
+	color: #051C12;
 }
 
 .monitor-link-btn:hover {
-	background-color: #f3e8ff;
+	background-color: rgba(180, 241, 5, 0.3);
 }
 
 html.dark .monitor-link-btn {
-	background-color: rgba(147, 51, 234, 0.15);
-	border-color: rgba(147, 51, 234, 0.3);
-	color: #c084fc;
+	background-color: rgba(180, 241, 5, 0.15);
+	border-color: rgba(180, 241, 5, 0.3);
+	color: #c1f824;
 }
 
 html.dark .monitor-link-btn:hover {
-	background-color: rgba(147, 51, 234, 0.25);
+	background-color: rgba(180, 241, 5, 0.25);
 }
 
 /* Header billing icon: color highlight based on payment status */
@@ -1026,10 +1026,10 @@ html.dark.perf-mode [data-action="toggle-perf-mode"] {
 }
 
 html.a11y-mode [data-action="toggle-a11y-mode"] {
-    background-color: rgba(59, 130, 246, 0.15) !important;
+    background-color: rgba(180, 241, 5, 0.18) !important;
 }
 html.dark.a11y-mode [data-action="toggle-a11y-mode"] {
-    background-color: rgba(59, 130, 246, 0.25) !important;
+    background-color: rgba(180, 241, 5, 0.25) !important;
 }
 
 /* --- Hide elements on desktop and mobile --- */
@@ -1101,7 +1101,7 @@ html.amoled #log-loader {
 }
 
 .edit-mode .dashboard-block {
-    border: 2px dashed rgba(59, 130, 246, 0.5) !important; /* Blue dashed border */
+    border: 2px dashed rgba(180, 241, 5, 0.6) !important; /* Brand lime dashed border */
     cursor: grab;
 }
 
@@ -1226,10 +1226,10 @@ html.amoled #log-loader {
 }
 
 .size-picker-item:hover {
-    background: rgba(59, 130, 246, 0.06);
-    border-color: rgba(59, 130, 246, 0.2);
+    background: rgba(180, 241, 5, 0.1);
+    border-color: rgba(180, 241, 5, 0.35);
     transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(59, 130, 246, 0.12);
+    box-shadow: 0 4px 12px rgba(180, 241, 5, 0.18);
 }
 
 .dark .size-picker-item {
@@ -1237,19 +1237,19 @@ html.amoled #log-loader {
 }
 
 .dark .size-picker-item:hover {
-    background: rgba(59, 130, 246, 0.1);
-    border-color: rgba(59, 130, 246, 0.3);
+    background: rgba(180, 241, 5, 0.14);
+    border-color: rgba(180, 241, 5, 0.4);
 }
 
 .size-picker-item--active {
-    background: rgba(59, 130, 246, 0.1) !important;
-    border-color: #3b82f6 !important;
-    box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.2), 0 4px 12px rgba(59, 130, 246, 0.15);
+    background: rgba(180, 241, 5, 0.14) !important;
+    border-color: #051C12 !important;
+    box-shadow: 0 0 0 1px rgba(5, 28, 18, 0.2), 0 4px 12px rgba(180, 241, 5, 0.2);
 }
 
 .dark .size-picker-item--active {
-    background: rgba(59, 130, 246, 0.15) !important;
-    border-color: #60a5fa !important;
+    background: rgba(180, 241, 5, 0.18) !important;
+    border-color: #B4F105 !important;
 }
 
 .size-picker-preview {
@@ -1269,13 +1269,13 @@ html.amoled #log-loader {
 .size-picker-bar {
     height: 100%;
     border-radius: 6px;
-    background: linear-gradient(135deg, #3b82f6, #6366f1);
-    transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    background: linear-gradient(135deg, #8fcf04, #B4F105);
+    transition: width 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
     min-width: 4px;
 }
 
 .size-picker-item--active .size-picker-bar {
-    background: linear-gradient(135deg, #2563eb, #4f46e5);
+    background: linear-gradient(135deg, #051C12, #072F1F);
 }
 
 .size-picker-label {
@@ -1302,11 +1302,11 @@ html.amoled #log-loader {
     right: 4px;
     width: 14px;
     height: 14px;
-    color: #3b82f6;
+    color: #051C12;
 }
 
 .dark .size-picker-check {
-    color: #60a5fa;
+    color: #B4F105;
 }
 
 /* --- Resize Handle --- */
@@ -1335,14 +1335,14 @@ html.amoled #log-loader {
     width: 4px;
     height: 32px;
     border-radius: 4px;
-    background: rgba(59, 130, 246, 0);
-    transition: all 0.2s ease;
+    background: rgba(180, 241, 5, 0);
+    transition: all 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 .resize-handle:hover .resize-handle-bar {
-    background: rgba(59, 130, 246, 0.5);
+    background: rgba(180, 241, 5, 0.7);
     height: 48px;
-    box-shadow: 0 0 8px rgba(59, 130, 246, 0.3);
+    box-shadow: 0 0 8px rgba(180, 241, 5, 0.4);
 }
 
 .dashboard-block.is-resizing {
@@ -1351,9 +1351,9 @@ html.amoled #log-loader {
 }
 
 .dashboard-block.is-resizing .resize-handle-bar {
-    background: rgba(59, 130, 246, 0.7) !important;
+    background: rgba(180, 241, 5, 0.9) !important;
     height: 64px;
-    box-shadow: 0 0 12px rgba(59, 130, 246, 0.4);
+    box-shadow: 0 0 12px rgba(180, 241, 5, 0.5);
 }
 
 /* Hide resize handle and size button on mobile */

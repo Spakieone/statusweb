@@ -1,7 +1,7 @@
 version: '3.8'
-
 x-bot-base: &bot-base
   build: .
+  image: tg-vps-bot:latest
   restart: always
   env_file: .env
   depends_on:
@@ -19,13 +19,11 @@ x-bot-base: &bot-base
   networks:
     - app
     - docker-api
-
 services:
   docker-proxy:
     image: tecnativa/docker-socket-proxy:0.3.0
     container_name: tg-docker-proxy
     restart: always
-    read_only: true
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -53,37 +51,40 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - docker-api
-
   bot-secure:
     <<: *bot-base
     container_name: tg-bot-secure
     profiles: ["secure"]
     user: "tgbot"
+    pid: host
     ports:
-      - "127.0.0.1:${WEB_SERVER_PORT}:${WEB_SERVER_PORT}"
+      - "${WEB_PORT}:${WEB_PORT}"
     environment:
-      INSTALL_MODE: secure
-      TG_BOT_CONTAINER_NAME: tg-bot-secure
+      - INSTALL_MODE=secure
+      - TG_BOT_CONTAINER_NAME=tg-bot-secure
     volumes:
       - ./config:/opt/tg-bot/config
       - ./logs/bot:/opt/tg-bot/logs/bot
-      - /proc/uptime:/proc_host/uptime:ro
-      - /proc/stat:/proc_host/stat:ro
-      - /proc/meminfo:/proc_host/meminfo:ro
-      - /proc/net/dev:/proc_host/net/dev:ro
+      - ./core/templates:/opt/tg-bot/core/templates:ro
+      - ./core/static:/opt/tg-bot/core/static:ro
+      - /proc:/proc_host:ro
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+    group_add:
+      - "999"
     cap_add:
       - NET_RAW
-
   bot-root:
     <<: *bot-base
     container_name: tg-bot-root
     profiles: ["root"]
     user: "root"
     ports:
-      - "127.0.0.1:${WEB_SERVER_PORT}:${WEB_SERVER_PORT}"
+      - "${WEB_PORT}:${WEB_PORT}"
     environment:
-      INSTALL_MODE: root
-      TG_BOT_CONTAINER_NAME: tg-bot-root
+      - INSTALL_MODE=root
+      - TG_BOT_CONTAINER_NAME=tg-bot-root
     volumes:
       - ./config:/opt/tg-bot/config
       - ./logs/bot:/opt/tg-bot/logs/bot
@@ -93,7 +94,6 @@ services:
       - /proc/net/dev:/proc_host/net/dev:ro
       - /etc/hostname:/host/etc/hostname:ro
       - /etc/os-release:/host/etc/os-release:ro
-
   watchdog:
     <<: *bot-base
     container_name: tg-watchdog
@@ -102,7 +102,6 @@ services:
     volumes:
       - ./config:/opt/tg-bot/config
       - ./logs/watchdog:/opt/tg-bot/logs/watchdog
-
 networks:
   app:
     driver: bridge

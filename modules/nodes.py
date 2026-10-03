@@ -372,7 +372,7 @@ async def process_node_name(message: types.Message, state: FSMContext):
     else:
          agent_url = f"http://{host_address}:{config.WEB_SERVER_PORT}"
 
-    deploy_cmd = f"bash <(wget -qO- https://raw.githubusercontent.com/jatixs/tgbotvpscp/main/deploy.sh) --agent={agent_url} --token={token}"
+    deploy_cmd = f"bash <(wget -qO- https://raw.githubusercontent.com/Spakieone/statusweb/main/deploy.sh) --agent={agent_url} --token={token}"
     safe_command = html.escape(deploy_cmd)
 
     await message.answer(
