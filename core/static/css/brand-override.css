@@ -57,7 +57,9 @@ body.brand-ui .bg-purple-300 {
   opacity: 0.22 !important;
 }
 html.dark body.brand-ui .dark\:bg-blue-600\/30,
-html.dark body.brand-ui .dark\:bg-purple-600\/30 {
+html.dark body.brand-ui .dark\:bg-purple-600\/30,
+html.dark body.brand-ui .dark\:bg-blue-600\/20,
+html.dark body.brand-ui .dark\:bg-purple-600\/20 {
   background-color: var(--b-lime) !important;
   opacity: 0.12 !important;
 }
@@ -311,7 +313,9 @@ body.brand-ui .text-blue-600 {
 }
 html.dark body.brand-ui .text-blue-400,
 html.dark body.brand-ui .text-blue-300,
-html.dark body.brand-ui .text-blue-500 {
+html.dark body.brand-ui .text-blue-500,
+html.dark body.brand-ui .dark\:text-blue-400,
+html.dark body.brand-ui .dark\:text-blue-300 {
   color: var(--b-lime) !important;
 }
 body.brand-ui .border-blue-500,
@@ -335,9 +339,14 @@ body.brand-ui .bg-blue-500\/10,
 body.brand-ui .bg-blue-500\/20 {
   background-color: var(--b-lime-translucent) !important;
 }
+html.dark body.brand-ui .dark\:bg-blue-500\/20 {
+  background-color: rgba(180, 241, 5, 0.18) !important;
+}
 html.dark body.brand-ui .bg-blue-900\/50,
 html.dark body.brand-ui .bg-blue-900\/30,
-html.dark body.brand-ui .bg-blue-900\/10 {
+html.dark body.brand-ui .bg-blue-900\/10,
+html.dark body.brand-ui .dark\:bg-blue-900\/20,
+html.dark body.brand-ui .dark\:bg-blue-900\/30 {
   background-color: rgba(180, 241, 5, 0.1) !important;
 }
 body.brand-ui .focus\:ring-blue-500:focus,
@@ -398,52 +407,60 @@ body.brand-ui > nav button:focus-visible {
    Яркий лайм — основной сигнальный акцент бренда. Работает и как "нормальное"
    состояние, и как "активное" до срабатывания порога (applyAgentWarning сам
    переключает на orange/red при превышении, эти классы не трогаем). */
-body.brand-ui .text-indigo-600 {
+html:not(.dark) body.brand-ui .text-indigo-600 {
   color: var(--b-forest-dark) !important;
 }
-html.dark body.brand-ui .text-indigo-400 {
+html.dark body.brand-ui .dark\:text-indigo-400 {
   color: var(--b-lime) !important;
 }
-body.brand-ui .bg-indigo-100 {
+html:not(.dark) body.brand-ui .bg-indigo-100 {
   background-color: var(--b-lime-translucent) !important;
 }
-html.dark body.brand-ui .bg-indigo-500\/20 {
+html.dark body.brand-ui .dark\:bg-indigo-500\/20 {
   background-color: rgba(180, 241, 5, 0.18) !important;
 }
-body.brand-ui .bg-indigo-500 {
+html:not(.dark) body.brand-ui .bg-indigo-500 {
+  background-color: var(--b-forest-dark) !important;
+}
+html.dark body.brand-ui .bg-indigo-500 {
   background-color: var(--b-lime) !important;
 }
-body.brand-ui .bg-indigo-500\/10 {
+html:not(.dark) body.brand-ui .bg-indigo-500\/10 {
   background-color: var(--b-lime-translucent) !important;
 }
-body.brand-ui .group:hover .group-hover\:bg-indigo-500\/20 {
+html.dark body.brand-ui .group:hover .group-hover\:bg-indigo-500\/20 {
   background-color: rgba(180, 241, 5, 0.3) !important;
 }
 
 /* ============ Dashboard quick-stats: карточка ОЗУ (было purple) ============
-   Тёмный forest-тон вместо лайма — чтобы визуально отличаться от соседней
-   карточки CPU, оставаясь строго в палитре бренда (forest-medium/forest-dark). */
-body.brand-ui .text-purple-600 {
+   Тёмный forest-тон в светлой теме; в тёмной — светлый лайм-тинт (иначе
+   тёмный forest на тёмном фоне карточки попросту не виден, как и было в
+   первой версии этого фикса). */
+html:not(.dark) body.brand-ui .text-purple-600 {
   color: var(--b-forest-medium) !important;
 }
-html.dark body.brand-ui .text-purple-400 {
+html.dark body.brand-ui .dark\:text-purple-400,
+html.dark body.brand-ui .dark\:text-purple-200 {
   color: #EAF7D8 !important;
 }
-body.brand-ui .bg-purple-100 {
+html:not(.dark) body.brand-ui .text-purple-700 {
+  color: var(--b-forest-medium) !important;
+}
+html:not(.dark) body.brand-ui .bg-purple-100 {
   background-color: var(--b-lime-translucent) !important;
 }
-html.dark body.brand-ui .bg-purple-500\/20 {
-  background-color: var(--b-forest-medium) !important;
+html.dark body.brand-ui .dark\:bg-purple-500\/20 {
+  background-color: var(--b-forest-light) !important;
 }
-body.brand-ui .bg-purple-500 {
+html:not(.dark) body.brand-ui .bg-purple-500 {
   background-color: var(--b-forest-medium) !important;
 }
 html.dark body.brand-ui .bg-purple-500 {
-  background-color: var(--b-forest-light, #1A3E30) !important;
+  background-color: #EAF7D8 !important;
 }
-body.brand-ui .bg-purple-500\/10 {
+html:not(.dark) body.brand-ui .bg-purple-500\/10 {
   background-color: var(--b-lime-translucent) !important;
 }
-body.brand-ui .group:hover .group-hover\:bg-purple-500\/20 {
-  background-color: rgba(180, 241, 5, 0.3) !important;
+html.dark body.brand-ui .group:hover .group-hover\:bg-purple-500\/20 {
+  background-color: rgba(234, 247, 216, 0.3) !important;
 }
