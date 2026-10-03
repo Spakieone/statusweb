@@ -67,6 +67,7 @@ services:
       - ./logs/bot:/opt/tg-bot/logs/bot
       - ./core/templates:/opt/tg-bot/core/templates:ro
       - ./core/static:/opt/tg-bot/core/static:ro
+      - ./core/static/favicons:/opt/tg-bot/core/static/favicons
       - /proc:/proc_host:ro
       - /var/log/journal:/var/log/journal:ro
       - /run/log/journal:/run/log/journal:ro
