@@ -593,30 +593,10 @@ python bot.py
 
 ---
 
-## 👤 Автор
+## 👤 Автор оригинального проекта
 
-**Jatix**
+Эта панель создана на основе проекта мониторинга и управления VPS/нодами **tgbotvpscp**.
 
-- 📧 Почта: [jatix.com@mail.ru](jatix.com@mail.ru)
-- 💬 Telegram: [@jatix](https://t.me/faridshykhaliev)
-- 🌐 GitHub: [@jatixs](https://github.com/jatixs)
-
----
-
-## 🌟 Поддержать проект
-
-Если проект оказался полезным, поддержите его:
-
-- ⭐ **Поставь звезду** на GitHub
-- 🔄 **Поделись** с друзьями
-- 💰 **[Донат](https://yoomoney.ru/to/410011639584793)**
-
----
-
-<p align="center">
-  <b>Версия:</b> 1.25.1 (Build 90)<br>
-  <b>Лицензия:</b> GPL-3.0 license<br>
-  <b>Статус:</b> Релиз<br>
-  <br>
-  Сделано с ❤️ для сообщества DevOps
-</p>
+- 🌐 Автор: [Jatix](https://github.com/jatixs)
+- 🔗 Оригинальный репозиторий: [github.com/jatixs/tgbotvpscp](https://github.com/jatixs/tgbotvpscp)
+- 💰 [Поддержать автора донатом](https://yoomoney.ru/to/410011639584793)

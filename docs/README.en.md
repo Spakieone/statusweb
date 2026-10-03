@@ -596,31 +596,10 @@ This project is licensed under **GPL-3.0**. See [LICENSE](LICENSE) file for deta
 
 ---
 
-## 👤 Author
+## 👤 Author of the Original Project
 
-**Jatix**
+This panel is based on the **tgbotvpscp** VPS/node monitoring and management project.
 
-- 📧 Email: [jatix.com@mail.ru](jatix.com@mail.ru)
-- 💬 Telegram: [@jatix](https://t.me/faridshykhaliev)
-- 🌐 GitHub: [@jatixs](https://github.com/jatixs)
-
----
-
-## 🌟 Support the Project
-
-If you find this project useful, support it:
-
-- ⭐ **Star** on GitHub
-- 🔄 **Share** with friends
-- 💰 **[Donate](https://yoomoney.ru/to/410011639584793)**
-
----
-
-<p align="center">
-  <b>Version:</b> 1.25.1 (Build 90)<br>
-  <b>Release Date:</b> July 2026<br>
-  <b>License:</b> GPL-3.0 license<br>
-  <b>Status:</b> Release<br>
-  <br>
-  Made with ❤️ for the DevOps community
-</p>
+- 🌐 Author: [Jatix](https://github.com/jatixs)
+- 🔗 Original repository: [github.com/jatixs/tgbotvpscp](https://github.com/jatixs/tgbotvpscp)
+- 💰 [Support the author with a donation](https://yoomoney.ru/to/410011639584793)
