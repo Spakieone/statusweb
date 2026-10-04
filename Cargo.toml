@@ -10,7 +10,7 @@ members = [
 version = "1.0.0-beta.4"
 edition = "2024"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/ZingerLittleBee/ServerBee"
+repository = "https://github.com/Spakieone/statusweb"
 
 [workspace.dependencies]
 serverbee-common = { path = "crates/common", default-features = false }

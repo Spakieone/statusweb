@@ -20,7 +20,7 @@ case "$0" in
 esac
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-REPO="ZingerLittleBee/ServerBee"
+REPO="Spakieone/statusweb"
 INSTALLER_VERSION="1.0.0-beta.4"
 # Everything ServerBee installs lives under a single base directory for
 # unified management. The PATH-visible management CLI is the only exception.
@@ -1425,7 +1425,7 @@ refresh_cli_from_release() {
         # Sanity-check the download before trusting it as our own CLI.
         [ -s "$tmp" ] || exit 1
         sh -n "$tmp" 2>/dev/null || exit 1
-        grep -q 'REPO="ZingerLittleBee/ServerBee"' "$tmp" || exit 1
+        grep -q 'REPO="Spakieone/statusweb"' "$tmp" || exit 1
 
         chmod +x "$tmp"
         mv "$tmp" "$target"
