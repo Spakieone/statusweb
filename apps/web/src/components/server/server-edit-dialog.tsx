@@ -237,6 +237,64 @@ function ServerEditBasicFields({
         server={server}
         value={state.countryCode}
       />
+      <Field label={t('add_server.project_label', { defaultValue: 'Проект' })}>
+        <Select
+          onValueChange={(value) => {
+            if (value === null) {
+              return
+            }
+            const existing = parseTagsInput(tagsInput).tags.filter((tag) => tag !== 'PEPE' && tag !== 'No-Touch')
+            const next = value === '__none__' ? existing : [...new Set([value, ...existing])].sort()
+            dispatch({ type: 'patch', value: { tagsDraft: { dirty: true, value: next.join(', ') } } })
+          }}
+          value={
+            parseTagsInput(tagsInput).tags.includes('PEPE')
+              ? 'PEPE'
+              : parseTagsInput(tagsInput).tags.includes('No-Touch')
+                ? 'No-Touch'
+                : '__none__'
+          }
+        >
+          <SelectTrigger className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__none__">{t('add_server.project_none', { defaultValue: 'Без проекта' })}</SelectItem>
+            <SelectItem value="PEPE">PEPE</SelectItem>
+            <SelectItem value="No-Touch">No-Touch</SelectItem>
+          </SelectContent>
+        </Select>
+      </Field>
+      <Field label={t('add_server.category_label', { defaultValue: 'Категория' })}>
+        <Select
+          onValueChange={(value) => {
+            if (value === null) {
+              return
+            }
+            const CATEGORY_VALUES = ['Сайт', 'Нода', 'Бот', 'Панель Remnawave']
+            const existing = parseTagsInput(tagsInput).tags.filter((tag) => !CATEGORY_VALUES.includes(tag))
+            const next = value === '__none__' ? existing : [...new Set([value, ...existing])].sort()
+            dispatch({ type: 'patch', value: { tagsDraft: { dirty: true, value: next.join(', ') } } })
+          }}
+          value={
+            ['Сайт', 'Нода', 'Бот', 'Панель Remnawave'].find((cat) => parseTagsInput(tagsInput).tags.includes(cat)) ??
+            '__none__'
+          }
+        >
+          <SelectTrigger className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__none__">{t('add_server.category_none', { defaultValue: 'Без категории' })}</SelectItem>
+            <SelectItem value="Сайт">{t('add_server.category_site', { defaultValue: 'Сайт' })}</SelectItem>
+            <SelectItem value="Нода">{t('add_server.category_node', { defaultValue: 'Нода' })}</SelectItem>
+            <SelectItem value="Бот">{t('add_server.category_bot', { defaultValue: 'Бот' })}</SelectItem>
+            <SelectItem value="Панель Remnawave">
+              {t('add_server.category_panel', { defaultValue: 'Панель Remnawave' })}
+            </SelectItem>
+          </SelectContent>
+        </Select>
+      </Field>
       <Field label={t('tags_label')}>
         <Input
           aria-label={t('tags_label')}
@@ -291,6 +349,7 @@ function ServerEditBillingFields({
             <SelectContent>
               <SelectItem value="USD">USD</SelectItem>
               <SelectItem value="EUR">EUR</SelectItem>
+              <SelectItem value="RUB">RUB</SelectItem>
               <SelectItem value="CNY">CNY</SelectItem>
               <SelectItem value="JPY">JPY</SelectItem>
               <SelectItem value="GBP">GBP</SelectItem>

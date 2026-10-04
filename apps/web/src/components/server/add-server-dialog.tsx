@@ -141,6 +141,7 @@ function DatePickerField({ ariaLabel, onChange, value }: DatePickerFieldProps) {
 interface AddServerFormState {
   billingCycle: string
   billingStartDay: string
+  category: string
   currency: string
   expiredAt: string
   groupId: string
@@ -148,6 +149,7 @@ interface AddServerFormState {
   name: string
   onboardingRequestId: string
   price: string
+  project: string
   publicRemark: string
   remark: string
   selectedCaps: Set<string>
@@ -165,8 +167,9 @@ type AddServerFormAction =
 
 function initialAddServerFormState(): AddServerFormState {
   return {
-    billingCycle: '',
+    billingCycle: 'monthly',
     billingStartDay: '',
+    category: '__none__',
     currency: 'USD',
     expiredAt: '',
     groupId: '',
@@ -174,6 +177,7 @@ function initialAddServerFormState(): AddServerFormState {
     name: '',
     onboardingRequestId: randomUUID(),
     price: '',
+    project: '__none__',
     publicRemark: '',
     remark: '',
     selectedCaps: new Set(DEFAULT_AGENT_CAPABILITY_KEYS),
@@ -342,6 +346,38 @@ function AddServerBasicFields({
           </SelectContent>
         </Select>
       </Field>
+      <Field label={t('add_server.project_label')}>
+        <Select
+          onValueChange={(value) => value !== null && dispatch({ type: 'patch', value: { project: value } })}
+          value={state.project}
+        >
+          <SelectTrigger className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__none__">{t('add_server.project_none')}</SelectItem>
+            <SelectItem value="PEPE">PEPE</SelectItem>
+            <SelectItem value="No-Touch">No-Touch</SelectItem>
+          </SelectContent>
+        </Select>
+      </Field>
+      <Field label={t('add_server.category_label')}>
+        <Select
+          onValueChange={(value) => value !== null && dispatch({ type: 'patch', value: { category: value } })}
+          value={state.category}
+        >
+          <SelectTrigger className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__none__">{t('add_server.category_none')}</SelectItem>
+            <SelectItem value="Сайт">{t('add_server.category_site')}</SelectItem>
+            <SelectItem value="Нода">{t('add_server.category_node')}</SelectItem>
+            <SelectItem value="Бот">{t('add_server.category_bot')}</SelectItem>
+            <SelectItem value="Панель Remnawave">{t('add_server.category_panel')}</SelectItem>
+          </SelectContent>
+        </Select>
+      </Field>
       <Field label={t('add_server.tags_label')}>
         <Input
           aria-label={t('add_server.tags_label')}
@@ -419,6 +455,7 @@ function AddServerBillingFields({
             <SelectContent>
               <SelectItem value="USD">USD</SelectItem>
               <SelectItem value="EUR">EUR</SelectItem>
+              <SelectItem value="RUB">RUB</SelectItem>
               <SelectItem value="CNY">CNY</SelectItem>
               <SelectItem value="JPY">JPY</SelectItem>
               <SelectItem value="GBP">GBP</SelectItem>
@@ -640,7 +677,9 @@ export function AddServerDialog({ open, onClose }: { onClose: () => void; open: 
       toast.error(t(parsed.error))
       return
     }
-    mutation.mutate(buildBody(trimmedName, parsed.tags))
+    const fixedTags = [state.project, state.category].filter((value) => value !== '__none__')
+    const allTags = fixedTags.length > 0 ? [...new Set([...fixedTags, ...parsed.tags])].sort() : parsed.tags
+    mutation.mutate(buildBody(trimmedName, allTags))
   }
 
   const submitDisabled = mutation.isPending || !state.name.trim()
