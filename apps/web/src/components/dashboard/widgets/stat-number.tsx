@@ -131,7 +131,7 @@ export function StatNumberWidget({ config, servers, title }: StatNumberWidgetPro
 
       <div className="min-w-0 flex-1">
         <p
-          className="truncate font-medium text-[0.625rem] text-muted-foreground uppercase leading-tight tracking-[0.12em]"
+          className="line-clamp-2 break-words font-medium text-[0.625rem] text-muted-foreground uppercase leading-tight tracking-[0.12em]"
           data-testid="stat-number-label"
         >
           {label}
