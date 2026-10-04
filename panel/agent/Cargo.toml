@@ -24,7 +24,7 @@ uuid = { version = "1", features = ["v4"] }
 instant-acme = { version = "0.8", features = ["hyper-rustls", "rcgen", "time", "x509-parser"] }
 time = { version = "0.3", features = ["formatting"] }
 x509-parser = "0.16"
-bollard = "0.18"
+bollard = "0.21"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
