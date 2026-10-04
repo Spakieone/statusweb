@@ -683,31 +683,33 @@ function renderNextNodeBatch() {
     renderedCount += batch.length;
 }
 
-function applyAgentWarning(type, val, threshold, def) {
+function applyAgentWarning(type, val, threshold) {
+    // Цвет значения/прогресс-бара отражает статус относительно порога, который
+    // пользователь сам задаёт в настройках: порог = граница опасности (red),
+    // зона внимания (yellow) начинается за 15 п.п. до порога. Иконка метрики
+    // в это НЕ вовлечена - у неё фиксированный цвет из brand-override.css,
+    // независимо от текущего статуса.
     const warnIcon = document.getElementById(`warn-${type}`);
     const statEl = document.getElementById(`stat_${type}`);
     const progEl = document.getElementById(`prog_${type}`);
-    const iconContainer = document.getElementById(`icon-${type}`);
     if (!warnIcon || !statEl || !progEl) return;
-    
-    const isPeak = val >= Math.max(threshold, 95) || val >= threshold + 5;
-    const isWarn = val >= threshold;
 
-    if (isPeak) {
-        warnIcon.classList.remove('hidden');
+    const warnStart = Math.max(0, threshold - 15);
+    const isDanger = val >= threshold;
+    const isWarn = !isDanger && val >= warnStart;
+
+    if (isDanger) {
+        warnIcon.className = `w-3.5 h-3.5 text-red-500`;
         statEl.className = `text-2xl font-black text-red-600 dark:text-red-400`;
         progEl.className = `h-1.5 rounded-full transition-all duration-1000 ease-out bg-red-500`;
-        if (iconContainer) iconContainer.className = `p-2 rounded-xl relative bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400`;
     } else if (isWarn) {
-        warnIcon.classList.remove('hidden');
-        statEl.className = `text-2xl font-black text-orange-500 dark:text-orange-400`;
-        progEl.className = `h-1.5 rounded-full transition-all duration-1000 ease-out bg-orange-500`;
-        if (iconContainer) iconContainer.className = `p-2 rounded-xl relative bg-orange-100 dark:bg-orange-500/20 text-orange-600 dark:text-orange-400`;
+        warnIcon.className = `w-3.5 h-3.5 text-yellow-500`;
+        statEl.className = `text-2xl font-black text-yellow-500 dark:text-yellow-400`;
+        progEl.className = `h-1.5 rounded-full transition-all duration-1000 ease-out bg-yellow-500`;
     } else {
         warnIcon.classList.add('hidden');
-        statEl.className = `text-2xl font-black ${def.text}`;
-        progEl.className = `h-1.5 rounded-full transition-all duration-1000 ease-out ${def.bg}`;
-        if (iconContainer) iconContainer.className = `p-2 rounded-xl relative ${def.iconBg} ${def.text}`;
+        statEl.className = `text-2xl font-black text-green-600 dark:text-green-400`;
+        progEl.className = `h-1.5 rounded-full transition-all duration-1000 ease-out bg-green-500`;
     }
 }
 
@@ -737,11 +739,7 @@ function updateAgentStatsUI(data) {
             if (progCpu) {
                 progCpu.style.width = data.stats.cpu + "%";
                 if (typeof SYS_CONFIG !== 'undefined') {
-                    applyAgentWarning('cpu', data.stats.cpu, SYS_CONFIG.cpu_threshold || 90, {
-                        text: 'text-indigo-600 dark:text-indigo-400',
-                        bg: 'bg-indigo-500',
-                        iconBg: 'bg-indigo-100 dark:bg-indigo-500/20'
-                    });
+                    applyAgentWarning('cpu', data.stats.cpu, SYS_CONFIG.cpu_threshold || 90);
                 }
             }
 
@@ -762,11 +760,7 @@ function updateAgentStatsUI(data) {
             if (progRam) {
                 progRam.style.width = data.stats.ram + "%";
                 if (typeof SYS_CONFIG !== 'undefined') {
-                    applyAgentWarning('ram', data.stats.ram, SYS_CONFIG.ram_threshold || 90, {
-                        text: 'text-purple-600 dark:text-purple-400',
-                        bg: 'bg-purple-500',
-                        iconBg: 'bg-purple-100 dark:bg-purple-500/20'
-                    });
+                    applyAgentWarning('ram', data.stats.ram, SYS_CONFIG.ram_threshold || 90);
                 }
             }
 
@@ -787,11 +781,7 @@ function updateAgentStatsUI(data) {
             if (progDisk) {
                 progDisk.style.width = data.stats.disk + "%";
                 if (typeof SYS_CONFIG !== 'undefined') {
-                    applyAgentWarning('disk', data.stats.disk, SYS_CONFIG.disk_threshold || 95, {
-                        text: 'text-green-600 dark:text-green-400',
-                        bg: 'bg-green-500',
-                        iconBg: 'bg-green-100 dark:bg-green-500/20'
-                    });
+                    applyAgentWarning('disk', data.stats.disk, SYS_CONFIG.disk_threshold || 95);
                 }
             }
 
