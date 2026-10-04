@@ -1,0 +1,179 @@
+{
+  "page": {
+    "title": "Мониторинг сервисов",
+    "description": "Отслеживание SSL-сертификатов, DNS, HTTP, TCP и WHOIS-статуса; оповещение об истечении срока или сбое."
+  },
+  "empty": {
+    "noMonitors": "Мониторы сервисов пока не настроены.",
+    "createFirst": "Создать первый монитор"
+  },
+  "dialog": {
+    "addTitle": "Добавить монитор",
+    "editTitle": "Редактировать монитор",
+    "addDescription": "Создание нового монитора сервиса.",
+    "editDescription": "Обновление конфигурации монитора сервиса."
+  },
+  "monitorTypes": {
+    "ssl": "SSL",
+    "dns": "DNS",
+    "http_keyword": "HTTP-ключевое слово",
+    "tcp": "TCP",
+    "whois": "WHOIS"
+  },
+  "form": {
+    "name": "Название",
+    "type": "Тип",
+    "target": "Цель",
+    "interval": "Интервал (секунды)",
+    "enabled": "Включено"
+  },
+  "sslConfig": {
+    "warningDays": "Дней до предупреждения",
+    "criticalDays": "Дней до критического уровня"
+  },
+  "dnsConfig": {
+    "recordType": "Тип записи",
+    "expectedValues": "Ожидаемые значения (по одному на строку)",
+    "nameserver": "DNS-сервер (опционально)"
+  },
+  "httpConfig": {
+    "method": "Метод",
+    "timeout": "Тайм-аут (с)",
+    "keyword": "Ключевое слово",
+    "keywordExists": "Ключевое слово должно присутствовать в ответе",
+    "expectedStatus": "Ожидаемые коды статуса (через запятую)"
+  },
+  "tcpConfig": {
+    "timeout": "Тайм-аут (с)"
+  },
+  "whoisConfig": {
+    "warningDays": "Дней до предупреждения",
+    "criticalDays": "Дней до критического уровня",
+    "targetHint": "WHOIS принимает домен, URL или host:port и перед сохранением извлечёт из них домен.",
+    "targetPreview": "WHOIS выполнит запрос: {{target}}",
+    "unsupportedTldHint": "Домены .app, .dev и .page обычно не раскрывают данные через традиционный WHOIS, поэтому рекомендуется использовать SSL-монитор.",
+    "targetInvalid": "Укажите цель WHOIS, которая преобразуется в домен, например example.com или https://example.com."
+  },
+  "table": {
+    "status": "Статус",
+    "name": "Название",
+    "type": "Тип",
+    "target": "Цель",
+    "interval": "Интервал",
+    "enabled": "Включено",
+    "lastChecked": "Последняя проверка",
+    "actions": "Действия"
+  },
+  "targetPlaceholder": {
+    "ssl": "example.com или example.com:8443",
+    "dns": "example.com",
+    "http_keyword": "https://example.com/health",
+    "tcp": "example.com:3306",
+    "whois": "example.com"
+  },
+  "namePlaceholder": "Моя проверка SSL",
+  "dnsExpectedPlaceholder": "например, 93.184.216.34",
+  "dnsNameserverPlaceholder": "например, 8.8.8.8",
+  "httpKeywordPlaceholder": "Строка для поиска в теле ответа",
+  "httpStatusPlaceholder": "200, 201",
+  "aria": {
+    "viewDetails": "Просмотреть детали",
+    "triggerCheck": "Запустить проверку",
+    "edit": "Редактировать монитор",
+    "deleteMonitor": "Удалить монитор"
+  },
+  "toast": {
+    "created": "Монитор создан",
+    "updated": "Монитор обновлён",
+    "deleted": "Монитор удалён",
+    "createFailed": "Не удалось создать монитор",
+    "updateFailed": "Не удалось обновить монитор",
+    "deleteFailed": "Не удалось удалить монитор",
+    "checkTriggered": "Проверка запущена",
+    "triggerFailed": "Не удалось запустить проверку",
+    "toggleFailed": "Не удалось переключить состояние монитора"
+  },
+  "stats": {
+    "uptime": "Аптайм",
+    "avgLatency": "Средняя задержка",
+    "lastCheck": "Последняя проверка"
+  },
+  "detail": {
+    "ssl": {
+      "title": "SSL-сертификат",
+      "subject": "Субъект",
+      "issuer": "Издатель",
+      "notBefore": "Действителен с",
+      "notAfter": "Действителен до",
+      "daysRemaining": "Осталось дней",
+      "sha256Fingerprint": "Отпечаток SHA-256",
+      "warning": "Предупреждение"
+    },
+    "dns": {
+      "title": "DNS-резолвинг",
+      "recordType": "Тип записи",
+      "nameserver": "DNS-сервер",
+      "changed": "Изменено",
+      "resolvedValues": "Полученные значения",
+      "yes": "Да",
+      "no": "Нет"
+    },
+    "http": {
+      "title": "HTTP-проверка",
+      "statusCode": "Код статуса",
+      "keywordFound": "Ключевое слово найдено",
+      "responseTime": "Время ответа",
+      "yes": "Да",
+      "no": "Нет",
+      "na": "Н/Д"
+    },
+    "tcp": {
+      "title": "TCP-соединение",
+      "connected": "Подключено",
+      "yes": "Да",
+      "no": "Нет"
+    },
+    "whois": {
+      "title": "Информация WHOIS",
+      "registrar": "Регистратор",
+      "expiryDate": "Дата истечения",
+      "daysRemaining": "Осталось дней",
+      "warning": "Предупреждение"
+    }
+  },
+  "history": {
+    "title": "История проверок",
+    "empty": "История проверок пока отсутствует.",
+    "table": {
+      "time": "Время",
+      "status": "Статус",
+      "latency": "Задержка",
+      "error": "Ошибка"
+    },
+    "status": {
+      "ok": "OK",
+      "fail": "Сбой"
+    }
+  },
+  "navigation": {
+    "backToList": "Назад к мониторам сервисов"
+  },
+  "actions": {
+    "checkNow": "Проверить сейчас",
+    "addMonitor": "Добавить монитор"
+  },
+  "status": {
+    "up": "Работает",
+    "down": "Не работает",
+    "online": "Онлайн",
+    "offline": "Офлайн",
+    "pending": "Ожидание",
+    "notChecked": "Ещё не проверялось"
+  },
+  "chart": {
+    "responseTime": "Время ответа",
+    "latency": "Задержка",
+    "noRecords": "Нет данных для построения графика."
+  },
+  "notFound": "Монитор сервиса не найден."
+}

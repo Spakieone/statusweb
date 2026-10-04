@@ -1,0 +1,8 @@
+{
+  "title": "Терминал",
+  "back": "Назад",
+  "reconnect": "Переподключиться",
+  "status_connected": "подключено",
+  "status_connecting": "подключение…",
+  "status_closed": "закрыто"
+}

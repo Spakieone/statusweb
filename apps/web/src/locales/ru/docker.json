@@ -1,0 +1,107 @@
+{
+  "backToServer": "Назад к серверу",
+  "overview": {
+    "running": "Запущено",
+    "stopped": "Остановлено",
+    "totalCpu": "Всего CPU",
+    "totalMemory": "Всего памяти",
+    "dockerVersion": "Версия Docker",
+    "unknown": "Неизвестно"
+  },
+  "containers": {
+    "title": "Контейнеры",
+    "searchPlaceholder": "Поиск контейнеров...",
+    "noFilterMatch": "Нет контейнеров, соответствующих текущему фильтру",
+    "noContainers": "Контейнеры не найдены"
+  },
+  "notAvailable": {
+    "title": "Docker недоступен",
+    "description": "Ожидание данных Docker от агента..."
+  },
+  "noContainers": {
+    "title": "Контейнеры не найдены",
+    "description": "Docker запущен, но контейнеров нет"
+  },
+  "networksButton": "Сети",
+  "volumesButton": "Тома",
+  "filter": {
+    "all": "Все",
+    "running": "Запущенные",
+    "stopped": "Остановленные"
+  },
+  "state": {
+    "created": "Создан",
+    "restarting": "Перезапускается",
+    "running": "Запущен",
+    "removing": "Удаляется",
+    "paused": "Приостановлен",
+    "exited": "Завершён",
+    "dead": "Неактивен"
+  },
+  "table": {
+    "name": "Название",
+    "image": "Образ",
+    "status": "Статус",
+    "cpu": "CPU %",
+    "memory": "Память",
+    "networkIO": "Сеть I/O"
+  },
+  "detail": {
+    "image": "Образ",
+    "status": "Статус",
+    "ports": "Порты",
+    "created": "Создан",
+    "containerId": "ID контейнера",
+    "noPorts": "Нет"
+  },
+  "actions": {
+    "start": "Запустить",
+    "stop": "Остановить",
+    "restart": "Перезапустить",
+    "remove": "Удалить",
+    "removeTitle": "Удалить контейнер?",
+    "removeConfirm": "Контейнер \"{{name}}\" будет удалён. Это действие нельзя отменить.",
+    "removeRunningNote": "Контейнер запущен и будет удалён принудительно.",
+    "cancel": "Отмена",
+    "started": "Контейнер запущен",
+    "stopped": "Контейнер остановлен",
+    "restarted": "Контейнер перезапущен",
+    "removed": "Контейнер удалён",
+    "failed": "Действие не выполнено"
+  },
+  "networks": {
+    "title": "Сети Docker",
+    "empty": "Сети не найдены",
+    "table": {
+      "name": "Название",
+      "driver": "Драйвер",
+      "scope": "Область",
+      "containers": "Контейнеры"
+    }
+  },
+  "volumes": {
+    "title": "Тома Docker",
+    "empty": "Тома не найдены",
+    "table": {
+      "name": "Название",
+      "driver": "Драйвер",
+      "mountpoint": "Точка монтирования",
+      "created": "Создан"
+    }
+  },
+  "logs": {
+    "title": "Логи",
+    "connected": "Подключено",
+    "disconnected": "Отключено",
+    "follow": "Следить",
+    "clear": "Очистить",
+    "empty": "Записей лога пока нет..."
+  },
+  "events": {
+    "title": "События",
+    "empty": "События пока не зафиксированы"
+  },
+  "common": {
+    "notAvailable": "Н/Д"
+  }
+}

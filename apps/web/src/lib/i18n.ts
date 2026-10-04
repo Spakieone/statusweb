@@ -34,12 +34,29 @@ import zhSettings from '@/locales/zh/settings.json'
 import zhStatus from '@/locales/zh/status.json'
 import zhTerminal from '@/locales/zh/terminal.json'
 
+import ruCommon from '@/locales/ru/common.json'
+import ruDashboard from '@/locales/ru/dashboard.json'
+import ruDocker from '@/locales/ru/docker.json'
+import ruFile from '@/locales/ru/file.json'
+import ruFirewall from '@/locales/ru/firewall.json'
+import ruIpQuality from '@/locales/ru/ip-quality.json'
+import ruLogin from '@/locales/ru/login.json'
+import ruNetwork from '@/locales/ru/network.json'
+import ruOnboarding from '@/locales/ru/onboarding.json'
+import ruSecurity from '@/locales/ru/security.json'
+import ruServers from '@/locales/ru/servers.json'
+import ruServiceMonitors from '@/locales/ru/service-monitors.json'
+import ruSettings from '@/locales/ru/settings.json'
+import ruStatus from '@/locales/ru/status.json'
+import ruTerminal from '@/locales/ru/terminal.json'
+
 // i18next resource keys are bare language codes; `<html lang>` wants a BCP-47
 // tag so screen readers pick the right voice and the browser the right
 // hyphenation/font rules.
 const HTML_LANG_TAGS: Record<string, string> = {
   en: 'en',
-  zh: 'zh-CN'
+  zh: 'zh-CN',
+  ru: 'ru'
 }
 
 function syncDocumentLang() {
@@ -89,6 +106,23 @@ i18next
         settings: zhSettings,
         status: zhStatus,
         terminal: zhTerminal
+      },
+      ru: {
+        common: ruCommon,
+        dashboard: ruDashboard,
+        docker: ruDocker,
+        file: ruFile,
+        firewall: ruFirewall,
+        'ip-quality': ruIpQuality,
+        login: ruLogin,
+        network: ruNetwork,
+        onboarding: ruOnboarding,
+        security: ruSecurity,
+        servers: ruServers,
+        'service-monitors': ruServiceMonitors,
+        settings: ruSettings,
+        status: ruStatus,
+        terminal: ruTerminal
       }
     },
     fallbackLng: 'en',

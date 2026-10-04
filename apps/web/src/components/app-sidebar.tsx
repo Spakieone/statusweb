@@ -99,7 +99,11 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const { isMobile } = useSidebar()
   const isAdmin = user?.role === 'admin'
   const roleLabel = user?.role ? t(isAdmin ? 'users.role_admin' : 'users.role_member', { ns: 'settings' }) : ''
-  const currentLang = (i18n.resolvedLanguage ?? i18n.language).startsWith('zh') ? 'zh' : 'en'
+  const currentLang = (i18n.resolvedLanguage ?? i18n.language).startsWith('zh')
+    ? 'zh'
+    : (i18n.resolvedLanguage ?? i18n.language).startsWith('ru')
+      ? 'ru'
+      : 'en'
 
   const handleLogout = async () => {
     await logout()
@@ -228,6 +232,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                       >
                         <DropdownMenuRadioItem value="zh">中文</DropdownMenuRadioItem>
                         <DropdownMenuRadioItem value="en">English</DropdownMenuRadioItem>
+                        <DropdownMenuRadioItem value="ru">Русский</DropdownMenuRadioItem>
                       </DropdownMenuRadioGroup>
                     </DropdownMenuSubContent>
                   </DropdownMenuSub>

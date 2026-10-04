@@ -1,0 +1,334 @@
+{
+  "title": "Панель мониторинга",
+  "servers_online": "{{online}} из {{total}} серверов онлайн",
+  "stat_servers": "Серверы",
+  "stat_status": "Статус",
+  "offline_count": "{{count}} офлайн",
+  "avg_cpu": "Средняя загрузка CPU",
+  "avg_memory": "Средняя загрузка RAM",
+  "total_bandwidth": "Общий трафик",
+  "per_second": "/с",
+  "online": "Онлайн",
+  "healthy": "Исправно",
+  "no_data": "Нет данных",
+  "chart_time": "Время",
+  "chart_date": "Дата",
+  "no_servers_title": "Серверы еще не подключены",
+  "no_servers_description": "Серверы появятся здесь после подключения через агент",
+  "ungrouped": "Без группы",
+  "unknown": "Неизвестно",
+  "edit": "Редактировать",
+  "save": "Сохранить",
+  "cancel": "Отмена",
+  "create": "Создать",
+  "delete": "Удалить",
+  "add_widget": "Добавить виджет",
+  "edit_widget": "Редактировать виджет",
+  "configure_widget": "Настроить виджет",
+  "widget_title": "Заголовок (опционально)",
+  "delete_widget": "Удалить виджет",
+  "lock_widget_position": "Закрепить позицию виджета",
+  "unlock_widget_position": "Разблокировать позицию виджета",
+  "new_dashboard": "Новая панель",
+  "manage_dashboard": "Управление панелью",
+  "delete_dashboard": "Удалить панель",
+  "delete_dashboard_confirm": "Вы уверены, что хотите удалить «{{name}}»? Это действие нельзя отменить.",
+  "select_dashboard": "Выбрать панель",
+  "set_default": "Сделать по умолчанию",
+  "dashboard_name_placeholder": "Название панели",
+  "no_widgets_title": "Пока нет виджетов",
+  "no_widgets_description": "Нажмите «Редактировать», чтобы начать добавлять виджеты на панель",
+  "picker_custom_widgets": "Пользовательские виджеты",
+  "picker_no_custom_widgets": "Пользовательские виджеты еще не установлены.",
+  "module_not_installed": "Модуль виджета не установлен",
+  "module_not_installed_id": "Модуль виджета «{{id}}» не установлен",
+  "module_config_invalid": "Некорректная конфигурация виджета: {{message}}",
+  "module_config_no_fields": "Этот модуль не содержит настраиваемых полей.",
+  "toast_created": "Панель создана",
+  "toast_create_failed": "Не удалось создать панель",
+  "toast_updated": "Панель обновлена",
+  "toast_update_failed": "Не удалось обновить панель",
+  "toast_deleted": "Панель удалена",
+  "toast_delete_failed": "Не удалось удалить панель",
+  "widgetPicker": {
+    "categories": {
+      "Real-time": "В реальном времени",
+      "Charts": "Графики",
+      "Status": "Статус"
+    },
+    "types": {
+      "stat-number": {
+        "label": "Числовой показатель",
+        "description": "Значение одной метрики с иконкой"
+      },
+      "metric-card": {
+        "label": "Карточка метрики",
+        "description": "Текущее значение + изменение за 1ч + график и статистика за 24ч"
+      },
+      "server-cards": {
+        "label": "Карточки серверов",
+        "description": "Сетка карточек с обзором серверов"
+      },
+      "gauge": {
+        "label": "Индикатор",
+        "description": "Круговой индикатор метрики"
+      },
+      "line-chart": {
+        "label": "Линейный график",
+        "description": "Линейный график временного ряда"
+      },
+      "multi-line": {
+        "label": "Несколько линий",
+        "description": "Сравнение метрик по серверам"
+      },
+      "top-n": {
+        "label": "Топ N",
+        "description": "Рейтинговый список серверов"
+      },
+      "alert-list": {
+        "label": "Список оповещений",
+        "description": "Последние события оповещений"
+      },
+      "service-status": {
+        "label": "Статус сервисов",
+        "description": "Индикаторы статуса мониторинга сервисов"
+      },
+      "traffic-bar": {
+        "label": "Диаграмма трафика",
+        "description": "Столбчатая диаграмма трафика по дням"
+      },
+      "disk-io": {
+        "label": "Disk I/O",
+        "description": "График чтения/записи диска"
+      },
+      "server-map": {
+        "label": "Карта серверов",
+        "description": "Карта мира с расположением серверов"
+      },
+      "markdown": {
+        "label": "Markdown",
+        "description": "Произвольный контент в формате markdown"
+      },
+      "uptime-timeline": {
+        "label": "Хронология аптайма",
+        "description": "Шкала аптайма за 90 дней"
+      },
+      "network-latency": {
+        "label": "Сетевая задержка",
+        "description": "Задержка во времени до целей сетевого зонда"
+      },
+      "network-quality": {
+        "label": "Качество сети",
+        "description": "Текущая задержка и потери пакетов по каждой цели"
+      },
+      "network-overview": {
+        "label": "Обзор сети",
+        "description": "Качество сети по всем серверам"
+      }
+    }
+  },
+  "widgets": {
+    "trafficBar": {
+      "title": "Трафик",
+      "empty": {
+        "noData": "Нет данных о трафике"
+      },
+      "legend": {
+        "inbound": "Входящий",
+        "outbound": "Исходящий"
+      }
+    },
+    "alertList": {
+      "title": "Оповещения",
+      "empty": {
+        "noEvents": "Нет событий оповещений"
+      }
+    },
+    "serviceStatus": {
+      "title": "Статус сервисов",
+      "empty": {
+        "noMonitors": "Нет мониторов сервисов"
+      },
+      "status": {
+        "pending": "Ожидание",
+        "degraded": "Деградация",
+        "healthy": "Исправно",
+        "down": "Недоступен"
+      },
+      "summary": {
+        "healthy": "{{count}} исправно",
+        "degraded": "{{count}} деградация",
+        "down": "{{count}} недоступно",
+        "pending": "{{count}} в ожидании"
+      },
+      "neverChecked": "никогда"
+    },
+    "serverMap": {
+      "title": "Карта серверов",
+      "total": "Всего",
+      "serverCount_one": "{{count}} сервер",
+      "serverCount_other": "{{count}} серверов",
+      "empty": {
+        "noGeoIP": "База данных GeoIP не установлена",
+        "noLocationData": "Нет данных о расположении серверов",
+        "mapUnavailable": "Данные карты недоступны"
+      },
+      "actions": {
+        "downloadGeoIP": "Скачать базу данных GeoIP"
+      }
+    },
+    "uptimeTimeline": {
+      "title": "Хронология аптайма"
+    },
+    "diskIo": {
+      "title": "Disk I/O",
+      "legend": {
+        "read": "Чтение",
+        "write": "Запись"
+      },
+      "empty": {
+        "noData": "Нет данных Disk I/O"
+      }
+    },
+    "topN": {
+      "title": "Топ по {{metric}}",
+      "empty": {
+        "noServers": "Нет серверов онлайн"
+      }
+    },
+    "multiLine": {
+      "title": "Сравнение по {{metric}}"
+    },
+    "common": {
+      "labels": {
+        "metric": "Метрика",
+        "server": "Сервер",
+        "servers": "Серверы",
+        "monitors": "Мониторы",
+        "timeRange": "Временной диапазон",
+        "count": "Количество",
+        "maxItems": "Макс. элементов",
+        "maxOptional": "Максимальное значение (опционально)",
+        "sortOrder": "Сортировка",
+        "markdownContent": "Содержимое Markdown",
+        "days": "Дней",
+        "titleOptional": "Заголовок (опционально)",
+        "labelOptional": "Метка (опционально)",
+        "layout": "Макет",
+        "layoutGrid": "Сетка",
+        "layoutList": "Список",
+        "color": "Цвет графика",
+        "colorPrimary": "Основной цвет",
+        "colorSecondary": "Дополнительный цвет"
+      },
+      "placeholders": {
+        "selectServer": "Выберите сервер",
+        "selectMetric": "Выберите метрику",
+        "selectRange": "Выберите диапазон",
+        "widgetTitle": "Заголовок виджета",
+        "allServers": "Все серверы",
+        "writeMarkdown": "Введите текст в формате markdown...",
+        "optionalLabel": "Переопределить метку"
+      },
+      "empty": {
+        "noServers": "Нет доступных серверов",
+        "serverNotFound": "Сервер не найден"
+      },
+      "sort": {
+        "desc": "Сначала наибольшие",
+        "asc": "Сначала наименьшие"
+      },
+      "hints": {
+        "allServersWhenEmpty": "Оставьте пустым, чтобы включить все серверы",
+        "allMonitorsWhenEmpty": "Оставьте пустым, чтобы включить все мониторы"
+      },
+      "errors": {
+        "numberRange": "Введите число от {{min}} до {{max}}"
+      }
+    },
+    "networkLatency": {
+      "title": "Сетевая задержка",
+      "empty": {
+        "noData": "Нет данных сетевого зонда"
+      }
+    },
+    "networkQuality": {
+      "title": "Качество сети",
+      "empty": {
+        "noData": "Нет данных сетевого зонда"
+      }
+    },
+    "networkOverview": {
+      "title": "Обзор сети",
+      "empty": {
+        "noData": "Нет данных сетевого зонда"
+      }
+    }
+  },
+  "common": {
+    "metrics": {
+      "cpu": "CPU",
+      "memory": "Память",
+      "disk": "Диск",
+      "swap": "Swap",
+      "load1m": "Нагрузка (1м)",
+      "load5m": "Нагрузка (5м)",
+      "load15m": "Нагрузка (15м)",
+      "networkIn": "Входящий трафик",
+      "networkOut": "Исходящий трафик",
+      "network": "Сеть",
+      "diskIo": "Disk I/O",
+      "bandwidth": "Пропускная способность",
+      "serverCount": "Количество серверов",
+      "avgCpu": "Средняя загрузка CPU",
+      "avgMemory": "Средняя загрузка RAM",
+      "totalBandwidth": "Общий трафик",
+      "health": "Исправность"
+    },
+    "timeRange": {
+      "1hour": "1 час",
+      "6hours": "6 часов",
+      "12hours": "12 часов",
+      "24hours": "24 часа",
+      "3days": "3 дня",
+      "7days": "7 дней",
+      "30days": "30 дней",
+      "60days": "60 дней",
+      "90days": "90 дней",
+      "realtime": "В реальном времени"
+    }
+  },
+  "dialogs": {
+    "widgetConfig": {
+      "editTitle": "Редактировать виджет",
+      "configureTitle": "Настроить виджет",
+      "labels": {
+        "titleOptional": "Заголовок (опционально)",
+        "preview": "Предпросмотр"
+      },
+      "placeholders": {
+        "widgetTitle": "Заголовок виджета"
+      }
+    }
+  },
+  "states": {
+    "loading": "Загрузка...",
+    "downloading": "Загрузка...",
+    "download_failed": "Ошибка загрузки"
+  },
+  "metricCard": {
+    "metric": {
+      "cpu": "CPU",
+      "memory": "Память",
+      "network": "Сеть",
+      "diskIo": "Disk I/O"
+    },
+    "past1h": "за последний час",
+    "peak": "ПИК ЗА 24Ч",
+    "avg": "СРЕДНЕЕ ЗА 24Ч",
+    "unknownServer": "Неизвестный сервер",
+    "unknownMetric": "Метрика не настроена"
+  },
+  "rename_dashboard": "Переименовать панель",
+  "rename": "Переименовать"
+}

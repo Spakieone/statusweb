@@ -10,7 +10,9 @@ import i18next from 'i18next'
  */
 export function activeLocale(): string {
   const lang = i18next.resolvedLanguage ?? i18next.language ?? 'en'
-  return lang.startsWith('zh') ? 'zh-CN' : 'en-US'
+  if (lang.startsWith('zh')) return 'zh-CN'
+  if (lang.startsWith('ru')) return 'ru-RU'
+  return 'en-US'
 }
 
 export function formatDate(date: Date | string | number | undefined, opts: Intl.DateTimeFormatOptions = {}) {
