@@ -1,0 +1,225 @@
+---
+title: API Reference
+description: ServerBee REST API overview, authentication, WebSocket endpoints, and Swagger UI interactive docs.
+icon: FileCode
+---
+
+ServerBee exposes the same capabilities the web dashboard uses through REST and WebSocket APIs. The authoritative, schema-level reference is generated from OpenAPI annotations in the server binary.
+
+## Swagger UI
+
+Open the built-in interactive documentation at:
+
+```text
+https://your-server/swagger-ui/
+```
+
+Swagger UI lets you inspect request/response schemas and authentication requirements, and send test requests against your own deployment. The raw OpenAPI document is available at:
+
+```text
+https://your-server/api-docs/openapi.json
+```
+
+## Response Format
+
+Successful REST responses are wrapped as:
+
+```json
+{
+  "data": {}
+}
+```
+
+Application errors use an error code and message, with optional `details`:
+
+```json
+{
+  "error": {
+    "code": "BAD_REQUEST",
+    "message": "Bad request: description of what went wrong"
+  }
+}
+```
+
+## Authentication
+
+### Session Cookie
+
+Used by the web dashboard after login:
+
+```bash
+curl -X POST https://your-server/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"your-password"}' \
+  -c cookies.txt
+
+curl https://your-server/api/servers -b cookies.txt
+```
+
+### API Key
+
+Use API keys for automation. Admin users can create them in Settings → API Keys.
+
+```bash
+curl https://your-server/api/servers \
+  -H "X-API-Key: serverbee_your-api-key-here"
+```
+
+API keys use the `serverbee_` prefix and are shown only once when created. An API key authenticates as its owning user; it is a credential, not a separate role. Requests inherit the owner's current Admin or Member permissions. Only Admin users can create new API keys.
+
+### Bearer Session Token
+
+Mobile flows use Bearer tokens for selected REST and WebSocket endpoints:
+
+```bash
+curl https://your-server/api/auth/me \
+  -H "Authorization: Bearer <session-token>"
+```
+
+## Public Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/auth/login` | Web login |
+| GET | `/api/auth/oauth/providers` | List enabled OAuth providers |
+| GET | `/api/auth/oauth/{provider}` | OAuth authorization redirect |
+| GET | `/api/auth/oauth/{provider}/callback` | OAuth callback |
+| POST | `/api/mobile/auth/login` | Mobile login |
+| POST | `/api/mobile/auth/refresh` | Refresh a mobile session |
+| POST | `/api/mobile/auth/pair` | Redeem a mobile pairing code |
+| POST | `/api/agent/register` | Claim a bound enrollment offer with an Agent-proposed run token |
+| GET | `/api/status/config` | Public status page configuration |
+| GET | `/api/status` | Servers included on the public status page |
+| GET | `/api/status/servers/{id}` | Public detail for an included server |
+| GET | `/api/status/servers/{id}/metrics` | Public metrics for an included server |
+| GET | `/api/status/servers/{id}/uptime-daily` | Public daily uptime for an included server |
+| GET | `/api/status/network`, `/api/status/network/{id}` | Public network overview and per-server detail |
+| GET | `/api/status/ip-quality` | Public IP quality overview |
+| GET | `/api/status/incidents`, `/api/status/maintenances` | Public incidents and maintenance windows |
+| GET | `/api/settings/brand` | Public brand settings |
+| GET | `/api/brand/logo` | Serve uploaded logo |
+| GET | `/api/brand/favicon` | Serve uploaded favicon |
+
+## Authenticated Read Endpoints
+
+These endpoints require a user credential. Admin and Member users can use the listed read operations, plus operations that apply only to the signed-in account. API keys receive the same access as their owning users. Admin-only management endpoints are listed separately below.
+
+| Family | Representative endpoints |
+|--------|--------------------------|
+| Current user and credentials | `GET /api/auth/me`, `PUT /api/auth/password`, `GET /api/auth/api-keys`, `DELETE /api/auth/api-keys/{id}` |
+| 2FA and OAuth accounts | `/api/auth/2fa/*`, `GET/DELETE /api/auth/oauth/accounts/*` |
+| Mobile sessions and devices | `POST /api/mobile/auth/logout`, `GET /api/mobile/auth/devices`, `DELETE /api/mobile/auth/devices/{id}`, `POST /api/mobile/pair`, `POST /api/mobile/push/register`, `POST /api/mobile/push/unregister` |
+| Servers | `GET /api/servers`, `GET /api/servers/{id}`, `GET /api/servers/{id}/records`, `GET /api/servers/{id}/gpu-records` |
+| Agent Authority | `GET /api/servers/{id}/agent-authority`, `GET /api/agent-authority/events?server_id={id}` |
+| Groups and tags | `GET /api/server-groups`, `GET /api/servers/{id}/tags` |
+| Uptime and traffic | `GET /api/servers/{id}/uptime-daily`, `GET /api/servers/{id}/traffic` |
+| GeoIP | `GET /api/geoip/status` |
+| Ping tasks | `GET /api/ping-tasks`, `GET /api/ping-tasks/{id}/records` |
+| Network probes | `GET /api/network-probes/targets`, `GET /api/network-probes/setting`, `GET /api/network-probes/overview`, `GET /api/servers/{id}/network-probes/targets`, `GET /api/servers/{id}/network-probes/records`, `GET /api/servers/{id}/network-probes/summary`, `GET /api/servers/{id}/network-probes/anomalies` |
+| Traceroute results | `GET /api/servers/{id}/traceroute/{request_id}` |
+| Docker, read-only | `GET /api/servers/{id}/docker/containers`, `stats`, `info`, `events`, `networks`, `volumes` |
+| Service monitors | `GET /api/service-monitors`, `GET /api/service-monitors/{id}`, `GET /api/service-monitors/{id}/records` |
+| Status page config | `GET /api/status-page` |
+| Dashboards | `GET /api/dashboards`, `GET /api/dashboards/default`, `GET /api/dashboards/{id}` |
+| Cost insights | `GET /api/cost/overview`, `GET /api/servers/{id}/cost-insights` |
+| Alert events | `GET /api/alert-events`, `GET /api/alert-events/{alert_key}` |
+
+## Admin Write and Management Endpoints
+
+The following management and host-control operations require Admin. Operations listed above that apply only to the signed-in account remain available to authenticated Member users.
+
+| Family | Representative endpoints |
+|--------|--------------------------|
+| API key creation | `POST /api/auth/api-keys` |
+| Server management | `POST /api/servers` (idempotent onboarding), `PUT/DELETE /api/servers/{id}`, `POST /api/servers/{id}/upgrade` |
+| Agent Authority | re-enrollment, offer issue/replace/revoke, and authority revocation under `/api/servers/{id}/agent-authority/*` |
+| Groups and tags | `POST /api/server-groups`, `PUT/DELETE /api/server-groups/{id}`, `PUT /api/servers/{id}/tags` |
+| Ping and network probes | `POST /api/ping-tasks`, `PUT/DELETE /api/ping-tasks/{id}`, `POST /api/network-probes/targets`, `PUT/DELETE /api/network-probes/targets/{id}`, `PUT /api/network-probes/setting`, `PUT /api/servers/{id}/network-probes/targets` |
+| Traceroute | `POST /api/servers/{id}/traceroute` |
+| Files | All `/api/files/*` endpoints, including list, stat, read, download, transfer management, and file changes |
+| Docker actions | `POST /api/servers/{id}/docker/containers/{cid}/action` |
+| Service monitors | `POST /api/service-monitors`, `PUT/DELETE /api/service-monitors/{id}`, `POST /api/service-monitors/{id}/check` |
+| Dashboards | `POST /api/dashboards`, `PUT/DELETE /api/dashboards/{id}` |
+| Brand appearance | `PUT /api/settings/brand`, `POST /api/settings/brand/logo`, `POST /api/settings/brand/favicon` |
+| Status page | `PUT /api/status-page` |
+| Incidents | `GET/POST /api/incidents`, `PUT/DELETE /api/incidents/{id}`, `POST /api/incidents/{id}/updates` |
+| Maintenance windows | `GET/POST /api/maintenances`, `PUT/DELETE /api/maintenances/{id}` |
+| Alerts and notifications | Manage `/api/alert-rules`, `/api/notifications`, `/api/notification-groups`, and their `/{id}` routes |
+| Tasks | `GET/POST /api/tasks`, `GET/PUT/DELETE /api/tasks/{id}`, `GET /api/tasks/{id}/results`, `POST /api/tasks/{id}/run` |
+| Users | `GET/POST /api/users`, `GET/PUT/DELETE /api/users/{id}` |
+| Audit and settings | `GET/DELETE /api/audit-logs`, `GET/PUT /api/settings`, `POST /api/settings/backup`, `POST /api/settings/restore` |
+| GeoIP | `POST /api/geoip/download` |
+
+The backup endpoint returns a raw SQLite download. Restore accepts a raw SQLite body with `Content-Type: application/octet-stream` and requires a Server restart. Both are Admin-only, high-risk operations; see [Backup and Restore](/en/docs/deployment#backup-and-restore) for verified commands and safeguards.
+
+## Agent Authority and Enrollment
+
+Responses follow the standard `{ "data": ... }` envelope. Agent Authority management requires Admin; state and event history are authenticated read endpoints.
+
+### `POST /api/servers` -- Onboard a Server
+
+Creates the Server profile and its initial bound offer atomically. `onboarding_request_id` is required and is scoped to the authenticated actor. Retrying the same ID with identical normalized input returns the same `server_id`; reusing it with different input returns `409 ONBOARDING_IDEMPOTENCY_CONFLICT`.
+
+```json
+{
+  "onboarding_request_id": "019f...",
+  "name": "edge-tpe-1",
+  "tags": ["production"],
+  "ttl_secs": 600
+}
+```
+
+A new operation returns `replayed: false` and `enrollment: { id, code, code_prefix, expires_at }`. A replay returns `replayed: true`, never returns plaintext `code`, and may return `outstanding_offer` metadata.
+
+### `POST /api/agent/register` -- Claim an offer
+
+This public Agent endpoint authenticates with `Authorization: Bearer <enrollment_code>` and requires an Agent-generated token:
+
+```json
+{ "proposed_run_token": "<32-or-more non-whitespace characters>" }
+```
+
+On success it consumes the offer, stores only the run-token hash, and returns `{ "data": { "server_id": "..." } }`. The Server never returns the plaintext run token.
+
+### Agent Authority state and history
+
+- `GET /api/servers/{id}/agent-authority` returns `status` (`claimed` or `unclaimed`) and the current `outstanding_offer`, if any.
+- `GET /api/agent-authority/events?server_id={id}&limit=100` returns secret-free transition history. Events survive Server deletion.
+
+### Offer and authority actions
+
+- `POST /api/servers/{id}/agent-authority/re-enrollment` with `{ "mode": "graceful" | "emergency", "ttl_secs": 600 }` starts re-enrollment for a claimed authority. Graceful keeps the old authority valid; emergency revokes and fences it immediately.
+- `POST /api/servers/{id}/agent-authority/offers` with optional `{ "ttl_secs": 600 }` issues an offer only when authority is unclaimed.
+- `POST /api/servers/{id}/agent-authority/offers/{offer_id}/replace` replaces exactly the current outstanding offer and returns new plaintext once.
+- `DELETE /api/servers/{id}/agent-authority/offers/{offer_id}` revokes exactly that offer.
+- `DELETE /api/servers/{id}/agent-authority` revokes the current authority and disconnects its Agent without issuing an offer.
+
+Only one offer may be outstanding per Server. Its terminal outcome is exactly one of `consumed`, `revoked`, `replaced`, or `expired`. Exact-ID replacement is compare-and-swap: stale or terminal offers return `409` and cannot overwrite newer state.
+
+## WebSocket Endpoints
+
+| Path | Auth | Description |
+|------|------|-------------|
+| `/api/agent/ws` | Agent Bearer token (`?token=` accepted for legacy Agents) | Agent metrics, commands, pings, files, Docker, traceroute |
+| `/api/ws/servers` | Session cookie, API key, or Bearer token | Browser/mobile real-time server updates |
+| `/api/ws/terminal/{server_id}` | Authenticated Admin + `CAP_TERMINAL` | Web terminal proxy; JSON text messages with terminal data base64-encoded |
+| `/api/ws/docker/logs/{server_id}` | Authenticated Admin + `CAP_DOCKER` | Per-container Docker log streaming |
+
+## Common Status Codes
+
+| Code | Meaning |
+|------|---------|
+| 400 | Bad request or invalid operation |
+| 401 | Not authenticated |
+| 403 | Forbidden: role, capability, or local agent policy blocks the operation |
+| 404 | Resource not found, server offline, or disabled public page |
+| 409 | Conflict, such as duplicate slug/name |
+| 422 | Validation error |
+| 429 | Rate limited |
+| 500 | Internal server error |
+
+<Cards>
+  <Card title="Capabilities" href="/en/docs/capabilities" />
+  <Card title="Admin Guide" href="/en/docs/admin" />
+  <Card title="Architecture" href="/en/docs/architecture" />
+</Cards>

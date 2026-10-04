@@ -1,0 +1,178 @@
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { api } from '@/lib/api-client'
+import type {
+  NetworkProbeAnomaly,
+  NetworkProbeRecord,
+  NetworkProbeSetting,
+  NetworkProbeTarget,
+  NetworkServerSummary,
+  TraceProtocol,
+  TracerouteRecordSummary,
+  TracerouteResponse,
+  TracerouteResult
+} from '@/lib/network-types'
+import { isoWindow } from '@/lib/utils'
+
+export function useNetworkTargets() {
+  return useQuery<NetworkProbeTarget[]>({
+    queryKey: ['network-probes', 'targets'],
+    queryFn: () => api.get('/api/network-probes/targets')
+  })
+}
+
+export function useNetworkSetting() {
+  return useQuery<NetworkProbeSetting>({
+    queryKey: ['network-probes', 'setting'],
+    queryFn: () => api.get('/api/network-probes/setting')
+  })
+}
+
+export function useNetworkOverview() {
+  return useQuery<NetworkServerSummary[]>({
+    queryKey: ['network-probes', 'overview'],
+    queryFn: () => api.get('/api/network-probes/overview'),
+    refetchInterval: 60_000
+  })
+}
+
+export function useNetworkServerSummary(serverId: string) {
+  return useQuery<NetworkServerSummary>({
+    queryKey: ['servers', serverId, 'network-probes', 'summary'],
+    queryFn: () => api.get(`/api/servers/${serverId}/network-probes/summary`),
+    enabled: serverId.length > 0
+  })
+}
+
+export function useNetworkRecords(serverId: string, hours: number, options?: { targetId?: string; enabled?: boolean }) {
+  return useQuery<NetworkProbeRecord[]>({
+    queryKey: ['servers', serverId, 'network-probes', 'records', hours, options?.targetId],
+    queryFn: () => {
+      const { from, to } = isoWindow(hours)
+      let url = `/api/servers/${serverId}/network-probes/records?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`
+      if (options?.targetId) {
+        url += `&target_id=${encodeURIComponent(options.targetId)}`
+      }
+      return api.get(url)
+    },
+    enabled: serverId.length > 0 && (options?.enabled ?? true),
+    refetchInterval: 60_000
+  })
+}
+
+export function useNetworkAnomalies(serverId: string, hours: number) {
+  return useQuery<NetworkProbeAnomaly[]>({
+    queryKey: ['servers', serverId, 'network-probes', 'anomalies', hours],
+    queryFn: () => {
+      const { from, to } = isoWindow(hours)
+      return api.get(
+        `/api/servers/${serverId}/network-probes/anomalies?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`
+      )
+    },
+    enabled: serverId.length > 0
+  })
+}
+
+export function useCreateTarget() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: { name: string; provider: string; location: string; target: string; probe_type: string }) =>
+      api.post('/api/network-probes/targets', input),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['network-probes', 'targets'] })
+    }
+  })
+}
+
+export function useUpdateTarget() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      id,
+      ...input
+    }: {
+      id: string
+      name: string
+      provider: string
+      location: string
+      target: string
+      probe_type: string
+    }) => api.put(`/api/network-probes/targets/${id}`, input),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['network-probes', 'targets'] })
+    }
+  })
+}
+
+export function useDeleteTarget() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => api.delete(`/api/network-probes/targets/${id}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['network-probes', 'targets'] })
+    }
+  })
+}
+
+export function useUpdateNetworkSetting() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: NetworkProbeSetting) => api.put('/api/network-probes/setting', input),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['network-probes', 'setting'] })
+    }
+  })
+}
+
+export function useSetServerTargets(serverId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (targetIds: string[]) =>
+      api.put(`/api/servers/${serverId}/network-probes/targets`, { target_ids: targetIds }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['servers', serverId, 'network-probes'] })
+    }
+  })
+}
+
+export function useStartTraceroute(serverId: string) {
+  return useMutation({
+    mutationFn: (input: { target: string; protocol: TraceProtocol }) =>
+      api.post<TracerouteResponse>(`/api/servers/${serverId}/traceroute`, input)
+  })
+}
+
+export function useTracerouteRecord(serverId: string, requestId: string | null) {
+  return useQuery<TracerouteResult>({
+    queryKey: ['servers', serverId, 'traceroute', requestId],
+    queryFn: () => api.get(`/api/servers/${serverId}/traceroute/${requestId}`),
+    enabled: !!requestId,
+    refetchInterval: (query) => (query.state.data?.completed ? false : 2000)
+  })
+}
+
+export function useTracerouteHistory(serverId: string) {
+  return useQuery<TracerouteRecordSummary[]>({
+    queryKey: ['servers', serverId, 'traceroute-history'],
+    queryFn: () => api.get(`/api/servers/${serverId}/traceroute?limit=50`)
+  })
+}
+
+export function useDeleteTraceroute(serverId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (requestId: string) => api.delete(`/api/servers/${serverId}/traceroute/${requestId}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['servers', serverId, 'traceroute-history'] })
+    }
+  })
+}
+
+export function useClearTracerouteHistory(serverId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () => api.delete(`/api/servers/${serverId}/traceroute`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['servers', serverId, 'traceroute-history'] })
+    }
+  })
+}

@@ -1,0 +1,63 @@
+import { useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
+import { Badge } from '@/components/ui/badge'
+import { ScrollArea } from '@/components/ui/scroll-area'
+import { formatRelativeTime } from '@/lib/widget-helpers'
+import type { DockerEventInfo } from '../types'
+
+interface DockerEventsProps {
+  events: DockerEventInfo[]
+}
+
+function eventTypeBadgeVariant(eventType: string): 'default' | 'secondary' | 'outline' | 'destructive' {
+  switch (eventType) {
+    case 'container':
+      return 'default'
+    case 'image':
+      return 'secondary'
+    case 'network':
+      return 'outline'
+    case 'volume':
+      return 'outline'
+    default:
+      return 'secondary'
+  }
+}
+
+export function DockerEvents({ events }: DockerEventsProps) {
+  const { t } = useTranslation('docker')
+  const sortedEvents = useMemo(() => {
+    return events.toSorted((a, b) => b.timestamp - a.timestamp)
+  }, [events])
+
+  if (sortedEvents.length === 0) {
+    return (
+      <div className="flex min-h-[200px] items-center justify-center rounded-lg border border-dashed">
+        <p className="text-muted-foreground text-sm">{t('events.empty')}</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-2">
+      <h3 className="font-semibold text-lg">{t('events.title')}</h3>
+      <ScrollArea className="max-h-[400px] rounded-lg border" contentClassName="space-y-1 p-3">
+        {sortedEvents.map((event, idx) => (
+          <div
+            className="flex items-start gap-3 rounded-md px-3 py-2 text-sm odd:bg-muted/30"
+            key={`${String(idx)}-${event.timestamp}-${event.event_type}-${event.action}`}
+          >
+            <span className="w-16 shrink-0 text-right text-muted-foreground text-xs tabular-nums">
+              {formatRelativeTime(event.timestamp)}
+            </span>
+            <Badge className="w-20 justify-center" variant={eventTypeBadgeVariant(event.event_type)}>
+              {event.event_type}
+            </Badge>
+            <span className="font-medium">{event.action}</span>
+            <span className="truncate text-muted-foreground">{event.actor_name ?? event.actor_id.slice(0, 12)}</span>
+          </div>
+        ))}
+      </ScrollArea>
+    </div>
+  )
+}

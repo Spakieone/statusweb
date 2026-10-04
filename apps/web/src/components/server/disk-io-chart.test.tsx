@@ -1,0 +1,95 @@
+import { fireEvent, render, screen } from '@testing-library/react'
+import { createContext, type ReactNode, use, useState } from 'react'
+import { describe, expect, it, vi } from 'vitest'
+import { DiskIoChart } from './disk-io-chart'
+
+const TabsContext = createContext<{ setValue: (value: string) => void; value: string } | null>(null)
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string) =>
+      ({
+        chart_disk_io: 'Disk I/O',
+        disk_io_merged: 'Merged',
+        disk_io_per_disk: 'Per Disk',
+        disk_io_read: 'Read',
+        disk_io_write: 'Write'
+      })[key] ?? key
+  })
+}))
+
+vi.mock('@/components/ui/tabs', () => ({
+  Tabs: ({ children, defaultValue }: { children?: ReactNode; defaultValue?: string }) => {
+    const [value, setValue] = useState(defaultValue ?? '')
+    return <TabsContext.Provider value={{ setValue, value }}>{children}</TabsContext.Provider>
+  },
+  TabsList: ({ children }: { children?: ReactNode }) => <div data-testid="tabs-list">{children}</div>,
+  TabsTrigger: ({ children, value }: { children?: ReactNode; value: string }) => {
+    const context = use(TabsContext)
+    if (!context) {
+      return null
+    }
+
+    return (
+      <button onClick={() => context.setValue(value)} type="button">
+        {children}
+      </button>
+    )
+  },
+  TabsContent: ({ children, value }: { children?: ReactNode; value: string }) => {
+    const context = use(TabsContext)
+    if (!context || context.value !== value) {
+      return null
+    }
+
+    return <div data-testid={`tab-content-${value}`}>{children}</div>
+  }
+}))
+
+vi.mock('@/components/charts/metric-line-plot', () => ({
+  MetricLinePlot: ({ series }: { series: { dataKey: string }[] }) => (
+    <div data-testid="metric-line-plot">
+      {series.map((item) => (
+        <div data-testid={`line-${item.dataKey}`} key={item.dataKey} />
+      ))}
+    </div>
+  )
+}))
+
+describe('DiskIoChart', () => {
+  it('renders merged and per-disk views', async () => {
+    render(
+      <DiskIoChart
+        mergedData={[{ timestamp: '2026-03-19T10:00:00Z', read_bytes_per_sec: 100, write_bytes_per_sec: 200 }]}
+        perDiskData={[
+          {
+            name: 'sda',
+            data: [{ timestamp: '2026-03-19T10:00:00Z', read_bytes_per_sec: 100, write_bytes_per_sec: 200 }]
+          },
+          {
+            name: 'sdb',
+            data: [{ timestamp: '2026-03-19T10:00:00Z', read_bytes_per_sec: 50, write_bytes_per_sec: 100 }]
+          }
+        ]}
+      />
+    )
+
+    expect(screen.getByText('Disk I/O')).toBeInTheDocument()
+    expect(screen.getByTestId('tab-content-merged')).toBeInTheDocument()
+    expect(screen.getByTestId('metric-line-plot')).toBeInTheDocument()
+    expect(await screen.findByTestId('line-read_bytes_per_sec')).toBeInTheDocument()
+    expect(await screen.findByTestId('line-write_bytes_per_sec')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Per Disk' }))
+
+    expect(screen.getByTestId('tab-content-per-disk')).toBeInTheDocument()
+    expect(await screen.findByText('sda')).toBeInTheDocument()
+    expect(await screen.findByText('sdb')).toBeInTheDocument()
+  })
+
+  it('returns null when there is no disk I/O data', () => {
+    const { container } = render(<DiskIoChart mergedData={[]} perDiskData={[]} />)
+
+    expect(container).toBeEmptyDOMElement()
+  })
+})

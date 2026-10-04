@@ -1,0 +1,152 @@
+---
+title: Status Page
+description: Publish a public server health page with live metrics, incidents, maintenance windows, and uptime history.
+icon: Globe
+---
+
+ServerBee serves a single public status page at `https://your-server/status`. It requires no authentication, so you can share it with users or stakeholders to communicate service health.
+
+The page shows the servers and sections an administrator selects, backed by the public `GET /api/status/config` and `GET /api/status` endpoints.
+
+## What the Page Shows
+
+- Online/total server count.
+- Each selected server's online/offline status and group label.
+- Live metrics for online servers: CPU, memory, swap, disk, disk I/O, network speed/transfer, load, connections, and uptime.
+- A 90-day uptime timeline per server.
+- Public server remarks where configured.
+- Optional sections: server detail, network quality, IP quality, incidents, and maintenance windows.
+
+Sensitive identifiers such as IP addresses, hostnames, and interface details are stripped at the API boundary and never appear on the public page.
+
+## Configuring the Page
+
+Configure the page in **Settings → Status Page**. The status page is a singleton: there is one page, edited in place rather than created per slug.
+
+| Setting | API field | Description |
+|---------|-----------|-------------|
+| Enabled | `enabled` | When disabled, the public page returns no data |
+| Title | `title` | Public page title |
+| Description | `description` | Optional introductory text |
+| Servers | `server_ids` | Servers shown on the page |
+| Default layout | `default_layout` | `list` or `grid` |
+| Show server detail | `show_server_detail` | Allow drilling into a server's detail view |
+| Show network | `show_network` | Show the network quality section |
+| Show IP quality | `show_ip_quality` | Show the IP quality section |
+| Show incidents | `show_incidents` | Show the incidents section |
+| Show maintenance | `show_maintenance` | Show the maintenance section |
+| Yellow uptime threshold | `uptime_yellow_threshold` | Days below this percentage show as degraded |
+| Red uptime threshold | `uptime_red_threshold` | Days below this percentage show as a major outage |
+
+### Admin API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/status-page` | Read the status page configuration |
+| PUT | `/api/status-page` | Update the status page configuration |
+
+Update example:
+
+```json
+{
+  "title": "Production Status",
+  "description": "Public health for production services",
+  "server_ids": ["server-id-1", "server-id-2"],
+  "show_ip_quality": false,
+  "default_layout": "grid",
+  "show_server_detail": true,
+  "show_network": true,
+  "show_incidents": true,
+  "show_maintenance": true,
+  "enabled": true,
+  "uptime_yellow_threshold": 99.9,
+  "uptime_red_threshold": 95
+}
+```
+
+## Public API
+
+These endpoints are unauthenticated and power the public page:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/status/config` | Page metadata and display options |
+| GET | `/api/status` | Selected server statuses with live metrics and uptime |
+| GET | `/api/status/servers/{id}` | Detail view for one server |
+| GET | `/api/status/servers/{id}/metrics` | Time-series metrics for one server |
+| GET | `/api/status/servers/{id}/uptime-daily` | 90-day daily uptime for one server |
+| GET | `/api/status/network` | Network quality overview |
+| GET | `/api/status/network/{id}` | Network quality detail for one server |
+| GET | `/api/status/ip-quality` | IP quality overview |
+| GET | `/api/status/incidents` | Active and recent incidents |
+| GET | `/api/status/maintenances` | Active and upcoming maintenance windows |
+
+Each server entry includes `id`, `name`, `group_name`, region/country, `os`, `online`, `in_maintenance`, `uptime_percent`, and `uptime_daily`.
+
+## Uptime Timeline
+
+Each server shows a 90-day uptime timeline where every bar represents one day:
+
+- **Green** -- healthy uptime.
+- **Yellow** -- uptime below the yellow threshold.
+- **Red** -- uptime below the red threshold.
+- **Gray** -- no data.
+
+Uptime data comes from the `uptime_daily` table, populated by the server's background aggregation tasks. Missing dates are gap-filled so the timeline stays continuous.
+
+## Incidents
+
+Incidents are public announcements for outages or degraded service. They can optionally be linked to specific servers.
+
+### Fields
+
+| Field | Description |
+|-------|-------------|
+| `title` | Incident title |
+| `status` | `investigating`, `identified`, `monitoring`, or `resolved` |
+| `severity` | `minor`, `major`, or `critical` |
+| `server_ids_json` | Optional affected servers |
+| `is_public` | Whether the incident is shown on the public status page |
+
+An incident can carry multiple updates, each with its own `status` and `message`. Adding an update records the message and moves the incident to that update's status. Setting the status to `resolved` also sets `resolved_at`.
+
+### API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/incidents` | List incidents; supports status filtering |
+| POST | `/api/incidents` | Create an incident |
+| PUT | `/api/incidents/{id}` | Update an incident |
+| DELETE | `/api/incidents/{id}` | Delete an incident |
+| POST | `/api/incidents/{id}/updates` | Add an incident update |
+
+## Maintenance Windows
+
+Maintenance windows announce planned work and also suppress alert notifications for the associated servers while active.
+
+### Fields
+
+| Field | Description |
+|-------|-------------|
+| `title` | Maintenance title |
+| `description` | Optional details |
+| `start_at` | UTC start time |
+| `end_at` | UTC end time; must be after `start_at` |
+| `server_ids_json` | Optional affected servers |
+| `is_public` | Whether the window is shown on the public status page |
+| `active` | Whether the window is enabled |
+
+### API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/maintenances` | List maintenance windows |
+| POST | `/api/maintenances` | Create a maintenance window |
+| PUT | `/api/maintenances/{id}` | Update a maintenance window |
+| DELETE | `/api/maintenances/{id}` | Delete a maintenance window |
+
+<Cards>
+  <Card title="Service Monitors" href="/en/docs/service-monitors" />
+  <Card title="Alerts & Notifications" href="/en/docs/alerts" />
+  <Card title="API Reference" href="/en/docs/api-reference" />
+</Cards>

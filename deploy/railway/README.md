@@ -1,0 +1,152 @@
+# ServerBee Server — Railway Template
+
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/serverbee-server)
+
+Lightweight, self-hosted VPS monitoring server. Receives metrics from distributed agents over WebSocket, stores in SQLite, and serves a React dashboard.
+
+## Quick Start
+
+1. Click the **Deploy on Railway** button above
+2. Deploy — the server will be live in ~30 seconds
+3. On first start the server auto-creates an admin account with a randomly generated password and prints it once to the deploy logs as a highlighted credentials banner. Open the Railway logs to retrieve it. You must change this password on first login and may optionally choose a different username.
+
+## Volume
+
+ServerBee stores data in SQLite. Add a Railway volume mounted at `/data` to persist data across deploys.
+
+| Mount Path | Recommended Size |
+|-----------|-----------------|
+| `/data` | 1 GB |
+
+## Environment Variables
+
+### Recommended
+
+These are the variables you'll most likely want to configure:
+
+```env
+SERVERBEE_LOG__LEVEL="info"                    # 日志级别（trace/debug/info/warn/error）
+
+SERVERBEE_RETENTION__RECORDS_DAYS="7"          # 原始指标保留天数
+SERVERBEE_RETENTION__RECORDS_HOURLY_DAYS="90"  # 小时聚合保留天数
+SERVERBEE_RETENTION__AUDIT_LOGS_DAYS="180"     # 审计日志保留天数
+SERVERBEE_SCHEDULER__TIMEZONE="UTC"            # 时区，影响流量按天聚合（如 Asia/Shanghai）
+
+SERVERBEE_OAUTH__BASE_URL=""                   # OAuth 回调公网地址（如 https://xxx.up.railway.app）
+SERVERBEE_OAUTH__GITHUB__CLIENT_ID=""          # GitHub OAuth Client ID
+SERVERBEE_OAUTH__GITHUB__CLIENT_SECRET=""      # GitHub OAuth Client Secret
+SERVERBEE_OAUTH__ALLOW_REGISTRATION="false"    # 首次登录自动创建账号（true=开放注册，false=仅已绑定用户可登录）
+```
+
+### All Variables
+
+<details>
+<summary>Click to expand the full list of environment variables</summary>
+
+#### Server
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SERVERBEE_SERVER__DATA_DIR` | `/data` | Data directory for SQLite and backups |
+| `SERVERBEE_SERVER__TRUSTED_PROXIES` | `["10.0.0.0/8",...]` | Pre-configured to trust Railway's internal proxy. Override only if needed |
+
+#### Admin
+
+There is no admin username/password variable. On first start the server auto-creates an admin account with a randomly generated password printed once to the deploy logs (look for the highlighted credentials banner). You are required to change this password on first login and may optionally choose a different username then.
+
+#### Database
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SERVERBEE_DATABASE__PATH` | `serverbee.db` | SQLite file path (relative to `data_dir`) |
+| `SERVERBEE_DATABASE__MAX_CONNECTIONS` | `10` | Maximum database connection pool size |
+
+#### Authentication
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SERVERBEE_AUTH__SESSION_TTL` | `86400` | Session token TTL in seconds (24h) |
+| `SERVERBEE_AUTH__MAX_SERVERS` | `0` | Maximum servers allowed via enrollment (0 = no limit) |
+| `SERVERBEE_AUTH__SECURE_COOKIE` | `true` | Set `Secure` flag on session cookies. Set `false` for HTTP-only |
+
+#### Data Retention
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SERVERBEE_RETENTION__RECORDS_DAYS` | `7` | Raw metric records retention in days |
+| `SERVERBEE_RETENTION__RECORDS_HOURLY_DAYS` | `90` | Hourly aggregated records retention in days |
+| `SERVERBEE_RETENTION__GPU_RECORDS_DAYS` | `7` | GPU metric records retention in days |
+| `SERVERBEE_RETENTION__PING_RECORDS_DAYS` | `7` | Ping probe records retention in days |
+| `SERVERBEE_RETENTION__NETWORK_PROBE_DAYS` | `7` | Raw network probe records retention in days |
+| `SERVERBEE_RETENTION__NETWORK_PROBE_HOURLY_DAYS` | `90` | Hourly network probe aggregates retention in days |
+| `SERVERBEE_RETENTION__AUDIT_LOGS_DAYS` | `180` | Audit log retention in days |
+| `SERVERBEE_RETENTION__TRAFFIC_HOURLY_DAYS` | `7` | Traffic hourly records retention in days |
+| `SERVERBEE_RETENTION__TRAFFIC_DAILY_DAYS` | `400` | Traffic daily records retention in days |
+| `SERVERBEE_RETENTION__TASK_RESULTS_DAYS` | `7` | Task results retention in days |
+| `SERVERBEE_RETENTION__DOCKER_EVENTS_DAYS` | `7` | Docker event records retention in days |
+| `SERVERBEE_RETENTION__SERVICE_MONITOR_DAYS` | `30` | Service monitor records retention in days |
+
+#### Scheduler
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SERVERBEE_SCHEDULER__TIMEZONE` | `UTC` | IANA timezone for daily traffic aggregation (e.g. `Asia/Shanghai`) |
+
+#### Rate Limiting
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SERVERBEE_RATE_LIMIT__LOGIN_MAX` | `5` | Maximum login attempts per IP within 15-minute window |
+| `SERVERBEE_RATE_LIMIT__REGISTER_MAX` | `3` | Maximum agent registrations per IP within 15-minute window |
+
+#### OAuth (Optional)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SERVERBEE_OAUTH__BASE_URL` | — | Public base URL for OAuth callbacks (e.g. `https://xxx.up.railway.app`) |
+| `SERVERBEE_OAUTH__ALLOW_REGISTRATION` | `false` | Auto-create accounts on first OAuth login (true=open, false=linked only) |
+| `SERVERBEE_OAUTH__GITHUB__CLIENT_ID` | — | GitHub OAuth App client ID |
+| `SERVERBEE_OAUTH__GITHUB__CLIENT_SECRET` | — | GitHub OAuth App client secret |
+| `SERVERBEE_OAUTH__GOOGLE__CLIENT_ID` | — | Google OAuth client ID |
+| `SERVERBEE_OAUTH__GOOGLE__CLIENT_SECRET` | — | Google OAuth client secret |
+| `SERVERBEE_OAUTH__OIDC__ISSUER_URL` | — | OIDC provider issuer URL |
+| `SERVERBEE_OAUTH__OIDC__CLIENT_ID` | — | OIDC client ID |
+| `SERVERBEE_OAUTH__OIDC__CLIENT_SECRET` | — | OIDC client secret |
+
+#### Logging
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SERVERBEE_LOG__LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
+| `SERVERBEE_LOG__FILE` | — | Log file path. Empty means stdout only |
+
+#### Upgrade
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SERVERBEE_UPGRADE__RELEASE_BASE_URL` | `https://github.com/ZingerLittleBee/ServerBee/releases` | Base URL for agent upgrade release assets |
+
+</details>
+
+## Selecting an Image Version
+
+The source template pins the repository's current package version, currently `1.0.0-beta.4`. This avoids silently deploying the older image behind `:latest` before ServerBee has a stable `1.x` release.
+
+To pin a specific version (stable or pre-release), add a **Build Variable** in the Railway service (Settings → Variables → New Variable → toggle *Build*):
+
+```env
+SERVERBEE_IMAGE_TAG=1.0.0-beta.4
+```
+
+Then trigger a redeploy. Check the release page before changing the pin. Future prereleases update the moving `beta` tag, while `latest` moves only for suffix-free stable releases. The Dockerfile exposes the current pin through `ARG SERVERBEE_IMAGE_TAG=1.0.0-beta.4`, so it only affects the build stage and never leaks into the running container's environment.
+
+## Connecting Agents
+
+After deployment, configure your agents to connect:
+
+```bash
+SERVERBEE_SERVER_URL=https://your-railway-app.up.railway.app
+SERVERBEE_ENROLLMENT_CODE=<one-time code from Add Server>
+```
+
+Sign in to the deployed server as an admin and choose **Add Server**. ServerBee atomically creates the Server profile and a bound enrollment offer, then shows its install command once. The offer is single-use and short-lived (default 10 min).

@@ -1,0 +1,62 @@
+[package]
+name = "serverbee-agent"
+version.workspace = true
+edition.workspace = true
+
+[features]
+gpu = ["nvml-wrapper"]
+
+[dependencies]
+serverbee-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+
+sysinfo = "0.33"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+futures-util = "0.3"
+url = "2"
+rand = "0.8"
+portable-pty = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+semver = "1"
+x509-parser = "0.16"
+webpki-roots = "1"
+dashmap = "6"
+libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+nvml-wrapper = { version = "0.10", optional = true }
+bollard = "0.18"
+regex = "1"
+once_cell = "1"
+async-trait = "0.1"
+thiserror.workspace = true
+ipnet = "2"
+trippy-core = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+# test-util enables tokio's deterministic time control (pause/advance/start_paused)
+# used by unit tests that exercise backoff/timeout logic without real sleeps.
+tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
+# Conntrack/scan detection on Linux is implemented via the `conntrack -E`
+# CLI in subprocess mode. We considered direct netlink with
+# `netlink-packet-netfilter`, but as of v0.2 it only implements the nflog
+# subprotocol; conntrack parsing would require hand-rolling
+# nfnetlink_cttuple decoding. The subprocess keeps the surface area small
+# and easy to mock in tests; the watcher fails fast if the binary is
+# missing so the manager can disable scan detection without affecting
+# brute-force detection.

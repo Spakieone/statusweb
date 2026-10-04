@@ -1,0 +1,225 @@
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use axum::extract::State;
+use axum::routing;
+use axum::{Json, Router};
+use serde::Serialize;
+use utoipa::ToSchema;
+
+use crate::error::{ApiResponse, AppError, ok};
+use crate::service::geoip;
+use crate::state::AppState;
+
+#[derive(Serialize, ToSchema)]
+pub struct GeoIpStatus {
+    pub installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct GeoIpDownloadResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/geoip/status",
+    tag = "geoip",
+    responses(
+        (status = 200, description = "GeoIP database install status", body = GeoIpStatus),
+    )
+)]
+pub async fn geoip_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ApiResponse<GeoIpStatus>>, AppError> {
+    let guard = state.geoip.read().unwrap();
+    let status = match guard.as_ref() {
+        Some(service) => {
+            let source = if !state.config.geoip.mmdb_path.is_empty() {
+                "custom"
+            } else {
+                "downloaded"
+            };
+            let (file_size, updated_at) = std::fs::metadata(&service.source_path)
+                .map(|m| {
+                    let size = m.len() as i64;
+                    let modified = m.modified().ok().map(|t| {
+                        let dt: chrono::DateTime<chrono::Utc> = t.into();
+                        dt.to_rfc3339()
+                    });
+                    (Some(size), modified)
+                })
+                .unwrap_or((None, None));
+            GeoIpStatus {
+                installed: true,
+                source: Some(source.to_string()),
+                file_size,
+                updated_at,
+            }
+        }
+        None => GeoIpStatus {
+            installed: false,
+            source: None,
+            file_size: None,
+            updated_at: None,
+        },
+    };
+    ok(status)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/geoip/download",
+    tag = "geoip",
+    responses(
+        (status = 200, description = "GeoIP download result", body = GeoIpDownloadResponse),
+    )
+)]
+pub async fn geoip_download(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ApiResponse<GeoIpDownloadResponse>>, AppError> {
+    // Concurrent download guard
+    if state.geoip_downloading.swap(true, Ordering::SeqCst) {
+        return ok(GeoIpDownloadResponse {
+            success: false,
+            message: "Download already in progress".to_string(),
+        });
+    }
+
+    let result = geoip::download_dbip(&state.config.server.data_dir).await;
+
+    match result {
+        Ok(service) => {
+            {
+                let mut guard = state.geoip.write().unwrap();
+                *guard = Some(service);
+            }
+            state.geoip_downloading.store(false, Ordering::SeqCst);
+            // Retroactively resolve geo for already-connected servers. Without
+            // this, the live lookup only re-runs on agent reconnect or a public
+            // IP change, so the server map would stay blank right after the
+            // operator enables GeoIP.
+            backfill_server_geo(&state).await;
+            ok(GeoIpDownloadResponse {
+                success: true,
+                message: "GeoIP database installed successfully".to_string(),
+            })
+        }
+        Err(e) => {
+            state.geoip_downloading.store(false, Ordering::SeqCst);
+            ok(GeoIpDownloadResponse {
+                success: false,
+                message: e,
+            })
+        }
+    }
+}
+
+/// Re-resolve `region`/`country_code` for every server that has a public IP on
+/// record and no manual geo override, using the freshly-installed database.
+/// Best-effort: logs and continues on per-server errors so a single bad row
+/// never fails the whole download. Manually-pinned servers (`geo_manual`) are
+/// left untouched, matching the live agent update path.
+async fn backfill_server_geo(state: &AppState) {
+    use crate::entity::server;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let servers = match server::Entity::find().all(&state.db).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("GeoIP backfill: failed to list servers: {e}");
+            return;
+        }
+    };
+
+    let mut updated: u32 = 0;
+    for model in servers {
+        if model.geo_manual {
+            continue;
+        }
+        let Some(ip) = geoip::pick_public_ip(model.ipv4.as_deref(), model.ipv6.as_deref()) else {
+            continue;
+        };
+        let geo = {
+            let guard = state.geoip.read().unwrap();
+            match guard.as_ref() {
+                Some(service) => service.lookup(ip),
+                // Database was cleared out from under us; nothing to backfill.
+                None => return,
+            }
+        };
+        let server_id = model.id.clone();
+        let mut active: server::ActiveModel = model.into();
+        active.region = Set(geo.region);
+        active.country_code = Set(geo.country_code);
+        active.updated_at = Set(chrono::Utc::now());
+        match active.update(&state.db).await {
+            Ok(_) => updated += 1,
+            Err(e) => tracing::error!("GeoIP backfill: failed to update {server_id}: {e}"),
+        }
+    }
+    tracing::info!("GeoIP backfill: resolved geo for {updated} server(s)");
+}
+
+pub fn read_router() -> Router<Arc<AppState>> {
+    Router::new().route("/geoip/status", routing::get(geoip_status))
+}
+
+pub fn write_router() -> Router<Arc<AppState>> {
+    Router::new().route("/geoip/download", routing::post(geoip_download))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::test_utils::setup_test_db;
+
+    /// An `AppState` whose data dir points at a fresh tempdir, so no GeoIP
+    /// database is installed and nothing touches the real `./data` directory.
+    async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let (db, tmp) = setup_test_db().await;
+        let mut config = AppConfig::default();
+        config.server.data_dir = tmp.path().to_string_lossy().to_string();
+        let state = AppState::new(db, config).await.expect("build test state");
+        (state, tmp)
+    }
+
+    #[tokio::test]
+    async fn status_reports_not_installed_without_a_database() {
+        let (state, _tmp) = test_state().await;
+
+        let response = geoip_status(State(state))
+            .await
+            .expect("status should succeed");
+        let status = &response.0.data;
+        assert!(!status.installed);
+        assert!(status.source.is_none());
+        assert!(status.file_size.is_none());
+        assert!(status.updated_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn download_returns_already_in_progress_when_flag_set() {
+        let (state, _tmp) = test_state().await;
+        // Simulate a download already running: the guard must short-circuit
+        // before any network work instead of starting a second download.
+        state.geoip_downloading.store(true, Ordering::SeqCst);
+
+        let response = geoip_download(State(Arc::clone(&state)))
+            .await
+            .expect("download should return a body, not an error");
+        let body = &response.0.data;
+        assert!(!body.success);
+        assert_eq!(body.message, "Download already in progress");
+        // The guard must leave the flag set for the in-flight download.
+        assert!(state.geoip_downloading.load(Ordering::SeqCst));
+    }
+}

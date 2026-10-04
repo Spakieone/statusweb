@@ -1,0 +1,365 @@
+import { useQuery } from '@tanstack/react-query'
+import { createFileRoute } from '@tanstack/react-router'
+import { curveStep } from '@visx/curve'
+import { AlertTriangle, ArrowDownToLine, ArrowUpFromLine, Crown, Server } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { TrafficOverviewSkeleton } from '@/components/boneyard/page-skeletons'
+import { MetricAreaPlot, type MetricAreaSeries } from '@/components/charts/metric-area-plot'
+import { PageBody } from '@/components/layout/page-body'
+import { Badge } from '@/components/ui/badge'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { api } from '@/lib/api-client'
+import { cn, formatBytes } from '@/lib/utils'
+
+export const Route = createFileRoute('/_authed/traffic/')({
+  component: TrafficPage
+})
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface TrafficOverviewItem {
+  billing_cycle: string | null
+  cycle_in: number
+  cycle_out: number
+  days_remaining: number | null
+  name: string
+  percent_used: number | null
+  server_id: string
+  traffic_limit: number | null
+}
+
+interface DailyTrafficItem extends Record<string, unknown> {
+  bytes_in: number
+  bytes_out: number
+  date: string
+}
+
+// ---------------------------------------------------------------------------
+// Sort helpers
+// ---------------------------------------------------------------------------
+
+type SortField = 'name' | 'total' | 'percent'
+type SortDir = 'asc' | 'desc'
+
+/** Daily buckets are date-only strings, so the axis only needs month-day. */
+function formatDayTick(date: string): string {
+  return date.slice(5, 10)
+}
+
+function formatDayLabel(date: string): string {
+  return date.slice(0, 10)
+}
+
+function getTotal(s: TrafficOverviewItem): number {
+  return s.cycle_in + s.cycle_out
+}
+
+function compareServers(a: TrafficOverviewItem, b: TrafficOverviewItem, field: SortField, dir: SortDir): number {
+  let cmp = 0
+  switch (field) {
+    case 'name':
+      cmp = a.name.localeCompare(b.name)
+      break
+    case 'total':
+      cmp = getTotal(a) - getTotal(b)
+      break
+    case 'percent':
+      cmp = (a.percent_used ?? -1) - (b.percent_used ?? -1)
+      break
+    default:
+      break
+  }
+  return dir === 'asc' ? cmp : -cmp
+}
+
+// ---------------------------------------------------------------------------
+// Stat Card
+// ---------------------------------------------------------------------------
+
+function StatCard({
+  icon: Icon,
+  label,
+  value
+}: {
+  icon: React.ComponentType<{ className?: string }>
+  label: string
+  value: string
+}) {
+  return (
+    <Card>
+      <CardContent className="flex items-center gap-4">
+        <div className="flex size-10 items-center justify-center rounded-lg bg-muted">
+          <Icon className="size-5 text-muted-foreground" />
+        </div>
+        <div>
+          <p className="text-muted-foreground text-sm">{label}</p>
+          <p className="font-semibold text-lg">{value}</p>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function TrafficOverviewEmptyState({ description, title }: { description: string; title: string }) {
+  return (
+    <Card className="mb-6">
+      <CardContent className="flex flex-col items-center gap-2 p-12 text-center">
+        <p className="font-medium">{title}</p>
+        <p className="max-w-xl text-muted-foreground text-sm">{description}</p>
+      </CardContent>
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Progress bar (inline)
+// ---------------------------------------------------------------------------
+
+function UsageBar({ percent }: { percent: number | null }) {
+  if (percent == null) {
+    return <span className="text-muted-foreground text-xs">N/A</span>
+  }
+
+  const barColor = (() => {
+    if (percent >= 90) {
+      return 'bg-red-500'
+    }
+    if (percent >= 70) {
+      return 'bg-yellow-500'
+    }
+    return 'bg-green-500'
+  })()
+
+  const textColor = (() => {
+    if (percent >= 90) {
+      return 'text-red-500'
+    }
+    if (percent >= 70) {
+      return 'text-yellow-500'
+    }
+    return ''
+  })()
+
+  // Real servers can exceed their limit (e.g. 250%), but extreme values would
+  // blow out the column width, so clamp the label to a readable ceiling.
+  const percentLabel = percent >= 1000 ? '>999%' : `${percent.toFixed(1)}%`
+
+  return (
+    <div className="flex items-center gap-2">
+      <div className="h-2 w-24 shrink-0 overflow-hidden rounded-full bg-muted">
+        <div
+          className={cn('h-full rounded-full transition-all', barColor)}
+          style={{ width: `${Math.min(percent, 100)}%` }}
+        />
+      </div>
+      <span className={cn('text-xs tabular-nums', textColor)}>{percentLabel}</span>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Sortable header
+// ---------------------------------------------------------------------------
+
+function SortableHead({
+  children,
+  field,
+  sortDir,
+  sortField,
+  onSort
+}: {
+  children: React.ReactNode
+  field: SortField
+  sortDir: SortDir
+  sortField: SortField
+  onSort: (f: SortField) => void
+}) {
+  const active = sortField === field
+  return (
+    <TableHead className="cursor-pointer select-none" onClick={() => onSort(field)}>
+      <span className={cn(active && 'font-bold')}>
+        {children}
+        {active && (sortDir === 'asc' ? ' \u2191' : ' \u2193')}
+      </span>
+    </TableHead>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Main Page
+// ---------------------------------------------------------------------------
+
+export function TrafficPage() {
+  const { t } = useTranslation('servers')
+  const [sortField, setSortField] = useState<SortField>('total')
+  const [sortDir, setSortDir] = useState<SortDir>('desc')
+
+  const { data: overview, isLoading: overviewLoading } = useQuery<TrafficOverviewItem[]>({
+    queryKey: ['traffic', 'overview'],
+    queryFn: () => api.get<TrafficOverviewItem[]>('/api/traffic/overview'),
+    staleTime: 60_000
+  })
+
+  const { data: dailyData, isLoading: dailyLoading } = useQuery<DailyTrafficItem[]>({
+    queryKey: ['traffic', 'overview', 'daily'],
+    queryFn: () => api.get<DailyTrafficItem[]>('/api/traffic/overview/daily?days=30'),
+    staleTime: 60_000
+  })
+
+  const trendSeries = useMemo<MetricAreaSeries[]>(
+    () => [
+      { dataKey: 'bytes_in', label: t('traffic_inbound'), color: 'var(--chart-1)' },
+      { dataKey: 'bytes_out', label: t('traffic_outbound'), color: 'var(--chart-2)' }
+    ],
+    [t]
+  )
+
+  const handleSort = (field: SortField) => {
+    if (sortField === field) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
+    } else {
+      setSortField(field)
+      setSortDir('desc')
+    }
+  }
+
+  const sorted = useMemo(() => {
+    if (!overview) {
+      return []
+    }
+    return overview.toSorted((a, b) => compareServers(a, b, sortField, sortDir))
+  }, [overview, sortField, sortDir])
+
+  // Stat card aggregations
+  const totalIn = useMemo(() => (overview ?? []).reduce((sum, s) => sum + s.cycle_in, 0), [overview])
+  const totalOut = useMemo(() => (overview ?? []).reduce((sum, s) => sum + s.cycle_out, 0), [overview])
+
+  const highestServer = useMemo(() => {
+    if (!overview || overview.length === 0) {
+      return '-'
+    }
+    const top = overview.reduce((max, s) => (getTotal(s) > getTotal(max) ? s : max), overview[0])
+    return top.name
+  }, [overview])
+
+  const warnCount = useMemo(
+    () => (overview ?? []).filter((s) => s.percent_used != null && s.percent_used > 80).length,
+    [overview]
+  )
+  const hasOverviewData = sorted.length > 0
+  const hasDailyData = (dailyData?.length ?? 0) > 0
+
+  const isLoading = overviewLoading || dailyLoading
+
+  if (isLoading) {
+    return (
+      <PageBody>
+        <TrafficOverviewSkeleton />
+      </PageBody>
+    )
+  }
+
+  return (
+    <PageBody>
+      <div className="w-full min-w-0 max-w-[calc(100vw-1.5rem)] sm:max-w-full">
+        {hasOverviewData ? (
+          <>
+            {/* Stat cards */}
+            <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              <StatCard icon={ArrowDownToLine} label={t('traffic_cycle_inbound')} value={formatBytes(totalIn)} />
+              <StatCard icon={ArrowUpFromLine} label={t('traffic_cycle_outbound')} value={formatBytes(totalOut)} />
+              <StatCard icon={Crown} label={t('traffic_highest_usage')} value={highestServer} />
+              <StatCard
+                icon={warnCount > 0 ? AlertTriangle : Server}
+                label={t('traffic_servers_warning')}
+                value={String(warnCount)}
+              />
+            </div>
+
+            {/* Server traffic ranking table */}
+            <div className="mb-6 min-w-0 max-w-full overflow-x-auto rounded-lg border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <SortableHead field="name" onSort={handleSort} sortDir={sortDir} sortField={sortField}>
+                      {t('traffic_server')}
+                    </SortableHead>
+                    <TableHead>{t('traffic_inbound')}</TableHead>
+                    <TableHead>{t('traffic_outbound')}</TableHead>
+                    <SortableHead field="total" onSort={handleSort} sortDir={sortDir} sortField={sortField}>
+                      {t('traffic_total')}
+                    </SortableHead>
+                    <TableHead>{t('traffic_limit')}</TableHead>
+                    <SortableHead field="percent" onSort={handleSort} sortDir={sortDir} sortField={sortField}>
+                      {t('traffic_usage')}
+                    </SortableHead>
+                    <TableHead>{t('traffic_days_left')}</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {sorted.map((s) => (
+                    <TableRow key={s.server_id}>
+                      <TableCell className="font-medium">{s.name}</TableCell>
+                      <TableCell className="tabular-nums">{formatBytes(s.cycle_in)}</TableCell>
+                      <TableCell className="tabular-nums">{formatBytes(s.cycle_out)}</TableCell>
+                      <TableCell className="tabular-nums">{formatBytes(getTotal(s))}</TableCell>
+                      <TableCell className="tabular-nums">
+                        {s.traffic_limit != null ? (
+                          formatBytes(s.traffic_limit)
+                        ) : (
+                          <Badge variant="secondary">{t('traffic_unlimited')}</Badge>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <UsageBar percent={s.percent_used} />
+                      </TableCell>
+                      <TableCell className="tabular-nums">
+                        {s.days_remaining != null ? (
+                          <span>{s.days_remaining}d</span>
+                        ) : (
+                          <span className="text-muted-foreground">-</span>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </>
+        ) : (
+          <TrafficOverviewEmptyState description={t('traffic_configure_prompt')} title={t('traffic_no_data')} />
+        )}
+
+        {/* Global 30-day trend chart */}
+        {hasDailyData && (
+          <Card>
+            <CardHeader>
+              <CardTitle>{t('traffic_global_trend')}</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <MetricAreaPlot
+                ariaLabel={t('traffic_global_trend')}
+                className="h-[300px] w-full"
+                curve={curveStep}
+                data={dailyData ?? []}
+                fillOpacity={0.3}
+                formatTime={formatDayTick}
+                formatTooltipLabel={formatDayLabel}
+                formatValue={formatBytes}
+                formatYAxisValue={formatBytes}
+                series={trendSeries}
+                timeKey="date"
+                timeLabel={t('traffic_chart_date')}
+                yMarginLeft={68}
+              />
+            </CardContent>
+          </Card>
+        )}
+      </div>
+    </PageBody>
+  )
+}

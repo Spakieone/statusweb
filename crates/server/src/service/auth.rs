@@ -1,0 +1,2142 @@
+use argon2::password_hash::SaltString;
+use argon2::password_hash::rand_core::OsRng;
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::Utc;
+use rand::RngCore;
+use sea_orm::*;
+use uuid::Uuid;
+
+use sea_orm::sea_query::Expr;
+
+use crate::entity::{api_key, device_token, mobile_session, server, session, user};
+use crate::error::AppError;
+
+/// Parameters for creating an authenticated session.
+pub struct LoginParams<'a> {
+    pub username: &'a str,
+    pub password: &'a str,
+    pub totp_code: Option<&'a str>,
+    pub ip: &'a str,
+    pub user_agent: &'a str,
+    pub session_ttl: i64,
+}
+
+pub struct WebSessionParams<'a> {
+    pub user_id: &'a str,
+    pub ip: &'a str,
+    pub user_agent: &'a str,
+    pub session_ttl: i64,
+}
+
+pub struct AuthService;
+
+impl AuthService {
+    /// The fixed username for the auto-provisioned first admin account.
+    pub const DEFAULT_ADMIN_USERNAME: &str = "admin";
+
+    /// Minimum length for a user-chosen password.
+    pub const MIN_PASSWORD_LEN: usize = 8;
+
+    /// Validate a user-chosen password against the minimum strength policy.
+    /// Applied wherever a user sets their own password (onboarding, change
+    /// password); not applied to system-generated secrets.
+    pub fn validate_password_strength(password: &str) -> Result<(), AppError> {
+        if password.chars().count() < Self::MIN_PASSWORD_LEN {
+            return Err(AppError::Validation(format!(
+                "Password must be at least {} characters",
+                Self::MIN_PASSWORD_LEN
+            )));
+        }
+        Ok(())
+    }
+
+    /// Hash a password using argon2 with a random salt.
+    pub fn hash_password(password: &str) -> Result<String, AppError> {
+        let salt = SaltString::generate(&mut OsRng);
+        let argon2 = Argon2::default();
+        let hash = argon2
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|e| AppError::Internal(format!("Password hashing failed: {e}")))?;
+        Ok(hash.to_string())
+    }
+
+    /// Verify a password against an argon2 hash.
+    pub fn verify_password(password: &str, hash: &str) -> Result<bool, AppError> {
+        let parsed_hash = PasswordHash::new(hash)
+            .map_err(|e| AppError::Internal(format!("Invalid password hash: {e}")))?;
+        Ok(Argon2::default()
+            .verify_password(password.as_bytes(), &parsed_hash)
+            .is_ok())
+    }
+
+    /// Create a new user with the given username, password, and role.
+    pub async fn create_user(
+        db: &DatabaseConnection,
+        username: &str,
+        password: &str,
+        role: &str,
+    ) -> Result<user::Model, AppError> {
+        // Check if username already exists
+        let existing = user::Entity::find()
+            .filter(user::Column::Username.eq(username))
+            .one(db)
+            .await?;
+
+        if existing.is_some() {
+            return Err(AppError::Conflict(format!(
+                "User '{username}' already exists"
+            )));
+        }
+
+        let password_hash = Self::hash_password(password)?;
+        let now = Utc::now();
+
+        let new_user = user::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            username: Set(username.to_string()),
+            password_hash: Set(password_hash),
+            role: Set(role.to_string()),
+            totp_secret: Set(None),
+            must_change_password: Set(false),
+            password_changed_at: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+
+        let result = new_user.insert(db).await?;
+        Ok(result)
+    }
+
+    /// Authenticate a user by username and password, creating a new session.
+    /// If the user has 2FA enabled, `totp_code` must be provided.
+    /// Returns the session and user models on success.
+    pub async fn login(
+        db: &DatabaseConnection,
+        params: LoginParams<'_>,
+    ) -> Result<(session::Model, user::Model), AppError> {
+        let user = user::Entity::find()
+            .filter(user::Column::Username.eq(params.username))
+            .one(db)
+            .await?
+            .ok_or(AppError::Unauthorized)?;
+
+        let valid = Self::verify_password(params.password, &user.password_hash)?;
+        if !valid {
+            return Err(AppError::Unauthorized);
+        }
+
+        // Check 2FA
+        if let Some(ref secret) = user.totp_secret {
+            match params.totp_code {
+                Some(code) => {
+                    if !Self::verify_totp(secret, code)? {
+                        return Err(AppError::Unauthorized);
+                    }
+                }
+                None => {
+                    // 2FA enabled but no code provided — signal requires_2fa
+                    return Err(AppError::Validation("2fa_required".to_string()));
+                }
+            }
+        }
+
+        let session = Self::create_web_session(
+            db,
+            WebSessionParams {
+                user_id: &user.id,
+                ip: params.ip,
+                user_agent: params.user_agent,
+                session_ttl: params.session_ttl,
+            },
+        )
+        .await?;
+        Ok((session, user))
+    }
+
+    /// Create a browser session and return its plaintext token to the caller.
+    /// Only the token hash is persisted.
+    pub async fn create_web_session(
+        db: &DatabaseConnection,
+        params: WebSessionParams<'_>,
+    ) -> Result<session::Model, AppError> {
+        let token = Self::generate_session_token();
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(params.session_ttl);
+        let new_session = session::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(params.user_id.to_string()),
+            // Store only the hash at rest; the plaintext lives in the cookie.
+            token: Set(Self::hash_session_token(&token)),
+            ip: Set(params.ip.to_string()),
+            user_agent: Set(params.user_agent.to_string()),
+            expires_at: Set(expires_at),
+            created_at: Set(now),
+            source: Set("web".to_string()),
+            mobile_session_id: Set(None),
+        };
+
+        let mut session_model = new_session.insert(db).await?;
+        // Hand the caller the plaintext token (for the Set-Cookie header). The
+        // row keeps the hash; this in-memory copy is never re-persisted.
+        session_model.token = token;
+        Ok(session_model)
+    }
+
+    /// Validate a session token. If valid and not expired, returns the
+    /// associated user and session. Only performs sliding expiry for
+    /// `source == "web"` sessions; mobile sessions keep their original TTL.
+    pub async fn validate_session(
+        db: &DatabaseConnection,
+        token: &str,
+        web_session_ttl: i64,
+    ) -> Result<Option<(user::Model, session::Model)>, AppError> {
+        let session = session::Entity::find()
+            .filter(session::Column::Token.eq(Self::hash_session_token(token)))
+            .one(db)
+            .await?;
+
+        let session = match session {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        // Check expiration
+        if session.expires_at < Utc::now() {
+            // Clean up expired session
+            session::Entity::delete_by_id(&session.id).exec(db).await?;
+            return Ok(None);
+        }
+
+        // Sliding expiry: only extend for web sessions
+        let session = if session.source == "web" {
+            let new_expires = Utc::now() + chrono::Duration::seconds(web_session_ttl);
+            let mut active: session::ActiveModel = session.into();
+            active.expires_at = Set(new_expires);
+            active.update(db).await?
+        } else {
+            // Update mobile_session.last_used_at (fire-and-forget for latency)
+            if let Some(ref ms_id) = session.mobile_session_id {
+                let ms_id = ms_id.clone();
+                let db = db.clone();
+                tokio::spawn(async move {
+                    let _ = mobile_session::Entity::update_many()
+                        .col_expr(mobile_session::Column::LastUsedAt, Expr::value(Utc::now()))
+                        .filter(mobile_session::Column::Id.eq(&ms_id))
+                        .exec(&db)
+                        .await;
+                });
+            }
+            session
+        };
+
+        // Fetch the user
+        let user = user::Entity::find_by_id(&session.user_id).one(db).await?;
+
+        match user {
+            Some(u) => Ok(Some((u, session))),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete a session by its token (logout).
+    pub async fn logout(db: &DatabaseConnection, token: &str) -> Result<(), AppError> {
+        session::Entity::delete_many()
+            .filter(session::Column::Token.eq(Self::hash_session_token(token)))
+            .exec(db)
+            .await?;
+        Ok(())
+    }
+
+    /// Create a new API key for a user. Returns the model and the plaintext key.
+    /// The key has the format "serverbee_" + random base64url bytes.
+    /// Only the argon2 hash and a prefix (first 8 chars after "serverbee_") are stored.
+    pub async fn create_api_key(
+        db: &DatabaseConnection,
+        user_id: &str,
+        name: &str,
+    ) -> Result<(api_key::Model, String), AppError> {
+        let raw_key = Self::generate_api_key_raw();
+        let after_prefix = &raw_key[10..]; // strip "serverbee_"
+        let key_prefix = &after_prefix[..8.min(after_prefix.len())];
+        let key_hash = Self::hash_password(&raw_key)?;
+        let now = Utc::now();
+
+        let new_key = api_key::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(user_id.to_string()),
+            name: Set(name.to_string()),
+            key_hash: Set(key_hash),
+            key_prefix: Set(key_prefix.to_string()),
+            last_used_at: Set(None),
+            created_at: Set(now),
+        };
+
+        let model = new_key.insert(db).await?;
+        Ok((model, raw_key))
+    }
+
+    /// List all API keys for a user.
+    pub async fn list_api_keys(
+        db: &DatabaseConnection,
+        user_id: &str,
+    ) -> Result<Vec<api_key::Model>, AppError> {
+        let keys = api_key::Entity::find()
+            .filter(api_key::Column::UserId.eq(user_id))
+            .all(db)
+            .await?;
+        Ok(keys)
+    }
+
+    /// Delete an API key by ID, ensuring it belongs to the given user.
+    pub async fn delete_api_key(
+        db: &DatabaseConnection,
+        id: &str,
+        user_id: &str,
+    ) -> Result<(), AppError> {
+        let result = api_key::Entity::delete_many()
+            .filter(api_key::Column::Id.eq(id))
+            .filter(api_key::Column::UserId.eq(user_id))
+            .exec(db)
+            .await?;
+
+        if result.rows_affected == 0 {
+            return Err(AppError::NotFound("API key not found".to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Validate an API key. Extracts the prefix, searches by key_prefix,
+    /// then verifies with argon2. Updates last_used_at on success.
+    pub async fn validate_api_key(
+        db: &DatabaseConnection,
+        key: &str,
+    ) -> Result<Option<user::Model>, AppError> {
+        Ok(Self::validate_api_key_with_model(db, key)
+            .await?
+            .map(|(user, _)| user))
+    }
+
+    /// Validate an API key and return both its user and persisted key row.
+    /// Long-lived transports retain the row ID so deletion can revoke an
+    /// already-established connection without keeping the secret in memory.
+    pub async fn validate_api_key_with_model(
+        db: &DatabaseConnection,
+        key: &str,
+    ) -> Result<Option<(user::Model, api_key::Model)>, AppError> {
+        if !key.starts_with("serverbee_") || key.len() < 18 {
+            return Ok(None);
+        }
+
+        let after_prefix = &key[10..];
+        let key_prefix = &after_prefix[..8.min(after_prefix.len())];
+
+        let candidates = api_key::Entity::find()
+            .filter(api_key::Column::KeyPrefix.eq(key_prefix))
+            .all(db)
+            .await?;
+
+        for candidate in candidates {
+            if Self::verify_password(key, &candidate.key_hash)? {
+                // Update last_used_at
+                let candidate_user_id = candidate.user_id.clone();
+                let mut active: api_key::ActiveModel = candidate.into();
+                active.last_used_at = Set(Some(Utc::now()));
+                let api_key = active.update(db).await?;
+
+                // Fetch user
+                let user = user::Entity::find_by_id(&candidate_user_id).one(db).await?;
+                return Ok(user.map(|user| (user, api_key)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Validate an agent token by searching servers by token_prefix,
+    /// then verifying with argon2.
+    pub async fn validate_agent_token(
+        db: &DatabaseConnection,
+        token: &str,
+    ) -> Result<Option<server::Model>, AppError> {
+        if token.len() < 8 {
+            return Ok(None);
+        }
+
+        let token_prefix = &token[..8.min(token.len())];
+
+        let candidates = server::Entity::find()
+            .filter(server::Column::TokenPrefix.eq(token_prefix))
+            .filter(server::Column::TokenHash.is_not_null())
+            .all(db)
+            .await?;
+
+        for candidate in candidates {
+            // Defense-in-depth: the query already filters NULL token_hash rows,
+            // but keep this guard in case a row slips through (e.g., schema drift).
+            let Some(hash) = candidate.token_hash.as_deref() else {
+                continue;
+            };
+            if Self::verify_password(token, hash)? {
+                return Ok(Some(candidate));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Initialize the admin user if the users table is empty.
+    /// Always generates a random password and forces a change on first login.
+    /// Returns `Some(generated_password)` when a new admin was created.
+    pub async fn init_admin(db: &DatabaseConnection) -> Result<Option<String>, AppError> {
+        let user_count = user::Entity::find().count(db).await?;
+        if user_count > 0 {
+            return Ok(None);
+        }
+
+        let password = Self::generate_session_token();
+        let created =
+            Self::create_user(db, Self::DEFAULT_ADMIN_USERNAME, &password, "admin").await?;
+
+        let mut active: user::ActiveModel = created.into();
+        active.must_change_password = Set(true);
+        active.updated_at = Set(Utc::now());
+        active.update(db).await?;
+
+        tracing::info!(
+            "Admin user '{}' created with a random password (must be changed on first login)",
+            Self::DEFAULT_ADMIN_USERNAME
+        );
+
+        Ok(Some(password))
+    }
+
+    /// Generate a cryptographically random session token (32 bytes, base64url encoded).
+    pub fn generate_session_token() -> String {
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Deterministic hash of a session / mobile access token for at-rest storage.
+    ///
+    /// The `sessions.token` column stores this hash, never the plaintext, so a
+    /// leaked database snapshot (backup export, `make db-pull`) cannot be replayed
+    /// as a cookie or Bearer token. A plain SHA-256 (not argon2) is used because
+    /// lookups are by-value and the input is already a 256-bit CSPRNG token, so
+    /// there is nothing to brute-force and no salt is needed. Hex-encoded.
+    pub fn hash_session_token(token: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(token.as_bytes());
+        format!("{:x}", h.finalize())
+    }
+
+    /// Generate a raw API key: "serverbee_" + 32 random bytes (base64url encoded).
+    pub fn generate_api_key_raw() -> String {
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        format!("serverbee_{}", URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    /// Check if the given TOTP code is valid for the user's secret.
+    pub fn verify_totp(secret: &str, code: &str) -> Result<bool, AppError> {
+        use totp_rs::{Algorithm, Secret, TOTP};
+
+        let secret_bytes = Secret::Encoded(secret.to_string())
+            .to_bytes()
+            .map_err(|e| AppError::Internal(format!("Invalid TOTP secret: {e}")))?;
+
+        let totp = TOTP::new(
+            Algorithm::SHA1,
+            6,
+            1,
+            30,
+            secret_bytes,
+            Some("ServerBee".to_string()),
+            String::new(),
+        )
+        .map_err(|e| AppError::Internal(format!("TOTP error: {e}")))?;
+
+        Ok(totp.check_current(code).unwrap_or(false))
+    }
+
+    /// Generate a new TOTP secret and return (secret_base32, otpauth_url, qr_code_base64).
+    pub fn generate_totp_secret(username: &str) -> Result<(String, String, String), AppError> {
+        use totp_rs::{Algorithm, Secret, TOTP};
+
+        let secret = Secret::generate_secret();
+        let secret_base32 = secret.to_encoded().to_string();
+        let secret_bytes = secret
+            .to_bytes()
+            .map_err(|e| AppError::Internal(format!("Secret error: {e}")))?;
+
+        let totp = TOTP::new(
+            Algorithm::SHA1,
+            6,
+            1,
+            30,
+            secret_bytes,
+            Some("ServerBee".to_string()),
+            username.to_string(),
+        )
+        .map_err(|e| AppError::Internal(format!("TOTP error: {e}")))?;
+
+        let url = totp.get_url();
+        let qr_base64 = totp
+            .get_qr_base64()
+            .map_err(|e| AppError::Internal(format!("QR error: {e}")))?;
+
+        Ok((secret_base32, url, qr_base64))
+    }
+
+    /// Enable 2FA for a user by saving the TOTP secret.
+    pub async fn enable_2fa(
+        db: &DatabaseConnection,
+        user_id: &str,
+        secret: &str,
+    ) -> Result<(), AppError> {
+        let user = user::Entity::find_by_id(user_id)
+            .one(db)
+            .await?
+            .ok_or(AppError::NotFound("User not found".to_string()))?;
+
+        let mut active: user::ActiveModel = user.into();
+        active.totp_secret = Set(Some(secret.to_string()));
+        active.updated_at = Set(Utc::now());
+        active.update(db).await?;
+        Ok(())
+    }
+
+    /// Disable 2FA for a user.
+    pub async fn disable_2fa(db: &DatabaseConnection, user_id: &str) -> Result<(), AppError> {
+        let user = user::Entity::find_by_id(user_id)
+            .one(db)
+            .await?
+            .ok_or(AppError::NotFound("User not found".to_string()))?;
+
+        let mut active: user::ActiveModel = user.into();
+        active.totp_secret = Set(None);
+        active.updated_at = Set(Utc::now());
+        active.update(db).await?;
+        Ok(())
+    }
+
+    /// Check if a user has 2FA enabled.
+    pub async fn has_2fa(db: &DatabaseConnection, user_id: &str) -> Result<bool, AppError> {
+        let user = user::Entity::find_by_id(user_id)
+            .one(db)
+            .await?
+            .ok_or(AppError::NotFound("User not found".to_string()))?;
+        Ok(user.totp_secret.is_some())
+    }
+
+    /// Change a user's password after verifying the old password.
+    pub async fn change_password(
+        db: &DatabaseConnection,
+        user_id: &str,
+        old_password: &str,
+        new_password: &str,
+        keep_session_token: Option<&str>,
+    ) -> Result<(), AppError> {
+        let user = user::Entity::find_by_id(user_id)
+            .one(db)
+            .await?
+            .ok_or(AppError::NotFound("User not found".to_string()))?;
+
+        let valid = Self::verify_password(old_password, &user.password_hash)?;
+        if !valid {
+            return Err(AppError::BadRequest(
+                "Current password is incorrect".to_string(),
+            ));
+        }
+
+        Self::validate_password_strength(new_password)?;
+
+        let new_hash = Self::hash_password(new_password)?;
+        let now = Utc::now();
+
+        // Resolve the caller's own mobile session to preserve (when the kept
+        // session is itself a mobile one, so the active device isn't logged out
+        // by its own password change). Read-only lookup, done before the txn.
+        // Sessions store the token hash, so hash the caller's token to match.
+        let keep_token_hash = keep_session_token.map(Self::hash_session_token);
+        let keep_mobile_session_id = match keep_token_hash {
+            Some(ref token_hash) => session::Entity::find()
+                .filter(session::Column::Token.eq(token_hash))
+                .one(db)
+                .await?
+                .and_then(|s| s.mobile_session_id),
+            None => None,
+        };
+
+        // Apply the password change and every revocation atomically, so a
+        // failure can't leave the password rotated while sessions stay live
+        // (and a concurrent push_register can't wedge a half-applied state).
+        let txn = db.begin().await?;
+
+        let mut active: user::ActiveModel = user.into();
+        active.password_hash = Set(new_hash);
+        // Stamp the change so mobile refresh rejects refresh tokens whose
+        // session was issued earlier — the authoritative guard against a stolen
+        // refresh token surviving the change (see MobileAuthService::refresh).
+        active.password_changed_at = Set(Some(now));
+        active.updated_at = Set(now);
+        active.update(&txn).await?;
+
+        // Revoke the user's other web sessions. Keep the caller's current one
+        // when its token is known (web cookie / bearer flow), else revoke all.
+        let mut revoke = session::Entity::delete_many().filter(session::Column::UserId.eq(user_id));
+        if let Some(ref token_hash) = keep_token_hash {
+            revoke = revoke.filter(session::Column::Token.ne(token_hash));
+        }
+        revoke.exec(&txn).await?;
+
+        // The mobile refresh secret lives in `mobile_session` (a separate
+        // table), so the revocation above does NOT cover the mobile auth path.
+        Self::revoke_user_mobile_sessions(&txn, user_id, keep_mobile_session_id.as_deref()).await?;
+
+        // The caller's own mobile session is intentionally preserved (above).
+        // Bump its issuance time to the change instant so token versioning keeps
+        // accepting its refresh token — it predates the change, but it IS the
+        // caller's current, deliberately-kept session (the caller proved the old
+        // password and holds this session's token).
+        if let Some(keep) = keep_mobile_session_id.as_deref()
+            && let Some(ms) = mobile_session::Entity::find_by_id(keep).one(&txn).await?
+        {
+            let mut ms: mobile_session::ActiveModel = ms.into();
+            ms.created_at = Set(now);
+            ms.update(&txn).await?;
+        }
+
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Revoke a user's mobile sessions (refresh tokens live in `mobile_session`,
+    /// which plain session revocation does not touch). Optionally preserve one
+    /// mobile session by id (the caller's own). `device_token` references
+    /// `mobile_session` with no ON DELETE cascade, so its rows are removed first.
+    pub async fn revoke_user_mobile_sessions<C: ConnectionTrait>(
+        conn: &C,
+        user_id: &str,
+        keep_mobile_session_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        // Resolve the target set as a SUBQUERY by user_id, not a captured id
+        // snapshot: a mobile_session created concurrently (e.g. by a
+        // refresh-rotation race) is then still covered by these deletes rather
+        // than slipping past a stale id list.
+        let target_subquery = || {
+            let mut q = mobile_session::Entity::find()
+                .select_only()
+                .column(mobile_session::Column::Id)
+                .filter(mobile_session::Column::UserId.eq(user_id));
+            if let Some(keep) = keep_mobile_session_id {
+                q = q.filter(mobile_session::Column::Id.ne(keep));
+            }
+            q.into_query()
+        };
+
+        // device_token -> session -> mobile_session (FK order; device_token's
+        // FK to mobile_session has no ON DELETE cascade). Sessions/tokens are
+        // matched via the subquery; mobile_session is deleted directly by
+        // user_id so any concurrently inserted row is caught too.
+        device_token::Entity::delete_many()
+            .filter(device_token::Column::MobileSessionId.in_subquery(target_subquery()))
+            .exec(conn)
+            .await?;
+        session::Entity::delete_many()
+            .filter(session::Column::MobileSessionId.in_subquery(target_subquery()))
+            .exec(conn)
+            .await?;
+        let mut del = mobile_session::Entity::delete_many()
+            .filter(mobile_session::Column::UserId.eq(user_id));
+        if let Some(keep) = keep_mobile_session_id {
+            del = del.filter(mobile_session::Column::Id.ne(keep));
+        }
+        del.exec(conn).await?;
+
+        Ok(())
+    }
+
+    /// Complete first-login onboarding: set a new password and optionally a new
+    /// username, then clear the `must_change_password` flag. Only valid while
+    /// the flag is set. Does NOT write audit logs (the handler does).
+    pub async fn complete_onboarding(
+        db: &DatabaseConnection,
+        user_id: &str,
+        new_password: &str,
+        new_username: Option<&str>,
+    ) -> Result<(), AppError> {
+        let user = user::Entity::find_by_id(user_id)
+            .one(db)
+            .await?
+            .ok_or(AppError::NotFound("User not found".to_string()))?;
+
+        if !user.must_change_password {
+            return Err(AppError::Forbidden(
+                "Onboarding is not required for this account".to_string(),
+            ));
+        }
+        if new_password.is_empty() {
+            return Err(AppError::Validation("New password is required".to_string()));
+        }
+        Self::validate_password_strength(new_password)?;
+        if Self::verify_password(new_password, &user.password_hash)? {
+            return Err(AppError::Validation(
+                "New password must be different from the current password".to_string(),
+            ));
+        }
+
+        let trimmed_username: Option<String> = new_username
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .filter(|u| *u != user.username)
+            .map(str::to_string);
+
+        if let Some(ref uname) = trimmed_username {
+            let existing = user::Entity::find()
+                .filter(user::Column::Username.eq(uname.as_str()))
+                .one(db)
+                .await?;
+            if existing.is_some() {
+                return Err(AppError::Conflict(format!("User '{uname}' already exists")));
+            }
+        }
+
+        let new_hash = Self::hash_password(new_password)?;
+        let mut active: user::ActiveModel = user.into();
+        active.password_hash = Set(new_hash);
+        if let Some(uname) = trimmed_username {
+            active.username = Set(uname);
+        }
+        active.must_change_password = Set(false);
+        active.updated_at = Set(Utc::now());
+        active.update(db).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to build LoginParams with test defaults; override only what matters.
+    fn login_params<'a>(username: &'a str, password: &'a str) -> LoginParams<'a> {
+        LoginParams {
+            username,
+            password,
+            totp_code: None,
+            ip: "127.0.0.1",
+            user_agent: "test-agent",
+            session_ttl: 3600,
+        }
+    }
+
+    #[test]
+    fn test_hash_and_verify_password() {
+        let password = "my_secret_p@ssw0rd!";
+        let hash = AuthService::hash_password(password).expect("hashing should succeed");
+
+        // Correct password should verify successfully
+        let valid = AuthService::verify_password(password, &hash).expect("verify should succeed");
+        assert!(valid, "correct password must verify as true");
+
+        // Wrong password should fail verification
+        let invalid =
+            AuthService::verify_password("wrong_password", &hash).expect("verify should succeed");
+        assert!(!invalid, "wrong password must verify as false");
+    }
+
+    #[test]
+    fn test_hash_password_not_empty() {
+        let hash = AuthService::hash_password("test123").expect("hashing should succeed");
+        assert!(!hash.is_empty(), "hash output must not be empty");
+        // Argon2 hashes start with "$argon2"
+        assert!(
+            hash.starts_with("$argon2"),
+            "hash should be in argon2 PHC format, got: {hash}"
+        );
+    }
+
+    #[test]
+    fn test_hash_password_unique_salts() {
+        let password = "same_password";
+        let hash1 = AuthService::hash_password(password).expect("hash 1");
+        let hash2 = AuthService::hash_password(password).expect("hash 2");
+
+        // Two hashes of the same password should differ (random salt)
+        assert_ne!(
+            hash1, hash2,
+            "hashing the same password twice must produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_generate_session_token() {
+        let token = AuthService::generate_session_token();
+
+        assert!(!token.is_empty(), "session token must not be empty");
+
+        // 32 bytes base64url-encoded (no padding) => 43 characters
+        assert_eq!(
+            token.len(),
+            43,
+            "32-byte base64url-no-pad token should be 43 chars, got {}",
+            token.len()
+        );
+
+        // Must be valid base64url characters (A-Z, a-z, 0-9, -, _)
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "token must only contain base64url characters"
+        );
+    }
+
+    #[test]
+    fn test_generate_session_token_uniqueness() {
+        let t1 = AuthService::generate_session_token();
+        let t2 = AuthService::generate_session_token();
+
+        assert_ne!(t1, t2, "two generated tokens must be different");
+    }
+
+    #[test]
+    fn test_generate_api_key_raw() {
+        let key = AuthService::generate_api_key_raw();
+
+        assert!(
+            key.starts_with("serverbee_"),
+            "API key must start with 'serverbee_' prefix"
+        );
+        // "serverbee_" + 43 chars of base64url = 53 total
+        assert_eq!(
+            key.len(),
+            53,
+            "API key should be 53 chars (serverbee_ + 43), got {}",
+            key.len()
+        );
+    }
+
+    #[test]
+    fn test_verify_password_invalid_hash_format() {
+        let result = AuthService::verify_password("password", "not_a_valid_hash");
+        assert!(
+            result.is_err(),
+            "verifying against an invalid hash format should return an error"
+        );
+    }
+
+    #[test]
+    fn test_generate_totp_secret() {
+        let (secret, url, qr) =
+            AuthService::generate_totp_secret("testuser").expect("TOTP generation should succeed");
+
+        assert!(!secret.is_empty(), "TOTP secret must not be empty");
+        assert!(
+            url.starts_with("otpauth://totp/"),
+            "TOTP URL should start with otpauth://totp/, got: {url}"
+        );
+        assert!(
+            url.contains("ServerBee"),
+            "TOTP URL should contain issuer 'ServerBee'"
+        );
+        assert!(!qr.is_empty(), "QR code base64 must not be empty");
+    }
+
+    // ── DB integration tests ──────────────────────────────────────────────────
+
+    use crate::test_utils::setup_test_db;
+
+    #[tokio::test]
+    async fn test_create_user_success() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "alice", "password123", "admin")
+            .await
+            .expect("create_user should succeed");
+        assert_eq!(user.username, "alice");
+        assert_eq!(user.role, "admin");
+        assert!(!user.id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_user_duplicate() {
+        let (db, _tmp) = setup_test_db().await;
+        AuthService::create_user(&db, "alice", "password123", "admin")
+            .await
+            .expect("first create should succeed");
+        let result = AuthService::create_user(&db, "alice", "other_pass", "member").await;
+        assert!(result.is_err(), "duplicate username should return an error");
+    }
+
+    #[tokio::test]
+    async fn test_login_success() {
+        let (db, _tmp) = setup_test_db().await;
+        AuthService::create_user(&db, "bob", "secret123", "member")
+            .await
+            .expect("create_user should succeed");
+        let (session, user) = AuthService::login(&db, login_params("bob", "secret123"))
+            .await
+            .expect("login should succeed");
+        assert_eq!(user.username, "bob");
+        assert!(!session.token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_login_stores_token_hash_not_plaintext() {
+        let (db, _tmp) = setup_test_db().await;
+        AuthService::create_user(&db, "hashed", "secret123", "member")
+            .await
+            .expect("create_user should succeed");
+        let (session, _user) = AuthService::login(&db, login_params("hashed", "secret123"))
+            .await
+            .expect("login should succeed");
+
+        // The caller receives the plaintext (for the cookie), but the row must
+        // hold only the hash — a leaked snapshot must not be replayable.
+        let row = session::Entity::find_by_id(&session.id)
+            .one(&db)
+            .await
+            .expect("query session row")
+            .expect("session row should exist");
+        assert_ne!(
+            row.token, session.token,
+            "the stored token must not be the plaintext"
+        );
+        assert_eq!(
+            row.token,
+            AuthService::hash_session_token(&session.token),
+            "the stored token must be the hash of the plaintext"
+        );
+        // And the plaintext still validates (hash lookup round-trips).
+        assert!(
+            AuthService::validate_session(&db, &session.token, 3600)
+                .await
+                .expect("validate")
+                .is_some(),
+            "plaintext token must validate against the stored hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_wrong_password() {
+        let (db, _tmp) = setup_test_db().await;
+        AuthService::create_user(&db, "carol", "correct_pass", "member")
+            .await
+            .expect("create_user should succeed");
+        let result = AuthService::login(&db, login_params("carol", "wrong_pass")).await;
+        assert!(result.is_err(), "wrong password should return an error");
+    }
+
+    #[tokio::test]
+    async fn test_login_nonexistent_user() {
+        let (db, _tmp) = setup_test_db().await;
+        let result = AuthService::login(&db, login_params("nobody", "pass")).await;
+        assert!(
+            result.is_err(),
+            "logging in as nonexistent user should error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_session_valid() {
+        let (db, _tmp) = setup_test_db().await;
+        AuthService::create_user(&db, "dave", "pass1234", "member")
+            .await
+            .expect("create_user should succeed");
+        let (session, _user) = AuthService::login(&db, login_params("dave", "pass1234"))
+            .await
+            .expect("login should succeed");
+        let validated = AuthService::validate_session(&db, &session.token, 3600)
+            .await
+            .expect("validate_session should not error");
+        assert!(validated.is_some(), "valid token should return a user");
+        let (user, sess) = validated.unwrap();
+        assert_eq!(user.username, "dave");
+        assert_eq!(sess.source, "web");
+    }
+
+    #[tokio::test]
+    async fn test_validate_session_invalid_token() {
+        let (db, _tmp) = setup_test_db().await;
+        let result = AuthService::validate_session(&db, "fake_token_that_does_not_exist", 3600)
+            .await
+            .expect("validate_session should not error");
+        assert!(result.is_none(), "invalid token should return None");
+    }
+
+    #[tokio::test]
+    async fn test_create_and_validate_api_key() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "eve", "pass5678", "admin")
+            .await
+            .expect("create_user should succeed");
+        let (_model, raw_key) = AuthService::create_api_key(&db, &user.id, "my-key")
+            .await
+            .expect("create_api_key should succeed");
+        assert!(
+            raw_key.starts_with("serverbee_"),
+            "raw key should start with serverbee_"
+        );
+
+        let validated = AuthService::validate_api_key(&db, &raw_key)
+            .await
+            .expect("validate_api_key should not error");
+        assert!(validated.is_some(), "valid api key should return a user");
+        assert_eq!(validated.unwrap().username, "eve");
+    }
+
+    #[tokio::test]
+    async fn test_validate_api_key_invalid() {
+        let (db, _tmp) = setup_test_db().await;
+        let result = AuthService::validate_api_key(&db, "serverbee_totally_fake_key_here_xyz")
+            .await
+            .expect("validate_api_key should not error");
+        assert!(result.is_none(), "invalid api key should return None");
+    }
+
+    #[tokio::test]
+    async fn test_change_password_wrong_old() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "frank", "real_pass", "member")
+            .await
+            .expect("create_user should succeed");
+        let result =
+            AuthService::change_password(&db, &user.id, "wrong_old_pass", "new_pass123", None)
+                .await;
+        assert!(result.is_err(), "wrong old password should return an error");
+    }
+
+    #[tokio::test]
+    async fn test_change_password_success() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "grace", "old_pass1", "member")
+            .await
+            .expect("create_user should succeed");
+        AuthService::change_password(&db, &user.id, "old_pass1", "new_pass99", None)
+            .await
+            .expect("change_password should succeed");
+        // Login with new password should succeed
+        let result = AuthService::login(&db, login_params("grace", "new_pass99")).await;
+        assert!(result.is_ok(), "login with new password should succeed");
+        // Login with old password should fail
+        let result2 = AuthService::login(&db, login_params("grace", "old_pass1")).await;
+        assert!(result2.is_err(), "login with old password should fail");
+    }
+
+    #[tokio::test]
+    async fn test_change_password_revokes_other_sessions() {
+        let (db, _tmp) = setup_test_db().await;
+        AuthService::create_user(&db, "heidi", "old_pass1", "member")
+            .await
+            .expect("create_user should succeed");
+        // Two active sessions (e.g. two browsers logged in).
+        let (keep, _u) = AuthService::login(&db, login_params("heidi", "old_pass1"))
+            .await
+            .expect("login should succeed");
+        let (other, _u) = AuthService::login(&db, login_params("heidi", "old_pass1"))
+            .await
+            .expect("login should succeed");
+
+        AuthService::change_password(
+            &db,
+            &keep.user_id,
+            "old_pass1",
+            "new_pass123",
+            Some(&keep.token),
+        )
+        .await
+        .expect("change_password should succeed");
+
+        // The caller's own session is preserved...
+        let kept = AuthService::validate_session(&db, &keep.token, 3600)
+            .await
+            .expect("validate_session should not error");
+        assert!(
+            kept.is_some(),
+            "the kept session must survive the password change"
+        );
+        // ...while every other session is revoked.
+        let revoked = AuthService::validate_session(&db, &other.token, 3600)
+            .await
+            .expect("validate_session should not error");
+        assert!(
+            revoked.is_none(),
+            "other sessions must be revoked after a password change"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_change_password_without_keep_token_revokes_all_sessions() {
+        let (db, _tmp) = setup_test_db().await;
+        AuthService::create_user(&db, "ivan", "old_pass1", "member")
+            .await
+            .expect("create_user should succeed");
+        let (sess, _u) = AuthService::login(&db, login_params("ivan", "old_pass1"))
+            .await
+            .expect("login should succeed");
+
+        // No keep token (e.g. API-key authenticated caller) -> revoke all.
+        AuthService::change_password(&db, &sess.user_id, "old_pass1", "new_pass123", None)
+            .await
+            .expect("change_password should succeed");
+
+        let validated = AuthService::validate_session(&db, &sess.token, 3600)
+            .await
+            .expect("validate_session should not error");
+        assert!(
+            validated.is_none(),
+            "with no keep token, all sessions must be revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_init_admin_creates_random_admin_with_flag() {
+        let (db, _tmp) = setup_test_db().await;
+        let generated = AuthService::init_admin(&db)
+            .await
+            .expect("init_admin should succeed");
+        let pwd = generated.expect("first run must return a generated password");
+        assert!(!pwd.is_empty(), "generated password must not be empty");
+
+        let admin = user::Entity::find()
+            .filter(user::Column::Username.eq(AuthService::DEFAULT_ADMIN_USERNAME))
+            .one(&db)
+            .await
+            .expect("query should succeed")
+            .expect("admin user must exist");
+        assert_eq!(admin.role, "admin");
+        assert!(
+            admin.must_change_password,
+            "freshly seeded admin must require password change"
+        );
+        assert!(
+            AuthService::verify_password(&pwd, &admin.password_hash).expect("verify"),
+            "generated password must match stored hash"
+        );
+    }
+
+    async fn seed_must_change_admin(db: &DatabaseConnection) -> user::Model {
+        let u = AuthService::create_user(db, "admin", "init-pass-123", "admin")
+            .await
+            .expect("seed admin");
+        let mut a: user::ActiveModel = u.into();
+        a.must_change_password = Set(true);
+        a.update(db).await.expect("set flag")
+    }
+
+    #[tokio::test]
+    async fn test_complete_onboarding_success_password_only() {
+        let (db, _tmp) = setup_test_db().await;
+        let admin = seed_must_change_admin(&db).await;
+        AuthService::complete_onboarding(&db, &admin.id, "brand-new-pass-9", None)
+            .await
+            .expect("onboarding should succeed");
+        let after = user::Entity::find_by_id(&admin.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!after.must_change_password, "flag must be cleared");
+        assert_eq!(after.username, "admin", "username unchanged when None");
+        assert!(AuthService::verify_password("brand-new-pass-9", &after.password_hash).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_complete_onboarding_with_username_change() {
+        let (db, _tmp) = setup_test_db().await;
+        let admin = seed_must_change_admin(&db).await;
+        AuthService::complete_onboarding(&db, &admin.id, "np-12345", Some("  newname  "))
+            .await
+            .expect("should succeed and trim username");
+        let after = user::Entity::find_by_id(&admin.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.username, "newname", "username trimmed + applied");
+        assert!(!after.must_change_password);
+    }
+
+    #[tokio::test]
+    async fn test_complete_onboarding_blank_username_is_ignored() {
+        let (db, _tmp) = setup_test_db().await;
+        let admin = seed_must_change_admin(&db).await;
+        AuthService::complete_onboarding(&db, &admin.id, "np-12345", Some("   "))
+            .await
+            .expect("blank username treated as not provided");
+        let after = user::Entity::find_by_id(&admin.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.username, "admin");
+    }
+
+    #[tokio::test]
+    async fn test_complete_onboarding_rejects_same_password() {
+        let (db, _tmp) = setup_test_db().await;
+        let admin = seed_must_change_admin(&db).await;
+        let r = AuthService::complete_onboarding(&db, &admin.id, "init-pass-123", None).await;
+        assert!(r.is_err(), "reusing current password must be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_complete_onboarding_rejects_empty_password() {
+        let (db, _tmp) = setup_test_db().await;
+        let admin = seed_must_change_admin(&db).await;
+        let r = AuthService::complete_onboarding(&db, &admin.id, "", None).await;
+        assert!(r.is_err(), "empty password must be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_complete_onboarding_rejects_weak_password() {
+        let (db, _tmp) = setup_test_db().await;
+        let admin = seed_must_change_admin(&db).await;
+        let r = AuthService::complete_onboarding(&db, &admin.id, "123", None).await;
+        assert!(
+            matches!(r, Err(AppError::Validation(_))),
+            "short/weak password must be rejected with a validation error, got {r:?}"
+        );
+        let after = user::Entity::find_by_id(&admin.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.must_change_password,
+            "onboarding must not complete with a weak password"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_change_password_rejects_weak_password() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "weakp", "old_pass1", "member")
+            .await
+            .expect("create user");
+        let r = AuthService::change_password(&db, &user.id, "old_pass1", "123", None).await;
+        assert!(
+            matches!(r, Err(AppError::Validation(_))),
+            "weak new password must be rejected, got {r:?}"
+        );
+        let after = user::Entity::find_by_id(&user.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            AuthService::verify_password("old_pass1", &after.password_hash).unwrap(),
+            "password must remain unchanged when new one is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complete_onboarding_rejects_when_flag_not_set() {
+        let (db, _tmp) = setup_test_db().await;
+        let u = AuthService::create_user(&db, "admin", "p", "admin")
+            .await
+            .unwrap();
+        let r = AuthService::complete_onboarding(&db, &u.id, "new-pass-1", None).await;
+        assert!(r.is_err(), "onboarding when flag is false must be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_complete_onboarding_rejects_duplicate_username() {
+        let (db, _tmp) = setup_test_db().await;
+        AuthService::create_user(&db, "taken", "p", "member")
+            .await
+            .unwrap();
+        let admin = seed_must_change_admin(&db).await;
+        let r = AuthService::complete_onboarding(&db, &admin.id, "new-pass-1", Some("taken")).await;
+        assert!(r.is_err(), "duplicate username must be rejected");
+    }
+
+    #[tokio::test]
+    async fn validate_agent_token_rejects_pending_server() {
+        use crate::entity::server;
+        use serverbee_common::constants::CAP_DEFAULT;
+
+        let (db, _tmp) = setup_test_db().await;
+        let now = Utc::now();
+        let sid = Uuid::new_v4().to_string();
+
+        server::ActiveModel {
+            id: Set(sid.clone()),
+            token_hash: Set(None),
+            token_prefix: Set(None),
+            name: Set("pending".into()),
+            cpu_name: Set(None),
+            cpu_cores: Set(None),
+            cpu_arch: Set(None),
+            os: Set(None),
+            kernel_version: Set(None),
+            mem_total: Set(None),
+            swap_total: Set(None),
+            disk_total: Set(None),
+            ipv4: Set(None),
+            ipv6: Set(None),
+            region: Set(None),
+            country_code: Set(None),
+            geo_manual: Set(false),
+            virtualization: Set(None),
+            agent_version: Set(None),
+            group_id: Set(None),
+            weight: Set(0),
+            hidden: Set(false),
+            remark: Set(None),
+            public_remark: Set(None),
+            price: Set(None),
+            billing_cycle: Set(None),
+            currency: Set(None),
+            expired_at: Set(None),
+            traffic_limit: Set(None),
+            traffic_limit_type: Set(None),
+            billing_start_day: Set(None),
+            capabilities: Set(CAP_DEFAULT as i32),
+            protocol_version: Set(1),
+            features: Set("[]".into()),
+            last_remote_addr: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        // Any plausible token string must not match a pending server.
+        let result = AuthService::validate_agent_token(&db, "anything-here")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "pending server must not validate any token"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_agent_token_rejects_row_with_prefix_but_null_hash() {
+        // Defense-in-depth: if a future schema regression ever produced a row
+        // with a non-NULL token_prefix but NULL token_hash, the query-level
+        // `is_not_null()` filter must keep the row out of the candidate set.
+        use serverbee_common::constants::CAP_DEFAULT;
+
+        let (db, _tmp) = setup_test_db().await;
+        let now = Utc::now();
+        let sid = Uuid::new_v4().to_string();
+
+        server::ActiveModel {
+            id: Set(sid.clone()),
+            token_hash: Set(None),
+            token_prefix: Set(Some("testtest".into())),
+            name: Set("half-bound".into()),
+            cpu_name: Set(None),
+            cpu_cores: Set(None),
+            cpu_arch: Set(None),
+            os: Set(None),
+            kernel_version: Set(None),
+            mem_total: Set(None),
+            swap_total: Set(None),
+            disk_total: Set(None),
+            ipv4: Set(None),
+            ipv6: Set(None),
+            region: Set(None),
+            country_code: Set(None),
+            geo_manual: Set(false),
+            virtualization: Set(None),
+            agent_version: Set(None),
+            group_id: Set(None),
+            weight: Set(0),
+            hidden: Set(false),
+            remark: Set(None),
+            public_remark: Set(None),
+            price: Set(None),
+            billing_cycle: Set(None),
+            currency: Set(None),
+            expired_at: Set(None),
+            traffic_limit: Set(None),
+            traffic_limit_type: Set(None),
+            billing_start_day: Set(None),
+            capabilities: Set(CAP_DEFAULT as i32),
+            protocol_version: Set(1),
+            features: Set("[]".into()),
+            last_remote_addr: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        // Token whose 8-char prefix matches the row's `token_prefix`.
+        let result = AuthService::validate_agent_token(&db, "testtest-not-a-real-token")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "row with non-NULL prefix but NULL token_hash must not validate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_init_admin_noop_when_users_exist() {
+        let (db, _tmp) = setup_test_db().await;
+        AuthService::create_user(&db, "someone", "pass1234", "admin")
+            .await
+            .expect("seed a user");
+        let generated = AuthService::init_admin(&db)
+            .await
+            .expect("init_admin should succeed");
+        assert!(
+            generated.is_none(),
+            "init_admin must be a no-op when users already exist"
+        );
+    }
+
+    // ── validate_password_strength boundaries ─────────────────────────────────
+
+    #[test]
+    fn test_validate_password_strength_too_short() {
+        // 7 chars is below the 8-char minimum and must be rejected.
+        let r = AuthService::validate_password_strength("1234567");
+        assert!(
+            matches!(r, Err(AppError::Validation(_))),
+            "a 7-char password must fail the strength check, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_password_strength_exact_minimum() {
+        // Exactly MIN_PASSWORD_LEN (8) chars is the inclusive lower boundary.
+        AuthService::validate_password_strength("12345678")
+            .expect("an 8-char password must pass the strength check");
+    }
+
+    #[test]
+    fn test_validate_password_strength_counts_unicode_chars() {
+        // Strength is measured in chars, not bytes: 8 multi-byte chars must pass.
+        AuthService::validate_password_strength("密码密码密码密码")
+            .expect("8 unicode chars must satisfy the char-count minimum");
+    }
+
+    // ── TOTP verify / generate ────────────────────────────────────────────────
+
+    /// Build a valid current TOTP code for a base32 secret using the same
+    /// construction the service uses, so the service must accept it.
+    fn current_totp_code(secret_base32: &str) -> String {
+        use totp_rs::{Algorithm, Secret, TOTP};
+        let secret_bytes = Secret::Encoded(secret_base32.to_string())
+            .to_bytes()
+            .expect("secret decode");
+        let totp = TOTP::new(
+            Algorithm::SHA1,
+            6,
+            1,
+            30,
+            secret_bytes,
+            Some("ServerBee".to_string()),
+            String::new(),
+        )
+        .expect("totp build");
+        totp.generate_current().expect("generate current code")
+    }
+
+    #[test]
+    fn test_verify_totp_accepts_current_code() {
+        // A freshly computed current code must verify against its own secret.
+        let (secret, _url, _qr) =
+            AuthService::generate_totp_secret("alice").expect("secret generation");
+        let code = current_totp_code(&secret);
+        let ok = AuthService::verify_totp(&secret, &code).expect("verify should not error");
+        assert!(ok, "the current TOTP code must verify as valid");
+    }
+
+    #[test]
+    fn test_verify_totp_rejects_wrong_code() {
+        // A code that is not the current one must be rejected (not an error).
+        let (secret, _url, _qr) =
+            AuthService::generate_totp_secret("bob").expect("secret generation");
+        let ok = AuthService::verify_totp(&secret, "000000").expect("verify should not error");
+        // "000000" is extremely unlikely to be the current code for a random secret.
+        assert!(!ok, "an arbitrary wrong code must verify as invalid");
+    }
+
+    #[test]
+    fn test_verify_totp_invalid_secret_errors() {
+        // A non-base32 secret cannot be decoded and must surface an error.
+        let r = AuthService::verify_totp("!!!not-base32!!!", "123456");
+        assert!(
+            matches!(r, Err(AppError::Internal(_))),
+            "an undecodable secret must produce an Internal error, got {r:?}"
+        );
+    }
+
+    // ── login with 2FA enabled ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_login_2fa_required_when_no_code() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "tfauser", "pass1234", "member")
+            .await
+            .expect("create user");
+        let (secret, _u, _q) = AuthService::generate_totp_secret("tfauser").expect("secret");
+        AuthService::enable_2fa(&db, &user.id, &secret)
+            .await
+            .expect("enable 2fa");
+
+        // With 2FA on and no code, login signals 2fa_required via Validation.
+        let r = AuthService::login(&db, login_params("tfauser", "pass1234")).await;
+        assert!(
+            matches!(r, Err(AppError::Validation(ref m)) if m == "2fa_required"),
+            "missing 2FA code must yield a `2fa_required` validation error, got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_2fa_rejects_bad_code() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "tfabad", "pass1234", "member")
+            .await
+            .expect("create user");
+        let (secret, _u, _q) = AuthService::generate_totp_secret("tfabad").expect("secret");
+        AuthService::enable_2fa(&db, &user.id, &secret)
+            .await
+            .expect("enable 2fa");
+
+        let mut params = login_params("tfabad", "pass1234");
+        params.totp_code = Some("000000");
+        let r = AuthService::login(&db, params).await;
+        assert!(
+            matches!(r, Err(AppError::Unauthorized)),
+            "a wrong 2FA code must be rejected as Unauthorized, got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_2fa_accepts_valid_code() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "tfaok", "pass1234", "member")
+            .await
+            .expect("create user");
+        let (secret, _u, _q) = AuthService::generate_totp_secret("tfaok").expect("secret");
+        AuthService::enable_2fa(&db, &user.id, &secret)
+            .await
+            .expect("enable 2fa");
+
+        let code = current_totp_code(&secret);
+        let mut params = login_params("tfaok", "pass1234");
+        params.totp_code = Some(&code);
+        let (session, who) = AuthService::login(&db, params)
+            .await
+            .expect("login with a valid 2FA code should succeed");
+        assert_eq!(who.username, "tfaok");
+        assert!(!session.token.is_empty());
+    }
+
+    // ── validate_session: expiry + mobile branch ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_validate_session_expired_is_deleted() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "expuser", "pass1234", "member")
+            .await
+            .expect("create user");
+        let now = Utc::now();
+        // Insert a web session that already expired one hour ago.
+        let token = AuthService::generate_session_token();
+        session::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(user.id.clone()),
+            token: Set(AuthService::hash_session_token(&token)),
+            ip: Set("127.0.0.1".into()),
+            user_agent: Set("test".into()),
+            expires_at: Set(now - chrono::Duration::hours(1)),
+            created_at: Set(now - chrono::Duration::hours(2)),
+            source: Set("web".into()),
+            mobile_session_id: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("seed expired session");
+
+        let validated = AuthService::validate_session(&db, &token, 3600)
+            .await
+            .expect("validate_session should not error");
+        assert!(
+            validated.is_none(),
+            "an expired session must validate to None"
+        );
+
+        // The expired row must have been cleaned up.
+        let remaining = session::Entity::find()
+            .filter(session::Column::Token.eq(AuthService::hash_session_token(&token)))
+            .one(&db)
+            .await
+            .expect("query");
+        assert!(remaining.is_none(), "expired session row must be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_validate_session_mobile_does_not_slide_expiry() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "mobuser", "pass1234", "member")
+            .await
+            .expect("create user");
+        let now = Utc::now();
+        let fixed_expiry = now + chrono::Duration::hours(24);
+        let token = AuthService::generate_session_token();
+        // A mobile session (source != "web", no mobile_session_id) keeps its TTL.
+        session::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(user.id.clone()),
+            token: Set(AuthService::hash_session_token(&token)),
+            ip: Set("127.0.0.1".into()),
+            user_agent: Set("test".into()),
+            expires_at: Set(fixed_expiry),
+            created_at: Set(now),
+            source: Set("mobile".into()),
+            mobile_session_id: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("seed mobile session");
+
+        let validated = AuthService::validate_session(&db, &token, 3600)
+            .await
+            .expect("validate_session should not error")
+            .expect("mobile session must validate");
+        let (who, sess) = validated;
+        assert_eq!(who.username, "mobuser");
+        assert_eq!(sess.source, "mobile");
+        // Sliding expiry must be skipped: the original TTL is preserved exactly.
+        assert_eq!(
+            sess.expires_at, fixed_expiry,
+            "mobile sessions must not have their expiry extended"
+        );
+    }
+
+    // ── logout ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_logout_deletes_session() {
+        let (db, _tmp) = setup_test_db().await;
+        AuthService::create_user(&db, "logoutme", "pass1234", "member")
+            .await
+            .expect("create user");
+        let (session, _u) = AuthService::login(&db, login_params("logoutme", "pass1234"))
+            .await
+            .expect("login");
+
+        AuthService::logout(&db, &session.token)
+            .await
+            .expect("logout should succeed");
+
+        let validated = AuthService::validate_session(&db, &session.token, 3600)
+            .await
+            .expect("validate_session should not error");
+        assert!(validated.is_none(), "session must be gone after logout");
+    }
+
+    #[tokio::test]
+    async fn test_logout_unknown_token_is_noop() {
+        // Logging out a token that does not exist must succeed without error.
+        let (db, _tmp) = setup_test_db().await;
+        AuthService::logout(&db, "no-such-token")
+            .await
+            .expect("logout of an unknown token must be a no-op");
+    }
+
+    // ── API key list / delete ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_api_keys_empty() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "nokeys", "pass1234", "admin")
+            .await
+            .expect("create user");
+        let keys = AuthService::list_api_keys(&db, &user.id)
+            .await
+            .expect("list should not error");
+        assert!(
+            keys.is_empty(),
+            "a user with no keys must return an empty list"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_api_keys_returns_only_owner_keys() {
+        let (db, _tmp) = setup_test_db().await;
+        let owner = AuthService::create_user(&db, "owner", "pass1234", "admin")
+            .await
+            .expect("owner");
+        let other = AuthService::create_user(&db, "other", "pass1234", "admin")
+            .await
+            .expect("other");
+        AuthService::create_api_key(&db, &owner.id, "k1")
+            .await
+            .expect("k1");
+        AuthService::create_api_key(&db, &owner.id, "k2")
+            .await
+            .expect("k2");
+        AuthService::create_api_key(&db, &other.id, "k3")
+            .await
+            .expect("k3");
+
+        let keys = AuthService::list_api_keys(&db, &owner.id)
+            .await
+            .expect("list");
+        assert_eq!(keys.len(), 2, "list must only return the owner's two keys");
+        assert!(keys.iter().all(|k| k.user_id == owner.id));
+    }
+
+    #[tokio::test]
+    async fn test_delete_api_key_success() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "delkey", "pass1234", "admin")
+            .await
+            .expect("user");
+        let (model, _raw) = AuthService::create_api_key(&db, &user.id, "doomed")
+            .await
+            .expect("create key");
+
+        AuthService::delete_api_key(&db, &model.id, &user.id)
+            .await
+            .expect("delete should succeed");
+
+        let keys = AuthService::list_api_keys(&db, &user.id)
+            .await
+            .expect("list");
+        assert!(keys.is_empty(), "the key must be gone after deletion");
+    }
+
+    #[tokio::test]
+    async fn test_delete_api_key_not_found() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "delnf", "pass1234", "admin")
+            .await
+            .expect("user");
+        let r = AuthService::delete_api_key(&db, "no-such-id", &user.id).await;
+        assert!(
+            matches!(r, Err(AppError::NotFound(_))),
+            "deleting a missing key must return NotFound, got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_api_key_wrong_owner_not_found() {
+        // A key owned by someone else must not be deletable; treated as NotFound.
+        let (db, _tmp) = setup_test_db().await;
+        let owner = AuthService::create_user(&db, "rightful", "pass1234", "admin")
+            .await
+            .expect("owner");
+        let stranger = AuthService::create_user(&db, "stranger", "pass1234", "admin")
+            .await
+            .expect("stranger");
+        let (model, _raw) = AuthService::create_api_key(&db, &owner.id, "private")
+            .await
+            .expect("create key");
+
+        let r = AuthService::delete_api_key(&db, &model.id, &stranger.id).await;
+        assert!(
+            matches!(r, Err(AppError::NotFound(_))),
+            "deleting another user's key must return NotFound, got {r:?}"
+        );
+        // The key must still exist for its real owner.
+        let keys = AuthService::list_api_keys(&db, &owner.id)
+            .await
+            .expect("list");
+        assert_eq!(
+            keys.len(),
+            1,
+            "the owner's key must remain after a foreign delete attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_api_key_updates_last_used_at() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "lastused", "pass1234", "admin")
+            .await
+            .expect("user");
+        let (model, raw) = AuthService::create_api_key(&db, &user.id, "k")
+            .await
+            .expect("create key");
+        assert!(model.last_used_at.is_none(), "new key has no last_used_at");
+
+        AuthService::validate_api_key(&db, &raw)
+            .await
+            .expect("validate should not error")
+            .expect("valid key must resolve to a user");
+
+        let after = api_key::Entity::find_by_id(&model.id)
+            .one(&db)
+            .await
+            .expect("query")
+            .expect("key still exists");
+        assert!(
+            after.last_used_at.is_some(),
+            "validating a key must stamp last_used_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_api_key_too_short_returns_none() {
+        // Below the 18-char minimum: short-circuits to None without a DB lookup.
+        let (db, _tmp) = setup_test_db().await;
+        let r = AuthService::validate_api_key(&db, "serverbee_x")
+            .await
+            .expect("validate should not error");
+        assert!(r.is_none(), "a too-short key must return None");
+    }
+
+    #[tokio::test]
+    async fn test_validate_api_key_wrong_prefix_returns_none() {
+        // Missing the `serverbee_` prefix short-circuits to None.
+        let (db, _tmp) = setup_test_db().await;
+        let r = AuthService::validate_api_key(&db, "wrongprefix_abcdefghijklmnop")
+            .await
+            .expect("validate should not error");
+        assert!(
+            r.is_none(),
+            "a key without the serverbee_ prefix must return None"
+        );
+    }
+
+    // ── validate_agent_token success + boundary ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_validate_agent_token_success() {
+        let (db, _tmp) = setup_test_db().await;
+        use serverbee_common::constants::CAP_DEFAULT;
+
+        // A real bound server: prefix is the first 8 chars, hash is argon2 of the token.
+        let token = "abcdefgh-this-is-a-real-agent-token";
+        let token_hash = AuthService::hash_password(token).expect("hash token");
+        let now = Utc::now();
+        let sid = Uuid::new_v4().to_string();
+        server::ActiveModel {
+            id: Set(sid.clone()),
+            token_hash: Set(Some(token_hash)),
+            token_prefix: Set(Some(token[..8].to_string())),
+            name: Set("bound".into()),
+            cpu_name: Set(None),
+            cpu_cores: Set(None),
+            cpu_arch: Set(None),
+            os: Set(None),
+            kernel_version: Set(None),
+            mem_total: Set(None),
+            swap_total: Set(None),
+            disk_total: Set(None),
+            ipv4: Set(None),
+            ipv6: Set(None),
+            region: Set(None),
+            country_code: Set(None),
+            geo_manual: Set(false),
+            virtualization: Set(None),
+            agent_version: Set(None),
+            group_id: Set(None),
+            weight: Set(0),
+            hidden: Set(false),
+            remark: Set(None),
+            public_remark: Set(None),
+            price: Set(None),
+            billing_cycle: Set(None),
+            currency: Set(None),
+            expired_at: Set(None),
+            traffic_limit: Set(None),
+            traffic_limit_type: Set(None),
+            billing_start_day: Set(None),
+            capabilities: Set(CAP_DEFAULT as i32),
+            protocol_version: Set(1),
+            features: Set("[]".into()),
+            last_remote_addr: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("seed bound server");
+
+        let matched = AuthService::validate_agent_token(&db, token)
+            .await
+            .expect("validate should not error")
+            .expect("the correct token must resolve to its server");
+        assert_eq!(matched.id, sid, "the matched server id must be returned");
+
+        // A token sharing the prefix but with a different body must not match.
+        let wrong = AuthService::validate_agent_token(&db, "abcdefgh-WRONG-body-entirely")
+            .await
+            .expect("validate should not error");
+        assert!(wrong.is_none(), "a wrong token body must not validate");
+    }
+
+    #[tokio::test]
+    async fn test_validate_agent_token_too_short_returns_none() {
+        // Tokens shorter than 8 chars short-circuit to None without a query.
+        let (db, _tmp) = setup_test_db().await;
+        let r = AuthService::validate_agent_token(&db, "short")
+            .await
+            .expect("validate should not error");
+        assert!(r.is_none(), "a token under 8 chars must return None");
+    }
+
+    // ── 2FA enable / disable / has + not-found paths ──────────────────────────
+
+    #[tokio::test]
+    async fn test_2fa_enable_disable_has_lifecycle() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "tfalife", "pass1234", "member")
+            .await
+            .expect("create user");
+
+        // Fresh user has no 2FA.
+        assert!(
+            !AuthService::has_2fa(&db, &user.id).await.expect("has_2fa"),
+            "a new user must not have 2FA enabled"
+        );
+
+        let (secret, _u, _q) = AuthService::generate_totp_secret("tfalife").expect("secret");
+        AuthService::enable_2fa(&db, &user.id, &secret)
+            .await
+            .expect("enable should succeed");
+        assert!(
+            AuthService::has_2fa(&db, &user.id).await.expect("has_2fa"),
+            "after enable the user must have 2FA"
+        );
+
+        AuthService::disable_2fa(&db, &user.id)
+            .await
+            .expect("disable should succeed");
+        assert!(
+            !AuthService::has_2fa(&db, &user.id).await.expect("has_2fa"),
+            "after disable the user must not have 2FA"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enable_2fa_user_not_found() {
+        let (db, _tmp) = setup_test_db().await;
+        let r = AuthService::enable_2fa(&db, "missing-id", "SECRET").await;
+        assert!(
+            matches!(r, Err(AppError::NotFound(_))),
+            "enabling 2FA for a missing user must be NotFound, got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disable_2fa_user_not_found() {
+        let (db, _tmp) = setup_test_db().await;
+        let r = AuthService::disable_2fa(&db, "missing-id").await;
+        assert!(
+            matches!(r, Err(AppError::NotFound(_))),
+            "disabling 2FA for a missing user must be NotFound, got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_has_2fa_user_not_found() {
+        let (db, _tmp) = setup_test_db().await;
+        let r = AuthService::has_2fa(&db, "missing-id").await;
+        assert!(
+            matches!(r, Err(AppError::NotFound(_))),
+            "querying 2FA for a missing user must be NotFound, got {r:?}"
+        );
+    }
+
+    // ── change_password / complete_onboarding not-found ───────────────────────
+
+    #[tokio::test]
+    async fn test_change_password_user_not_found() {
+        let (db, _tmp) = setup_test_db().await;
+        let r = AuthService::change_password(&db, "missing-id", "old", "new_pass123", None).await;
+        assert!(
+            matches!(r, Err(AppError::NotFound(_))),
+            "changing password for a missing user must be NotFound, got {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complete_onboarding_user_not_found() {
+        let (db, _tmp) = setup_test_db().await;
+        let r = AuthService::complete_onboarding(&db, "missing-id", "new-pass-1", None).await;
+        assert!(
+            matches!(r, Err(AppError::NotFound(_))),
+            "onboarding a missing user must be NotFound, got {r:?}"
+        );
+    }
+
+    // ── revoke_user_mobile_sessions ───────────────────────────────────────────
+
+    /// Seed a mobile session plus a session row + device token that reference it.
+    async fn seed_mobile_chain(db: &DatabaseConnection, user_id: &str) -> (String, String) {
+        let now = Utc::now();
+        let ms_id = Uuid::new_v4().to_string();
+        mobile_session::ActiveModel {
+            id: Set(ms_id.clone()),
+            user_id: Set(user_id.to_string()),
+            refresh_token_hash: Set("hash".into()),
+            installation_id: Set(Uuid::new_v4().to_string()),
+            device_name: Set("phone".into()),
+            created_at: Set(now),
+            expires_at: Set(now + chrono::Duration::days(30)),
+            last_used_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("seed mobile_session");
+
+        let session_token = AuthService::generate_session_token();
+        session::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(user_id.to_string()),
+            token: Set(AuthService::hash_session_token(&session_token)),
+            ip: Set("127.0.0.1".into()),
+            user_agent: Set("phone".into()),
+            expires_at: Set(now + chrono::Duration::days(30)),
+            created_at: Set(now),
+            source: Set("mobile".into()),
+            mobile_session_id: Set(Some(ms_id.clone())),
+        }
+        .insert(db)
+        .await
+        .expect("seed mobile session row");
+
+        device_token::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            user_id: Set(user_id.to_string()),
+            mobile_session_id: Set(ms_id.clone()),
+            installation_id: Set(Uuid::new_v4().to_string()),
+            token: Set("apns-token".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("seed device_token");
+
+        (ms_id, session_token)
+    }
+
+    #[tokio::test]
+    async fn test_revoke_user_mobile_sessions_removes_all() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "mobrevoke", "pass1234", "member")
+            .await
+            .expect("create user");
+        let (ms_id, _stoken) = seed_mobile_chain(&db, &user.id).await;
+
+        // No keep id -> the whole mobile chain (device_token, session, mobile_session) goes.
+        AuthService::revoke_user_mobile_sessions(&db, &user.id, None)
+            .await
+            .expect("revoke should succeed");
+
+        assert!(
+            mobile_session::Entity::find_by_id(&ms_id)
+                .one(&db)
+                .await
+                .expect("query")
+                .is_none(),
+            "mobile_session must be deleted"
+        );
+        assert!(
+            device_token::Entity::find()
+                .filter(device_token::Column::UserId.eq(&user.id))
+                .one(&db)
+                .await
+                .expect("query")
+                .is_none(),
+            "device_token rows must be deleted"
+        );
+        assert!(
+            session::Entity::find()
+                .filter(session::Column::UserId.eq(&user.id))
+                .one(&db)
+                .await
+                .expect("query")
+                .is_none(),
+            "mobile session rows must be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revoke_user_mobile_sessions_preserves_kept_id() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "mobkeep", "pass1234", "member")
+            .await
+            .expect("create user");
+        let (keep_ms, _t1) = seed_mobile_chain(&db, &user.id).await;
+        let (gone_ms, _t2) = seed_mobile_chain(&db, &user.id).await;
+
+        // Keeping one mobile session must spare exactly that row.
+        AuthService::revoke_user_mobile_sessions(&db, &user.id, Some(&keep_ms))
+            .await
+            .expect("revoke should succeed");
+
+        assert!(
+            mobile_session::Entity::find_by_id(&keep_ms)
+                .one(&db)
+                .await
+                .expect("query")
+                .is_some(),
+            "the kept mobile_session must survive"
+        );
+        assert!(
+            mobile_session::Entity::find_by_id(&gone_ms)
+                .one(&db)
+                .await
+                .expect("query")
+                .is_none(),
+            "the non-kept mobile_session must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_change_password_preserves_own_mobile_session() {
+        let (db, _tmp) = setup_test_db().await;
+        let user = AuthService::create_user(&db, "mobpwd", "old_pass1", "member")
+            .await
+            .expect("create user");
+        // The caller's own mobile session, identified by its session token.
+        let (keep_ms, keep_token) = seed_mobile_chain(&db, &user.id).await;
+        // A second mobile session that must be revoked by the password change.
+        let (gone_ms, _gone_token) = seed_mobile_chain(&db, &user.id).await;
+
+        AuthService::change_password(&db, &user.id, "old_pass1", "new_pass123", Some(&keep_token))
+            .await
+            .expect("change_password should succeed");
+
+        // The caller's mobile session is preserved and its created_at bumped.
+        let kept = mobile_session::Entity::find_by_id(&keep_ms)
+            .one(&db)
+            .await
+            .expect("query")
+            .expect("kept mobile session must survive");
+        assert!(
+            user::Entity::find_by_id(&user.id)
+                .one(&db)
+                .await
+                .expect("query")
+                .expect("user")
+                .password_changed_at
+                .is_some(),
+            "password_changed_at must be stamped"
+        );
+        // created_at is bumped to the change instant (>= the original seed time).
+        assert!(kept.created_at <= Utc::now());
+
+        // The other mobile session must be gone.
+        assert!(
+            mobile_session::Entity::find_by_id(&gone_ms)
+                .one(&db)
+                .await
+                .expect("query")
+                .is_none(),
+            "the other mobile session must be revoked"
+        );
+    }
+}

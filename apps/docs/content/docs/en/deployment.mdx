@@ -1,0 +1,867 @@
+---
+title: Deployment Guide
+description: Production deployment strategies for the ServerBee server and agents.
+icon: Cloud
+---
+
+This guide covers production deployment best practices for ServerBee: Railway, Docker, systemd, reverse proxy configuration, TLS, and backup strategies.
+
+## Railway (One-Click Deploy)
+
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/serverbee-server)
+
+The fastest way to get ServerBee running. Click the button above, then configure the environment variables:
+
+```bash
+SERVERBEE_LOG__LEVEL="info"                    # Log level (trace/debug/info/warn/error)
+
+SERVERBEE_RETENTION__RECORDS_DAYS="7"          # Raw metrics retention in days
+SERVERBEE_RETENTION__RECORDS_HOURLY_DAYS="90"  # Hourly aggregates retention in days
+SERVERBEE_RETENTION__AUDIT_LOGS_DAYS="180"     # Audit log retention in days
+SERVERBEE_SCHEDULER__TIMEZONE="UTC"            # Timezone for daily traffic aggregation (e.g. Asia/Shanghai)
+
+SERVERBEE_OAUTH__BASE_URL=""                   # OAuth callback URL (e.g. https://xxx.up.railway.app)
+SERVERBEE_OAUTH__GITHUB__CLIENT_ID=""          # GitHub OAuth Client ID
+SERVERBEE_OAUTH__GITHUB__CLIENT_SECRET=""      # GitHub OAuth Client Secret
+SERVERBEE_OAUTH__ALLOW_REGISTRATION="false"    # Auto-create accounts on first OAuth login (true=open, false=linked only)
+```
+
+After deploying:
+
+1. Add a **Volume** mounted at `/data` to persist data across deploys
+2. Configure your agents to connect using the Railway-provided URL
+3. On first start, the server auto-creates an admin account with a randomly generated password. Open the Railway deploy logs and look for the highlighted credentials banner to retrieve it. On first login you must change this password and may optionally choose a different username.
+
+<Callout type="info">
+Railway automatically assigns a port and provides HTTPS. No need to configure `SERVERBEE_SERVER__LISTEN` or TLS certificates.
+</Callout>
+
+### Selecting a Railway Version
+
+The source template pins the repository's current package version, currently `1.0.0-beta.4`. This avoids silently deploying the older image behind `:latest` while ServerBee has no stable `1.x` release.
+
+To pin a specific version (stable or pre-release), add the following variable under **Variables** on the Railway service:
+
+```bash
+SERVERBEE_IMAGE_TAG=1.0.0-beta.4
+```
+
+Save and trigger a redeploy. Check the [release page](https://github.com/ZingerLittleBee/ServerBee/releases) before changing this pin. Future prereleases also publish a moving `beta` tag, while `latest` moves only for suffix-free stable releases; an exact version remains the safest repeatable choice.
+
+<Callout type="info">
+The Dockerfile exposes this switch via `ARG SERVERBEE_IMAGE_TAG=1.0.0-beta.4`. Railway injects service variables as both build args and runtime environment variables; since this variable is not part of the `SERVERBEE_*` configuration schema, it has no runtime side effects.
+</Callout>
+
+## Bootstrap Installer
+
+On Linux hosts, the bootstrap installer is the quickest binary/systemd path:
+
+```bash
+# Install the server
+curl -fsSL https://raw.githubusercontent.com/ZingerLittleBee/ServerBee/main/deploy/install.sh | sudo sh -s -- server
+
+# Install an agent
+curl -fsSL https://raw.githubusercontent.com/ZingerLittleBee/ServerBee/main/deploy/install.sh | sudo sh -s -- agent \
+  --server-url http://your-server-ip:9527 \
+  --enrollment-code YOUR_ONE_TIME_CODE
+```
+
+After installation, manage your deployment with the `serverbee` CLI (automatically installed to `/usr/local/bin/serverbee`):
+
+```bash
+sudo serverbee status
+sudo serverbee upgrade -y
+sudo serverbee upgrade --channel beta -y   # Explicitly stay on prereleases
+sudo serverbee restart
+sudo serverbee config
+sudo serverbee env
+sudo serverbee uninstall agent -y
+```
+
+<Callout type="info">
+`install server` / `install agent` are bootstrap commands. If the binary already exists in `/usr/local/bin`, the installer adopts it instead of overwriting it. Use `upgrade` (or replace the binary manually) when you need to roll out a refreshed release binary to an existing host.
+</Callout>
+
+The default `auto` channel selects the newest suffix-free stable release when one exists, otherwise it falls back to the newest prerelease. The installer saves that policy per component and reuses it for upgrades. Pass `--channel stable` or `--channel beta` to opt into one track explicitly, or `--version vX.Y.Z-beta.N` to pin an exact release. The CLI refuses to replace an installed version with an older SemVer.
+
+## Docker Compose (Recommended)
+
+Docker Compose is the simplest way to deploy ServerBee in production. First create the configuration file (a missing bind source must not become a directory):
+
+```bash
+mkdir -p config
+cat > config/server.toml <<'EOF'
+[server]
+data_dir = "/data"
+EOF
+```
+
+Then create `docker-compose.yml` beside the `config` directory:
+
+```yaml
+services:
+  serverbee-server:
+    image: ghcr.io/zingerlittlebee/serverbee-server:1.0.0-beta.4
+    container_name: serverbee-server
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9527:9527"
+    volumes:
+      - serverbee-data:/data
+      - ./config/server.toml:/etc/serverbee/server.toml:ro
+    environment:
+      - SERVERBEE_AUTH__SECURE_COOKIE=true
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9527/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  serverbee-data:
+```
+
+<Callout type="info">
+Binding to `127.0.0.1:9527` instead of `0.0.0.0:9527` ensures the server is only accessible through the reverse proxy, not directly from the internet.
+</Callout>
+
+Start the service:
+
+```bash
+docker compose up -d
+```
+
+View logs:
+
+```bash
+docker compose logs -f serverbee-server
+```
+
+## Build from Source
+
+Developers and users with customization needs can build ServerBee from source. This requires Rust 1.89+ and Bun 1.x (or Node.js 22+).
+
+```bash
+# Clone the repo
+git clone https://github.com/ZingerLittleBee/ServerBee.git
+cd ServerBee
+
+# Build the frontend
+cd apps/web
+bun install
+bun run build
+cd ../..
+
+# Build the server (embeds the frontend via rust-embed)
+cargo build --release -p serverbee-server
+
+# Build the agent
+cargo build --release -p serverbee-agent
+```
+
+The binaries will be located in `target/release/`:
+
+- `serverbee-server` — the server, with the frontend assets embedded
+- `serverbee-agent` — the metrics agent
+
+Start the server:
+
+```bash
+./target/release/serverbee-server
+```
+
+After deploying the compiled binaries to the target host, use the systemd service configuration below to manage the processes.
+
+## Systemd Services
+
+For deployments without Docker, use systemd to manage the server and agent processes.
+
+<Callout type="info">
+If you do not need hand-written unit files, prefer the bootstrap installer above. It creates the config files and systemd units for you, then the `serverbee` CLI handles upgrades, restarts, and config edits.
+
+Note: the unit examples below use custom paths (`/usr/local/bin`, `/var/lib/serverbee`, `/etc/serverbee`) to illustrate a manual deployment. The bootstrap installer uses a different layout — binaries in `/opt/serverbee/bin/`, config in `/opt/serverbee/etc/`, data in `/opt/serverbee/data/` — managed by the `serverbee` CLI, with no hand-written units.
+</Callout>
+
+### Server Service
+
+Create `/etc/systemd/system/serverbee-server.service`:
+
+```ini
+[Unit]
+Description=ServerBee Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/serverbee-server
+Restart=always
+RestartSec=5
+User=serverbee
+Group=serverbee
+WorkingDirectory=/var/lib/serverbee
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/serverbee /var/log/serverbee
+PrivateTmp=true
+
+# Resource limits
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Create the service user and directories:
+
+```bash
+# Create system user
+sudo useradd -r -s /sbin/nologin -d /var/lib/serverbee serverbee
+
+# Create directories
+sudo mkdir -p /var/lib/serverbee /var/log/serverbee /etc/serverbee
+sudo chown serverbee:serverbee /var/lib/serverbee /var/log/serverbee
+
+# Place configuration
+sudo cp server.toml /etc/serverbee/server.toml
+
+# Place binary
+sudo cp serverbee-server /usr/local/bin/
+sudo chmod +x /usr/local/bin/serverbee-server
+```
+
+A production `server.toml` for systemd:
+
+```toml
+[server]
+listen = "127.0.0.1:9527"
+data_dir = "/var/lib/serverbee"
+
+[log]
+level = "info"
+file = "/var/log/serverbee/server.log"
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable serverbee-server
+sudo systemctl start serverbee-server
+sudo systemctl status serverbee-server
+```
+
+### Agent Service
+
+See the [Agent Setup](/en/docs/agent) guide for a complete systemd service unit file.
+
+## Reverse Proxy
+
+Running ServerBee behind a reverse proxy is strongly recommended in production. The proxy provides TLS termination, HTTP/2, and additional security headers.
+
+### Access URL and Cookie Settings
+
+Pick one public access URL and keep the browser URL, the agent's `server_url`, and the cookie setting aligned:
+
+| Scenario | Public URL | `auth.secure_cookie` | Docker Environment Variable | Agent URL |
+|----------|------------|----------------------|-----------------------------|-----------|
+| Direct IP over HTTP | `http://203.0.113.10:9527` | `false` | `SERVERBEE_AUTH__SECURE_COOKIE=false` | `http://203.0.113.10:9527` |
+| Domain through HTTPS reverse proxy | `https://monitor.example.com` | `true` | `SERVERBEE_AUTH__SECURE_COOKIE=true` or omit the variable | `https://monitor.example.com` |
+
+For domain access, create a DNS `A` or `AAAA` record pointing to the server, terminate HTTPS in Nginx, Caddy, or Traefik, and proxy traffic to ServerBee on `127.0.0.1:9527`.
+
+If you installed with the quick-start script, it writes `auth.secure_cookie = false` for direct HTTP access. Before switching that same installation to HTTPS, update `/opt/serverbee/etc/server.toml`:
+
+```toml
+[auth]
+secure_cookie = true
+```
+
+Then restart the server:
+
+```bash
+sudo systemctl restart serverbee-server
+```
+
+If ServerBee was installed with the install script, you can also let the CLI configure Caddy HTTPS automatically:
+
+```bash
+sudo serverbee domain setup --domain monitor.example.com --email admin@example.com -y
+```
+
+This command verifies that the domain resolves to the current server, installs and configures Caddy, changes ServerBee to listen only on `127.0.0.1:9527`, and sets `auth.secure_cookie = true`. If DNS is not ready yet, it stops and prints the `A`/`AAAA` record you need to add.
+
+### Nginx
+
+```nginx
+upstream serverbee {
+    server 127.0.0.1:9527;
+}
+
+server {
+    listen 80;
+    server_name monitor.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name monitor.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/monitor.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/monitor.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    location / {
+        proxy_pass http://serverbee;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket support (required for agents, browser updates, and terminal)
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Long timeouts for persistent WebSocket connections
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+
+        # Disable buffering for real-time data
+        proxy_buffering off;
+    }
+}
+```
+
+### Caddy
+
+Caddy handles TLS automatically with Let's Encrypt:
+
+```
+monitor.example.com {
+    reverse_proxy 127.0.0.1:9527 {
+        # WebSocket support is automatic in Caddy
+    }
+}
+```
+
+That is the entire Caddy configuration needed. Caddy handles HTTPS certificates, HTTP/2, WebSocket upgrades, and security headers by default.
+
+### Traefik
+
+Traefik integrates with Docker via labels — no separate config file needed. Traefik automatically detects WebSocket connections, so no extra configuration is required.
+
+```yaml
+services:
+  serverbee-server:
+    image: ghcr.io/zingerlittlebee/serverbee-server:1.0.0-beta.4
+    volumes:
+      - serverbee-data:/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.serverbee.rule=Host(`monitor.example.com`)"
+      - "traefik.http.routers.serverbee.entrypoints=websecure"
+      - "traefik.http.routers.serverbee.tls.certresolver=letsencrypt"
+      - "traefik.http.services.serverbee.loadbalancer.server.port=9527"
+    restart: unless-stopped
+    networks:
+      - traefik
+
+networks:
+  traefik:
+    external: true
+
+volumes:
+  serverbee-data:
+```
+
+## TLS / HTTPS
+
+For production deployments, always use HTTPS. The recommended approaches:
+
+### Let's Encrypt with Certbot (Nginx)
+
+```bash
+sudo apt install certbot python3-certbot-nginx
+sudo certbot --nginx -d monitor.example.com
+```
+
+Certbot will automatically configure nginx and set up certificate renewal.
+
+### Let's Encrypt with Caddy
+
+Caddy obtains and renews certificates automatically. No additional setup is needed.
+
+### Manual Certificates
+
+If you have your own certificates, place them in a secure directory and reference them in your reverse proxy configuration. Ensure the certificate files are readable by the proxy process and that you have a renewal process in place.
+
+## Agent Configuration for HTTPS
+
+When your server is behind HTTPS, update the agent's `server_url` accordingly:
+
+```toml
+server_url = "https://monitor.example.com"
+```
+
+The agent automatically handles WebSocket connections using the provided URL.
+
+<Callout type="info">
+ServerBee does not terminate TLS itself. All HTTPS/WSS encryption is handled by the reverse proxy in front of it (Nginx/Caddy/Traefik). This keeps the server implementation simple and lets you manage certificates in one place.
+</Callout>
+
+<Callout type="warn">
+When using HTTPS, keep `auth.secure_cookie = true` in your server configuration. Leaving it `false` may still allow login, but it removes the browser's Secure cookie protection and is not appropriate for production.
+</Callout>
+
+## Backup and Restore
+
+### What to Back Up [#persistent-data]
+
+SQLite stores monitoring records, users, settings, and uploaded widget packages. Several assets are separate files. A database download alone does not restore the complete installation:
+
+| Item | Location | Included in database backup | Description |
+|------|----------|-----------------------------|-------------|
+| Database | `{data_dir}/serverbee.db` | Yes | Default `database.path`; includes database-backed settings and widget packages |
+| Brand assets | `{data_dir}/brand/` | No | Uploaded logo and favicon; the database stores their URLs, not the image bytes |
+| Downloaded GeoIP Country database | `{data_dir}/dbip-country-lite.mmdb` | No | DB-IP Lite Country database, if downloaded |
+| Downloaded ASN database | `{data_dir}/dbip-asn-lite.mmdb` | No | DB-IP Lite ASN database, if downloaded |
+| Custom MMDB files | `geoip.mmdb_path`, `asn.mmdb_path` | No | Preserve these configured files separately if they are outside `data_dir` |
+| Server configuration | `/opt/serverbee/etc/` | No | Installer configuration and release policy; also preserve external environment files and secrets |
+| Agent configuration and state | `/opt/serverbee/etc/agent.toml`, configured `state_dir` and `security.data_dir` | No | Back up on each Agent host, including its run token; the Server backup does not copy remote files |
+
+`serverbee.db-wal` may contain changes not yet in the main database. Use SQLite `.backup` or the backup API for a running server, rather than copying its database and sidecars independently. A stopped full-directory snapshot preserves any remaining `serverbee.db-wal` and `serverbee.db-shm` files together.
+
+### Backup Strategy
+
+The following examples use the installer defaults: `/opt/serverbee/data/serverbee.db` and `/opt/serverbee/etc/`. Substitute your actual data directory, database filename, configuration directory, and any external MMDB paths. For Docker, the example assumes the Compose layout above (`/data`, `config/server.toml`, and `docker-compose.yml`).
+
+Run host filesystem commands as root, install the `sqlite3` CLI, and keep backup sets private. Create one timestamped directory for the database and its matching assets:
+
+```bash
+set -e
+umask 077
+SERVERBEE_BACKUP_DIR="/backups/serverbee-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$SERVERBEE_BACKUP_DIR"
+```
+
+**Option 0: Built-in admin backup API, database only**
+
+The admin-only `/api/settings/backup` endpoint uses SQLite `VACUUM INTO` and exports only the database. It does not include brand images, MMDB files, configuration, or Agent state. Store an admin-scoped API key in the environment:
+
+```bash
+curl --fail --request POST \
+  --header "X-API-Key: ${SERVERBEE_ADMIN_API_KEY}" \
+  --output "$SERVERBEE_BACKUP_DIR/serverbee.db" \
+  https://monitor.example.com/api/settings/backup
+test "$(sqlite3 "$SERVERBEE_BACKUP_DIR/serverbee.db" 'PRAGMA integrity_check;')" = ok
+```
+
+If downloading from another host, collect the asset and configuration archives on the Server host and copy them into the same backup set.
+
+**Option 1: SQLite backup command, database only**
+
+```bash
+sqlite3 /opt/serverbee/data/serverbee.db ".backup '$SERVERBEE_BACKUP_DIR/serverbee.db'"
+test "$(sqlite3 "$SERVERBEE_BACKUP_DIR/serverbee.db" 'PRAGMA integrity_check;')" = ok
+```
+
+For either database-only option, complete the backup set with the following archives. `assets.tar.gz` saves the data directory except the live database and its sidecars, so it includes `brand/` and both downloaded MMDB files when present. `config.tar.gz` saves the installer configuration directory:
+
+```bash
+tar czf "$SERVERBEE_BACKUP_DIR/assets.tar.gz" \
+  --exclude='./serverbee.db*' -C /opt/serverbee/data .
+tar czf "$SERVERBEE_BACKUP_DIR/config.tar.gz" -C /opt/serverbee etc
+```
+
+Keep branding, MMDB downloads, and configuration unchanged while collecting this set. Separate online copies are not an atomic snapshot; use a stopped snapshot below when those files are changing. Add any external `geoip.mmdb_path`, `asn.mmdb_path`, environment files, and secrets to the backup set with their original paths recorded. Copy verified backup sets off the ServerBee host.
+
+**Option 2: Complete host snapshot, requires stopping the server**
+
+```bash
+set -e
+sudo systemctl stop serverbee-server
+tar czf "$SERVERBEE_BACKUP_DIR/data.tar.gz" -C /opt/serverbee/data .
+tar czf "$SERVERBEE_BACKUP_DIR/config.tar.gz" -C /opt/serverbee etc
+sudo systemctl start serverbee-server
+```
+
+The data archive includes the database, any remaining WAL/SHM files, brand assets, and downloaded MMDB files. Save external files separately as described above. If an archive command fails, resolve it before restarting and treating the set as complete.
+
+**Option 3: Complete Docker volume and configuration snapshot**
+
+```bash
+set -e
+umask 077
+SERVERBEE_BACKUP_DIR="$PWD/backups/serverbee-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$SERVERBEE_BACKUP_DIR"
+docker compose stop serverbee-server
+
+SERVERBEE_DATA_VOLUME="$(
+  docker inspect serverbee-server \
+    --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{println .Name}}{{end}}{{end}}'
+)"
+test -n "$SERVERBEE_DATA_VOLUME"
+
+docker run --rm \
+  --mount "type=volume,src=${SERVERBEE_DATA_VOLUME},dst=/data,readonly" \
+  --mount "type=bind,src=${SERVERBEE_BACKUP_DIR},dst=/backups" \
+  alpine tar czf /backups/data.tar.gz -C /data .
+tar czf "$SERVERBEE_BACKUP_DIR/config.tar.gz" config docker-compose.yml
+
+docker compose start serverbee-server
+```
+
+This snapshots everything in the actual `/data` volume, including brand and downloaded MMDB assets, and archives the separately mounted configuration. Also preserve any Compose `.env` file, external secrets, and MMDB bind mounts. Do not assume the volume is literally named `serverbee-data`: Compose usually adds a project prefix, and a wrong name can silently create an empty volume.
+
+### Restore
+
+Restore the database and the matching assets/configuration before starting the Server. The example below uses a database-only backup completed with `assets.tar.gz` and `config.tar.gz`; it assumes the installer layout and a backup already checked with `PRAGMA integrity_check`:
+
+```bash
+set -e
+umask 077
+SERVERBEE_RESTORE_DIR="/backups/serverbee-20260314T020000Z"
+test "$(sqlite3 "$SERVERBEE_RESTORE_DIR/serverbee.db" 'PRAGMA integrity_check;')" = ok
+test -f "$SERVERBEE_RESTORE_DIR/assets.tar.gz"
+test -f "$SERVERBEE_RESTORE_DIR/config.tar.gz"
+sudo systemctl stop serverbee-server
+
+# Preserve the current state before replacing it.
+SERVERBEE_BEFORE_RESTORE="/backups/before-restore-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$SERVERBEE_BEFORE_RESTORE"
+mv /opt/serverbee/data /opt/serverbee/etc "$SERVERBEE_BEFORE_RESTORE/"
+
+# Restore into an empty directory, without the previous database WAL/SHM.
+mkdir -p /opt/serverbee/data
+cp "$SERVERBEE_RESTORE_DIR/serverbee.db" /opt/serverbee/data/serverbee.db
+tar xzf "$SERVERBEE_RESTORE_DIR/assets.tar.gz" -C /opt/serverbee/data
+tar xzf "$SERVERBEE_RESTORE_DIR/config.tar.gz" -C /opt/serverbee
+
+# Restore external MMDB/environment files and service ownership before starting.
+# For a dedicated service user: chown -R serverbee:serverbee /opt/serverbee/data
+sudo systemctl start serverbee-server
+```
+
+For a stopped host snapshot, extract `data.tar.gz` into the empty data directory instead of copying `serverbee.db` and extracting `assets.tar.gz`. Restore the matching `config.tar.gz` and external files in either case. Review restored configuration before startup; old environment variables or secret-store values can override the restored TOML.
+
+The admin-only `/api/settings/restore` endpoint accepts a raw SQLite file, keeps the previous database as `.pre-restore`, and requires a restart. It restores only the database, leaving file assets and configuration untouched. It is not a complete installation restore; use the stopped procedure above or the [Docker recovery runbook](#restore-a-docker-backup-into-a-new-volume) when those files must also be restored.
+
+### Automated Backups
+
+This cron entry schedules **database-only** backups. Install `sqlite3` and create the destination with `sudo install -d -m 0700 /backups` first:
+
+```bash
+# /etc/cron.d/serverbee-backup
+0 2 * * * root umask 077; sqlite3 /opt/serverbee/data/serverbee.db ".backup '/backups/serverbee-$(date +\%Y\%m\%d).db'" && find /backups -name 'serverbee-*.db' -mtime +30 -delete
+```
+
+It runs at 2:00 AM and deletes database backups older than 30 days. Schedule the matching asset/configuration archives too, especially after branding, MMDB, or configuration changes; verify and copy complete sets off-host.
+
+## Health Checks
+
+ServerBee exposes a health check endpoint:
+
+```
+GET /healthz
+```
+
+Use this to verify the server is running and responsive. Configure it in your monitoring system, Docker health check, or load balancer.
+
+### Docker Health Check
+
+The Docker Compose example above includes a health check. Three consecutive failures mark the container `unhealthy`; Docker does **not** restart a merely unhealthy container. The restart policy only reacts when the process exits, so monitor the health state externally and investigate or restart it deliberately.
+
+### External Monitoring
+
+If you use an external uptime monitoring service, point it at:
+
+```
+https://monitor.example.com/healthz
+```
+
+This creates a "monitor the monitor" setup, so you are alerted if ServerBee itself goes down.
+
+## Resource Requirements
+
+ServerBee is designed for lightweight VPS instances:
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| Server CPU | 1 vCPU | 2 vCPU |
+| Server RAM | 128 MB | 256 MB |
+| Server Disk | 100 MB + data | 1 GB+ (depends on retention) |
+| Agent CPU | Negligible | < 1% of 1 core |
+| Agent RAM | ~27 MB measured cgroup steady state | 30–40 MB headroom |
+
+Database size depends on server count, enabled writers, sampling intervals, and retention settings. Use [Storage & Sizing](/en/docs/storage-sizing) for the measured 30-day baseline, feature multipliers, and WAL headroom instead of combining rough estimates from different retention windows.
+
+Official Linux release binaries and Docker images use musl; `MALLOC_ARENA_MAX` does not affect those builds. Measure the version and workload you deploy rather than sizing from the historical glibc notes. See [Resource Usage](/en/docs/resource-usage).
+
+## Security Checklist
+
+Before exposing ServerBee to the internet:
+
+- [ ] Change the default admin password
+- [ ] Use HTTPS with a valid TLS certificate
+- [ ] Set `auth.secure_cookie = true` (default)
+- [ ] Bind the server to localhost and use a reverse proxy
+- [ ] Set strong rate limits for login attempts
+- [ ] Enable TOTP two-factor authentication for admin accounts
+- [ ] Use Add Server or explicit re-enrollment to issue a bound, short-lived offer only when needed
+- [ ] Keep the GeoIP database updated (if used)
+- [ ] Set up automated backups
+- [ ] Monitor the server itself with an external health check
+
+## Upgrading
+
+ServerBee runs database migrations automatically on startup, so no manual migration step is needed after an upgrade. Back up the complete data directory, configuration, and external assets before upgrading.
+
+**Docker:**
+
+```bash
+docker compose pull
+docker compose up -d            # restarts and runs migrations automatically
+docker compose ps
+```
+
+**Binary:**
+
+```bash
+wget https://github.com/ZingerLittleBee/ServerBee/releases/download/v1.0.0-beta.4/serverbee-server-linux-amd64
+sudo systemctl stop serverbee-server
+sudo mv serverbee-server-linux-amd64 /usr/local/bin/serverbee-server
+sudo chmod +x /usr/local/bin/serverbee-server
+sudo systemctl start serverbee-server
+```
+
+If you deployed with the install script, `sudo serverbee upgrade -y` handles the binary download, replacement, and restart for you.
+
+## Uninstalling and Purging
+
+`sudo serverbee uninstall <server|agent>` stops and removes the managed service/container and executable, but intentionally preserves configuration and data for a reinstall. Add `--purge -y` only after taking a verified backup; it also removes installer-managed config, Server data or Docker volumes/images, and removes the management CLI when no components remain.
+
+Review these leftovers separately:
+
+- Agent runtime state defaults to `/var/lib/serverbee/capability_grants.json` and `/var/lib/serverbee/security`. A custom `state_dir` or `security.data_dir` may point elsewhere; remove it only after confirming no remaining Agent uses it.
+- Domain setup may have installed Caddy and added a domain block to `/etc/caddy/Caddyfile`. The uninstaller does not delete packages or shared proxy configuration. Back up the file, remove only the ServerBee domain block, run `sudo caddy validate --config /etc/caddy/Caddyfile`, then `sudo systemctl reload caddy`. Remove Caddy itself only if no other site uses it.
+- A non-purge Docker uninstall preserves its Compose file, config, and named volume. Inspect the exact volume with `docker inspect serverbee-server` before deleting anything.
+
+After cleanup, verify that no `serverbee-*` service/container is running and that ports `9527` (and, if removing the proxy, `80`/`443`) have the expected owners.
+
+## Database Migration Failures and Recovery
+
+ServerBee runs database migrations during Rust server startup. Migrations finish before the HTTP listener starts; when a migration fails, the process exits, and Docker's `restart: unless-stopped` or a systemd restart policy may put the service into a restart loop.
+
+<Callout type="warn">
+The current release does not create an automatic pre-migration snapshot and cannot automatically roll migrations back. A Docker volume persists files, but it is not a versioned restore point. All migrations move forward, and migration `down()` implementations do not restore the old schema.
+</Callout>
+
+### Failure Scenarios
+
+| Category | Typical causes | Recommended response |
+|----------|----------------|----------------------|
+| Storage is not writable | Incorrect `/data` permissions, read-only mount, exhausted disk space or inodes | Stop the restart loop, repair storage, then retry the migration |
+| Database lock | Another ServerBee instance, backup process, or SQLite client holds a long-lived lock | Ensure there is one database writer, stop the conflicting process, then retry |
+| Database corruption | Damaged SQLite database, WAL, or SHM file; abrupt host power loss | Preserve the failed state, run integrity checks, and prefer a verified backup |
+| Schema drift | Tables, indexes, or migration history were edited manually | Do not fabricate migration records; restore a compatible backup or ship a forward repair migration |
+| Existing data violates a new constraint | Duplicate values, null values, orphaned foreign keys, or unexpected legacy formats | Locate and repair the data in a database copy, then retry the migration |
+| Migration implementation defect | Incorrect SQL, backfill logic, or target schema | Preserve the database and deploy a new image containing a corrected migration |
+| Interrupted execution | The container was killed or the host restarted during a migration | Snapshot the failed state first; verify schema and migration history before retrying |
+| Multiple instances compete | Multiple containers migrate the same SQLite file concurrently | Scale down to one instance; multiple Server instances must not share writes to one SQLite database |
+| Incompatible application rollback | A new migration succeeded, then only the application image was downgraded | Restore the matching pre-upgrade database backup or run an application version compatible with the new schema |
+
+### Step 1: Stop the Restart Loop
+
+Docker Compose:
+
+```bash
+docker compose stop serverbee-server
+```
+
+If an external tool still keeps starting the container, temporarily disable its container-level restart policy:
+
+```bash
+docker update --restart=no serverbee-server
+docker stop serverbee-server
+```
+
+systemd:
+
+```bash
+sudo systemctl stop serverbee-server
+sudo systemctl reset-failed serverbee-server
+```
+
+Stopping the service does not delete its Docker volume or database. Do not run `docker compose down -v`; the `-v` flag deletes Compose-managed volumes.
+
+### Step 2: Read the Migration Error
+
+Docker:
+
+```bash
+docker logs --tail 200 serverbee-server
+```
+
+systemd:
+
+```bash
+sudo journalctl -u serverbee-server -b -n 200 --no-pager
+```
+
+A successful migration writes `Database migrations complete` to the log. If that message is absent, investigate the first database or migration error rather than the later restart messages.
+
+### Step 3: Preserve the Failed State
+
+Create a complete copy even when the database may be partially migrated or damaged. It is both the input for repair and protection against later attempts overwriting evidence.
+
+Docker:
+
+```bash
+SERVERBEE_DATA_VOLUME="$(
+  docker inspect serverbee-server \
+    --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{println .Name}}{{end}}{{end}}'
+)"
+test -n "$SERVERBEE_DATA_VOLUME"
+
+mkdir -p backups
+docker run --rm \
+  --mount "type=volume,src=${SERVERBEE_DATA_VOLUME},dst=/data,readonly" \
+  --mount "type=bind,src=$(pwd)/backups,dst=/backups" \
+  alpine \
+  tar czf /backups/serverbee-failed-migration-$(date -u +%Y%m%dT%H%M%SZ).tar.gz -C /data .
+```
+
+For systemd or binary deployments, copy the entire data directory after stopping the service, not just the main database file:
+
+```bash
+sudo mkdir -p /backups
+sudo cp -a /opt/serverbee/data \
+  "/backups/serverbee-failed-migration-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+Preserve the matching configuration, external MMDB files, environment files, and secrets alongside the failed data snapshot. They may explain the failure and are required for a complete restore.
+
+### Step 4: Inspect the Database State
+
+Run checks against an extracted copy of the failed snapshot, not the only production volume:
+
+```bash
+mkdir -p recovery-data
+SERVERBEE_FAILED_BACKUP="$(ls -1t backups/serverbee-failed-migration-*.tar.gz | head -n 1)"
+test -f "$SERVERBEE_FAILED_BACKUP"
+tar xzf "$SERVERBEE_FAILED_BACKUP" -C recovery-data
+
+sqlite3 recovery-data/serverbee.db "PRAGMA integrity_check;"
+sqlite3 recovery-data/serverbee.db "PRAGMA foreign_key_check;"
+sqlite3 recovery-data/serverbee.db \
+  "SELECT * FROM seaql_migrations ORDER BY applied_at;"
+```
+
+- `PRAGMA integrity_check` should return `ok`.
+- `PRAGMA foreign_key_check` should normally return no rows.
+- `seaql_migrations` shows migrations recorded as successful; the table may not exist if a brand-new database failed before migration bookkeeping was created.
+
+Do not delete rows from `seaql_migrations` or manually mark a failed migration as successful. When migration history and the actual schema disagree, a later release can fail in a more difficult-to-recover state.
+
+### Step 5: Choose a Recovery Path
+
+**Environmental failure**
+
+If the cause was disk space, permissions, a read-only mount, or a temporary database lock, repair the root cause and restart. SeaORM will retry migrations not recorded as successful:
+
+```bash
+docker update --restart=unless-stopped serverbee-server
+docker compose up -d serverbee-server
+docker logs -f serverbee-server
+```
+
+**Incompatible existing data or schema**
+
+Identify conflicting data in a database copy. Prefer a forward repair migration that handles the legacy state. If manual data repair is unavoidable, validate the complete migration and application startup against the copy before applying the same reviewed operations to production.
+
+**Migration code defect**
+
+Do not repeatedly restart the same failing image. Preserve the failed state and deploy a new image containing a corrected migration. Switching only to the old image is not a database rollback; it is safe only when you have established that the failed migration made no schema changes. Otherwise restore the pre-upgrade backup.
+
+**Database corruption**
+
+Prefer the latest backup that passes integrity checks. SQLite `.recover` is a last-resort data salvage tool when no usable backup exists; its output may be incomplete and must be validated in isolation.
+
+### Restore a Docker Backup into a New Volume
+
+Restore into a new volume instead of overwriting the failed volume. This preserves the failed state for further investigation:
+
+```bash
+SERVERBEE_RECOVERY_VOLUME="serverbee-data-recovery-$(date -u +%Y%m%dT%H%M%SZ)"
+docker volume create "$SERVERBEE_RECOVERY_VOLUME"
+
+docker run --rm \
+  --mount "type=volume,src=${SERVERBEE_RECOVERY_VOLUME},dst=/data" \
+  --mount "type=bind,src=$(pwd)/backups/serverbee-20260314T020000Z,dst=/backups,readonly" \
+  alpine \
+  tar xzf /backups/data.tar.gz -C /data
+
+echo "$SERVERBEE_RECOVERY_VOLUME"
+
+# Inspect the matching Compose/configuration archive before restoring it.
+mkdir -p recovered-config
+tar xzf backups/serverbee-20260314T020000Z/config.tar.gz -C recovered-config
+```
+
+Review `recovered-config/config/server.toml` and `recovered-config/docker-compose.yml`, restore them to the deployment project, and reapply the matching external MMDB mounts, environment files, and secrets. The data archive restores `brand/` and downloaded MMDB files; it cannot restore files outside `/data`.
+
+Then point the existing `serverbee-data` logical Compose volume at the newly created volume:
+
+```yaml
+volumes:
+  serverbee-data:
+    external: true
+    name: serverbee-data-recovery-20260722T103000Z
+```
+
+Confirm that `name` exactly matches the preceding command's output before starting the service. Restoring an older database may run migrations again, so first decide whether to run the original application version or a newer version containing the migration fix.
+
+### Verify Recovery
+
+```bash
+docker compose up -d serverbee-server
+docker compose ps
+docker logs --tail 200 serverbee-server
+curl --fail http://127.0.0.1:9527/healthz
+```
+
+Consider recovery complete only when all of the following are true:
+
+- The logs contain `Database migrations complete`.
+- The container remains running and its health check passes.
+- `PRAGMA integrity_check` returns `ok`.
+- You can sign in and read existing servers, alerts, and historical records.
+- Previously configured logos, favicons, and GeoIP/ASN databases are available.
+- Database lock, foreign key, and missing table or column errors do not continue.
+
+### Prevention
+
+- Create and verify a complete data/configuration backup before every upgrade; the current upgrade command does not create one automatically.
+- Copy backups off the Docker host so one disk failure cannot damage both the production volume and its local backups.
+- Keep SQLite deployments at one Server instance; do not share one writable database file among multiple containers.
+- Check available disk space before upgrading, and use an explicit image version tag so the migration source is identifiable.
+- Keep the pre-upgrade image and its matching database, asset, and configuration backups. Database rollback depends on the backup, not just the old image.
+- Wait for the migration success log and health check after an upgrade; a successful `docker compose up -d` return is not sufficient evidence.
+
+<Cards>
+  <Card title="Server Setup" href="/en/docs/server" />
+  <Card title="Agent Setup" href="/en/docs/agent" />
+  <Card title="Architecture" href="/en/docs/architecture" />
+</Cards>

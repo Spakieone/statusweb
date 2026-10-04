@@ -1,0 +1,1355 @@
+use std::collections::HashMap;
+
+use chrono::{DateTime, Duration, DurationRound, SecondsFormat, Utc};
+use sea_orm::{Statement, *};
+
+use crate::entity::{gpu_record, record, record_hourly};
+use crate::error::AppError;
+use serverbee_common::types::{DiskIo, GpuReport, SystemReport};
+
+pub struct RecordService;
+
+#[derive(Default)]
+struct DiskIoAccumulator {
+    read_total: u64,
+    write_total: u64,
+    samples: u64,
+}
+
+fn serialize_disk_io(disk_io: Option<&Vec<DiskIo>>) -> Result<Option<String>, AppError> {
+    disk_io
+        .map(|entries| {
+            serde_json::to_string(entries)
+                .map_err(|e| AppError::Internal(format!("Disk I/O serialization error: {e}")))
+        })
+        .transpose()
+}
+
+fn aggregate_disk_io(records: &[&record::Model]) -> Result<Option<String>, AppError> {
+    let mut saw_non_null = false;
+    let mut grouped: HashMap<String, DiskIoAccumulator> = HashMap::new();
+
+    for record in records {
+        let Some(raw) = record.disk_io_json.as_deref() else {
+            continue;
+        };
+        saw_non_null = true;
+
+        let entries = match serde_json::from_str::<Vec<DiskIo>>(raw) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(record_id = record.id, server_id = %record.server_id, "Failed to parse disk_io_json: {error}");
+                continue;
+            }
+        };
+
+        for entry in entries {
+            let accumulator = grouped.entry(entry.name).or_default();
+            accumulator.read_total += entry.read_bytes_per_sec;
+            accumulator.write_total += entry.write_bytes_per_sec;
+            accumulator.samples += 1;
+        }
+    }
+
+    if !saw_non_null {
+        return Ok(None);
+    }
+
+    if grouped.is_empty() {
+        return Ok(Some("[]".to_string()));
+    }
+
+    let mut aggregated = grouped
+        .into_iter()
+        .map(|(name, accumulator)| DiskIo {
+            name,
+            read_bytes_per_sec: accumulator.read_total / accumulator.samples,
+            write_bytes_per_sec: accumulator.write_total / accumulator.samples,
+        })
+        .collect::<Vec<_>>();
+    aggregated.sort_by(|left, right| left.name.cmp(&right.name));
+
+    Ok(Some(serde_json::to_string(&aggregated).map_err(|e| {
+        AppError::Internal(format!("Disk I/O serialization error: {e}"))
+    })?))
+}
+
+impl RecordService {
+    /// Save a system report as a record for the given server.
+    pub async fn save_report(
+        db: &DatabaseConnection,
+        server_id: &str,
+        report: &SystemReport,
+    ) -> Result<(), AppError> {
+        let gpu_usage = report.gpu.as_ref().map(|g| g.average_usage);
+        let disk_io_json = serialize_disk_io(report.disk_io.as_ref())?;
+
+        let new_record = record::ActiveModel {
+            id: NotSet,
+            server_id: Set(server_id.to_string()),
+            time: Set(Utc::now()),
+            cpu: Set(report.cpu),
+            mem_used: Set(report.mem_used),
+            swap_used: Set(report.swap_used),
+            disk_used: Set(report.disk_used),
+            net_in_speed: Set(report.net_in_speed),
+            net_out_speed: Set(report.net_out_speed),
+            net_in_transfer: Set(report.net_in_transfer),
+            net_out_transfer: Set(report.net_out_transfer),
+            load1: Set(report.load1),
+            load5: Set(report.load5),
+            load15: Set(report.load15),
+            tcp_conn: Set(report.tcp_conn),
+            udp_conn: Set(report.udp_conn),
+            process_count: Set(report.process_count),
+            temperature: Set(report.temperature),
+            gpu_usage: Set(gpu_usage),
+            disk_io_json: Set(disk_io_json),
+        };
+
+        new_record.insert(db).await?;
+        Ok(())
+    }
+
+    /// Save GPU detail records for the given server.
+    pub async fn save_gpu_records(
+        db: &DatabaseConnection,
+        server_id: &str,
+        gpu: &GpuReport,
+    ) -> Result<(), AppError> {
+        let now = Utc::now();
+
+        for (index, info) in gpu.detailed_info.iter().enumerate() {
+            let new_gpu = gpu_record::ActiveModel {
+                id: NotSet,
+                server_id: Set(server_id.to_string()),
+                time: Set(now),
+                device_index: Set(index as i32),
+                device_name: Set(info.name.clone()),
+                mem_total: Set(info.mem_total),
+                mem_used: Set(info.mem_used),
+                utilization: Set(info.utilization),
+                temperature: Set(info.temperature),
+            };
+            new_gpu.insert(db).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Query historical records for a server.
+    /// Interval: "raw" uses records table, "hourly" uses records_hourly,
+    /// "auto" picks based on time range (<=24h = raw, >24h = hourly).
+    pub async fn query_history(
+        db: &DatabaseConnection,
+        server_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        interval: &str,
+    ) -> Result<QueryHistoryResult, AppError> {
+        let table = super::rollup::select_history_table(interval, from, to);
+
+        if table == super::rollup::HistoryTable::Hourly {
+            let records = record_hourly::Entity::find()
+                .filter(record_hourly::Column::ServerId.eq(server_id))
+                .filter(record_hourly::Column::Time.gte(from))
+                .filter(record_hourly::Column::Time.lte(to))
+                .order_by_asc(record_hourly::Column::Time)
+                .all(db)
+                .await?;
+            Ok(QueryHistoryResult::Hourly(records))
+        } else {
+            let records = record::Entity::find()
+                .filter(record::Column::ServerId.eq(server_id))
+                .filter(record::Column::Time.gte(from))
+                .filter(record::Column::Time.lte(to))
+                .order_by_asc(record::Column::Time)
+                .all(db)
+                .await?;
+            Ok(QueryHistoryResult::Raw(records))
+        }
+    }
+
+    /// Raw records for a server within the trailing `window`, newest first.
+    /// The shared read path for alert evaluation: consumers sampling "recent
+    /// metrics" go through here so a storage change cannot silently detach
+    /// them from what the recorder writes.
+    pub async fn query_recent(
+        db: &DatabaseConnection,
+        server_id: &str,
+        window: Duration,
+    ) -> Result<Vec<record::Model>, AppError> {
+        let since = Utc::now() - window;
+        Ok(record::Entity::find()
+            .filter(record::Column::ServerId.eq(server_id))
+            .filter(record::Column::Time.gte(since))
+            .order_by_desc(record::Column::Time)
+            .all(db)
+            .await?)
+    }
+
+    /// Time of the most recent raw record for a server, if any.
+    pub async fn latest_record_time(
+        db: &DatabaseConnection,
+        server_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, AppError> {
+        Ok(record::Entity::find()
+            .filter(record::Column::ServerId.eq(server_id))
+            .order_by_desc(record::Column::Time)
+            .one(db)
+            .await?
+            .map(|r| r.time))
+    }
+
+    /// Query GPU history records for a server within a time range.
+    pub async fn query_gpu_history(
+        db: &DatabaseConnection,
+        server_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<gpu_record::Model>, AppError> {
+        let records = gpu_record::Entity::find()
+            .filter(gpu_record::Column::ServerId.eq(server_id))
+            .filter(gpu_record::Column::Time.gte(from))
+            .filter(gpu_record::Column::Time.lte(to))
+            .order_by_asc(gpu_record::Column::Time)
+            .all(db)
+            .await?;
+        Ok(records)
+    }
+
+    /// Aggregate records from the previous completed hour bucket into hourly averages per server.
+    /// Time is truncated to the hour boundary (e.g. at 14:37, aggregates 13:00–14:00).
+    /// Uses SQL AVG/MAX pushed to SQLite and an ON CONFLICT upsert for idempotency.
+    /// disk_io_json is aggregated in Rust due to per-device JSON parsing requirements.
+    pub async fn aggregate_hourly(db: &DatabaseConnection) -> Result<u64, AppError> {
+        let now = Utc::now();
+        let hour = now
+            .duration_trunc(chrono::Duration::hours(1))
+            .map_err(|e| AppError::Internal(format!("Time truncation failed: {e}")))?;
+        let hour_start = hour - chrono::Duration::hours(1);
+        let hour_end = hour;
+
+        // Use RFC3339 format matching sqlx's DateTimeUtc storage format (AutoSi, no Z suffix)
+        let hour_start_str = hour_start.to_rfc3339_opts(SecondsFormat::AutoSi, false);
+        let hour_end_str = hour_end.to_rfc3339_opts(SecondsFormat::AutoSi, false);
+
+        // Scalar columns roll up in SQL; the statement is generated from the
+        // rollup-policy descriptor so column list and aggregation choices have
+        // a single owner (see service::rollup).
+        let sql = super::rollup::aggregate_hourly_sql();
+
+        let result = db
+            .execute(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                sql,
+                [
+                    hour_start_str.clone().into(),
+                    hour_start_str.clone().into(),
+                    hour_end_str.into(),
+                ],
+            ))
+            .await?;
+
+        let rows_affected = result.rows_affected();
+
+        if rows_affected == 0 {
+            return Ok(0);
+        }
+
+        // disk_io_json: Rust-side aggregation (per-device grouping)
+        let records = record::Entity::find()
+            .filter(record::Column::Time.gte(hour_start))
+            .filter(record::Column::Time.lt(hour_end))
+            .all(db)
+            .await?;
+
+        let mut grouped: HashMap<String, Vec<&record::Model>> = HashMap::new();
+        for r in &records {
+            grouped.entry(r.server_id.clone()).or_default().push(r);
+        }
+
+        for (server_id, server_records) in &grouped {
+            let disk_io_json = aggregate_disk_io(server_records)?;
+            let json_value: sea_orm::Value = match disk_io_json {
+                Some(s) => s.into(),
+                None => sea_orm::Value::String(None),
+            };
+            db.execute(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "UPDATE records_hourly SET disk_io_json = ? WHERE server_id = ? AND time = ?",
+                [
+                    json_value,
+                    server_id.clone().into(),
+                    hour_start_str.clone().into(),
+                ],
+            ))
+            .await?;
+        }
+
+        Ok(rows_affected)
+    }
+
+    /// Clean up expired records from a table with a `time` column.
+    /// Supported tables: "records", "records_hourly", "gpu_records".
+    pub async fn cleanup_expired(
+        db: &DatabaseConnection,
+        retention_days: u32,
+        table: &str,
+    ) -> Result<u64, AppError> {
+        let cutoff = Utc::now() - Duration::days(retention_days as i64);
+
+        let result = match table {
+            "records" => {
+                record::Entity::delete_many()
+                    .filter(record::Column::Time.lt(cutoff))
+                    .exec(db)
+                    .await?
+            }
+            "records_hourly" => {
+                record_hourly::Entity::delete_many()
+                    .filter(record_hourly::Column::Time.lt(cutoff))
+                    .exec(db)
+                    .await?
+            }
+            "gpu_records" => {
+                gpu_record::Entity::delete_many()
+                    .filter(gpu_record::Column::Time.lt(cutoff))
+                    .exec(db)
+                    .await?
+            }
+            _ => {
+                return Err(AppError::BadRequest(format!("Unknown table: {table}")));
+            }
+        };
+
+        Ok(result.rows_affected)
+    }
+}
+
+/// Result type for query_history to handle both raw and hourly records.
+#[derive(Debug)]
+pub enum QueryHistoryResult {
+    Raw(Vec<record::Model>),
+    Hourly(Vec<record_hourly::Model>),
+}
+
+impl QueryHistoryResult {
+    /// Rows in the raw-row shape regardless of resolution (the two tables
+    /// share one column set). For consumers that don't care which table
+    /// served the query.
+    pub fn into_rows(self) -> Vec<record::Model> {
+        match self {
+            QueryHistoryResult::Raw(rows) => rows,
+            QueryHistoryResult::Hourly(rows) => rows.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::server;
+    use crate::service::auth::AuthService;
+    use crate::test_utils::setup_test_db;
+    use sea_orm::{ActiveModelTrait, Set};
+    use serverbee_common::constants::CAP_DEFAULT;
+    use serverbee_common::types::{DiskIo, SystemReport};
+
+    async fn insert_test_server(db: &DatabaseConnection, id: &str) {
+        let token_hash = AuthService::hash_password("test").expect("hash_password should succeed");
+        let now = Utc::now();
+        server::ActiveModel {
+            id: Set(id.to_string()),
+            token_hash: Set(Some(token_hash)),
+            token_prefix: Set(Some("serverbee_test".to_string())),
+            name: Set("Test Server".to_string()),
+            weight: Set(0),
+            hidden: Set(false),
+            capabilities: Set(CAP_DEFAULT as i32),
+            protocol_version: Set(1),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert test server should succeed");
+    }
+
+    /// The retention cleanup predicate (`WHERE time < cutoff`) must resolve
+    /// through the dedicated single-column time index instead of a full table
+    /// scan, otherwise cleanup degrades linearly with table size.
+    #[tokio::test]
+    async fn cleanup_time_predicate_uses_index_not_full_scan() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let (db, _tmp) = setup_test_db().await;
+        let cutoff = Utc::now();
+        let plan = db
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "EXPLAIN QUERY PLAN DELETE FROM records WHERE time < ?",
+                [cutoff.into()],
+            ))
+            .await
+            .expect("explain query plan should run");
+
+        let detail: String = plan
+            .iter()
+            .filter_map(|row| row.try_get::<String>("", "detail").ok())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            detail.contains("idx_records_time"),
+            "cleanup must use idx_records_time, got plan: {detail}"
+        );
+        assert!(
+            !detail.contains("SCAN records") || detail.contains("USING INDEX"),
+            "cleanup must not full-scan records, got plan: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_and_query_report() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-rec-1").await;
+
+        let report = SystemReport {
+            cpu: 42.5,
+            mem_used: 1024,
+            ..Default::default()
+        };
+
+        RecordService::save_report(&db, "srv-rec-1", &report)
+            .await
+            .expect("save_report should succeed");
+
+        let now = Utc::now();
+        let from = now - Duration::hours(1);
+        let result = RecordService::query_history(&db, "srv-rec-1", from, now, "raw")
+            .await
+            .expect("query_history should succeed");
+
+        match result {
+            QueryHistoryResult::Raw(records) => {
+                assert_eq!(records.len(), 1, "Should find exactly one record");
+                assert!(
+                    (records[0].cpu - 42.5).abs() < f64::EPSILON,
+                    "CPU value should match"
+                );
+                assert_eq!(records[0].mem_used, 1024, "mem_used should match");
+                assert_eq!(records[0].server_id, "srv-rec-1", "server_id should match");
+            }
+            QueryHistoryResult::Hourly(_) => panic!("Expected Raw result for 'raw' interval"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-rec-2").await;
+
+        let report = SystemReport::default();
+        RecordService::save_report(&db, "srv-rec-2", &report)
+            .await
+            .expect("save_report should succeed");
+
+        // Verify the record exists
+        let now = Utc::now();
+        let from = now - Duration::hours(1);
+        let before = RecordService::query_history(&db, "srv-rec-2", from, now, "raw")
+            .await
+            .expect("query_history should succeed");
+        match &before {
+            QueryHistoryResult::Raw(records) => {
+                assert_eq!(records.len(), 1, "Record should exist before cleanup")
+            }
+            _ => panic!("Expected Raw result"),
+        }
+
+        // Cleanup with 0 retention days — cutoff is now, so all existing records (time < now) are deleted
+        let deleted = RecordService::cleanup_expired(&db, 0, "records")
+            .await
+            .expect("cleanup_expired should succeed");
+        assert!(deleted >= 1, "At least one record should have been deleted");
+
+        // Verify the record is gone
+        let now2 = Utc::now();
+        let from2 = now2 - Duration::hours(1);
+        let after = RecordService::query_history(&db, "srv-rec-2", from2, now2, "raw")
+            .await
+            .expect("query_history should succeed");
+        match after {
+            QueryHistoryResult::Raw(records) => {
+                assert_eq!(records.len(), 0, "Record should be deleted")
+            }
+            _ => panic!("Expected Raw result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_save_report_persists_disk_io_json() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-rec-disk-1").await;
+
+        let report = SystemReport {
+            disk_io: Some(vec![DiskIo {
+                name: "sda".to_string(),
+                read_bytes_per_sec: 1024,
+                write_bytes_per_sec: 2048,
+            }]),
+            ..Default::default()
+        };
+
+        RecordService::save_report(&db, "srv-rec-disk-1", &report)
+            .await
+            .expect("save_report should succeed");
+
+        let now = Utc::now();
+        let from = now - Duration::hours(1);
+        let result = RecordService::query_history(&db, "srv-rec-disk-1", from, now, "raw")
+            .await
+            .expect("query_history should succeed");
+
+        match result {
+            QueryHistoryResult::Raw(records) => {
+                let disk_io: Vec<DiskIo> =
+                    serde_json::from_str(records[0].disk_io_json.as_deref().unwrap()).unwrap();
+                assert_eq!(disk_io[0].name, "sda");
+                assert_eq!(disk_io[0].read_bytes_per_sec, 1024);
+                assert_eq!(disk_io[0].write_bytes_per_sec, 2048);
+            }
+            QueryHistoryResult::Hourly(_) => panic!("Expected Raw result for 'raw' interval"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_hourly_averages_disk_io_by_device() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-rec-disk-2").await;
+
+        // Compute the previous completed hour bucket so records fall within [hour_start, hour_end)
+        let now = Utc::now();
+        let hour = now
+            .duration_trunc(chrono::Duration::hours(1))
+            .expect("duration_trunc should succeed");
+        let hour_start = hour - chrono::Duration::hours(1);
+        // Place records 30 minutes into the previous hour
+        let record_time = hour_start + chrono::Duration::minutes(30);
+
+        let first_disk_io = serde_json::to_string(&vec![
+            DiskIo {
+                name: "sdb".to_string(),
+                read_bytes_per_sec: 100,
+                write_bytes_per_sec: 300,
+            },
+            DiskIo {
+                name: "sda".to_string(),
+                read_bytes_per_sec: 400,
+                write_bytes_per_sec: 800,
+            },
+        ])
+        .unwrap();
+        let second_disk_io = serde_json::to_string(&vec![
+            DiskIo {
+                name: "sda".to_string(),
+                read_bytes_per_sec: 600,
+                write_bytes_per_sec: 1000,
+            },
+            DiskIo {
+                name: "sdb".to_string(),
+                read_bytes_per_sec: 300,
+                write_bytes_per_sec: 500,
+            },
+        ])
+        .unwrap();
+
+        record::ActiveModel {
+            id: NotSet,
+            server_id: Set("srv-rec-disk-2".to_string()),
+            time: Set(record_time),
+            cpu: Set(0.0),
+            mem_used: Set(0),
+            swap_used: Set(0),
+            disk_used: Set(0),
+            net_in_speed: Set(0),
+            net_out_speed: Set(0),
+            net_in_transfer: Set(0),
+            net_out_transfer: Set(0),
+            load1: Set(0.0),
+            load5: Set(0.0),
+            load15: Set(0.0),
+            tcp_conn: Set(0),
+            udp_conn: Set(0),
+            process_count: Set(0),
+            temperature: Set(None),
+            gpu_usage: Set(None),
+            disk_io_json: Set(Some(first_disk_io)),
+        }
+        .insert(&db)
+        .await
+        .expect("first record insert should succeed");
+
+        record::ActiveModel {
+            id: NotSet,
+            server_id: Set("srv-rec-disk-2".to_string()),
+            time: Set(record_time),
+            cpu: Set(0.0),
+            mem_used: Set(0),
+            swap_used: Set(0),
+            disk_used: Set(0),
+            net_in_speed: Set(0),
+            net_out_speed: Set(0),
+            net_in_transfer: Set(0),
+            net_out_transfer: Set(0),
+            load1: Set(0.0),
+            load5: Set(0.0),
+            load15: Set(0.0),
+            tcp_conn: Set(0),
+            udp_conn: Set(0),
+            process_count: Set(0),
+            temperature: Set(None),
+            gpu_usage: Set(None),
+            disk_io_json: Set(Some(second_disk_io)),
+        }
+        .insert(&db)
+        .await
+        .expect("second record insert should succeed");
+
+        let aggregated = RecordService::aggregate_hourly(&db)
+            .await
+            .expect("aggregate_hourly should succeed");
+        assert_eq!(aggregated, 1);
+
+        let from = now - Duration::hours(2);
+        let result = RecordService::query_history(&db, "srv-rec-disk-2", from, now, "hourly")
+            .await
+            .expect("query_history should succeed");
+
+        match result {
+            QueryHistoryResult::Hourly(records) => {
+                assert_eq!(records.len(), 1);
+                let disk_io: Vec<DiskIo> =
+                    serde_json::from_str(records[0].disk_io_json.as_deref().unwrap()).unwrap();
+                assert_eq!(
+                    disk_io,
+                    vec![
+                        DiskIo {
+                            name: "sda".to_string(),
+                            read_bytes_per_sec: 500,
+                            write_bytes_per_sec: 900,
+                        },
+                        DiskIo {
+                            name: "sdb".to_string(),
+                            read_bytes_per_sec: 200,
+                            write_bytes_per_sec: 400,
+                        },
+                    ]
+                );
+            }
+            QueryHistoryResult::Raw(_) => panic!("Expected Hourly result for 'hourly' interval"),
+        }
+    }
+
+    // gpu_record / record_hourly are already in scope via `use super::*`.
+    use serverbee_common::types::{GpuInfo, GpuReport};
+
+    /// Insert a raw record at an explicit time with explicit disk_io_json.
+    /// Numeric metric columns are zeroed so tests can focus on the field under test.
+    async fn insert_record_at(
+        db: &DatabaseConnection,
+        server_id: &str,
+        time: DateTime<Utc>,
+        disk_io_json: Option<String>,
+    ) {
+        record::ActiveModel {
+            id: NotSet,
+            server_id: Set(server_id.to_string()),
+            time: Set(time),
+            cpu: Set(0.0),
+            mem_used: Set(0),
+            swap_used: Set(0),
+            disk_used: Set(0),
+            net_in_speed: Set(0),
+            net_out_speed: Set(0),
+            net_in_transfer: Set(0),
+            net_out_transfer: Set(0),
+            load1: Set(0.0),
+            load5: Set(0.0),
+            load15: Set(0.0),
+            tcp_conn: Set(0),
+            udp_conn: Set(0),
+            process_count: Set(0),
+            temperature: Set(None),
+            gpu_usage: Set(None),
+            disk_io_json: Set(disk_io_json),
+        }
+        .insert(db)
+        .await
+        .expect("insert_record_at should succeed");
+    }
+
+    // --- serialize_disk_io ---
+
+    #[test]
+    fn test_serialize_disk_io_none_returns_none() {
+        // None input must short-circuit to Ok(None) without serializing.
+        let result = serialize_disk_io(None).expect("serialize should succeed");
+        assert_eq!(result, None, "None disk_io should serialize to None");
+    }
+
+    #[test]
+    fn test_serialize_disk_io_some_returns_json() {
+        let entries = vec![DiskIo {
+            name: "sda".to_string(),
+            read_bytes_per_sec: 10,
+            write_bytes_per_sec: 20,
+        }];
+        let result = serialize_disk_io(Some(&entries)).expect("serialize should succeed");
+        let json = result.expect("Some input should produce Some output");
+        let parsed: Vec<DiskIo> = serde_json::from_str(&json).expect("round-trip parse");
+        assert_eq!(parsed, entries, "serialized JSON should round-trip");
+    }
+
+    // --- aggregate_disk_io (pure helper) branch coverage ---
+
+    #[test]
+    fn test_aggregate_disk_io_all_null_returns_none() {
+        // No record carries disk_io_json => saw_non_null stays false => Ok(None).
+        let r1 = record::Model {
+            id: 1,
+            server_id: "s".to_string(),
+            time: Utc::now(),
+            cpu: 0.0,
+            mem_used: 0,
+            swap_used: 0,
+            disk_used: 0,
+            net_in_speed: 0,
+            net_out_speed: 0,
+            net_in_transfer: 0,
+            net_out_transfer: 0,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            tcp_conn: 0,
+            udp_conn: 0,
+            process_count: 0,
+            temperature: None,
+            gpu_usage: None,
+            disk_io_json: None,
+        };
+        let r2 = record::Model {
+            id: 2,
+            disk_io_json: None,
+            ..r1.clone()
+        };
+        let result = aggregate_disk_io(&[&r1, &r2]).expect("aggregate should succeed");
+        assert_eq!(result, None, "all-null disk_io_json should yield None");
+    }
+
+    #[test]
+    fn test_aggregate_disk_io_non_null_but_empty_returns_empty_array() {
+        // A non-null but empty JSON array sets saw_non_null=true but leaves grouped empty
+        // => Ok(Some("[]")).
+        let base = record::Model {
+            id: 1,
+            server_id: "s".to_string(),
+            time: Utc::now(),
+            cpu: 0.0,
+            mem_used: 0,
+            swap_used: 0,
+            disk_used: 0,
+            net_in_speed: 0,
+            net_out_speed: 0,
+            net_in_transfer: 0,
+            net_out_transfer: 0,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            tcp_conn: 0,
+            udp_conn: 0,
+            process_count: 0,
+            temperature: None,
+            gpu_usage: None,
+            disk_io_json: Some("[]".to_string()),
+        };
+        let result = aggregate_disk_io(&[&base]).expect("aggregate should succeed");
+        assert_eq!(
+            result,
+            Some("[]".to_string()),
+            "non-null empty array should yield '[]'"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_disk_io_invalid_json_is_skipped() {
+        // Invalid JSON triggers the parse-error warn+continue branch. Since it is the only
+        // record and it is non-null, saw_non_null=true but grouped stays empty => Ok(Some("[]")).
+        let bad = record::Model {
+            id: 7,
+            server_id: "s".to_string(),
+            time: Utc::now(),
+            cpu: 0.0,
+            mem_used: 0,
+            swap_used: 0,
+            disk_used: 0,
+            net_in_speed: 0,
+            net_out_speed: 0,
+            net_in_transfer: 0,
+            net_out_transfer: 0,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            tcp_conn: 0,
+            udp_conn: 0,
+            process_count: 0,
+            temperature: None,
+            gpu_usage: None,
+            disk_io_json: Some("not valid json".to_string()),
+        };
+        let result = aggregate_disk_io(&[&bad]).expect("aggregate should not error on bad json");
+        assert_eq!(
+            result,
+            Some("[]".to_string()),
+            "invalid JSON should be skipped, leaving empty aggregate"
+        );
+    }
+
+    // --- query_history "auto" interval selection against the DB ---
+
+    #[tokio::test]
+    async fn test_query_history_auto_short_range_uses_raw() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-auto-raw").await;
+
+        let report = SystemReport {
+            cpu: 11.0,
+            ..Default::default()
+        };
+        RecordService::save_report(&db, "srv-auto-raw", &report)
+            .await
+            .expect("save_report should succeed");
+
+        // Range of 12h (<=24h) under "auto" must hit the raw records table.
+        let now = Utc::now();
+        let from = now - Duration::hours(12);
+        let result = RecordService::query_history(&db, "srv-auto-raw", from, now, "auto")
+            .await
+            .expect("query_history should succeed");
+        match result {
+            QueryHistoryResult::Raw(records) => {
+                assert_eq!(records.len(), 1, "auto short range should read raw table");
+            }
+            QueryHistoryResult::Hourly(_) => panic!("auto short range should be Raw"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_query_history_auto_long_range_uses_hourly() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-auto-hourly").await;
+
+        // Seed an hourly row directly so the >24h auto branch finds it.
+        let bucket = Utc::now() - Duration::hours(30);
+        record_hourly::ActiveModel {
+            id: NotSet,
+            server_id: Set("srv-auto-hourly".to_string()),
+            time: Set(bucket),
+            cpu: Set(33.0),
+            mem_used: Set(0),
+            swap_used: Set(0),
+            disk_used: Set(0),
+            net_in_speed: Set(0),
+            net_out_speed: Set(0),
+            net_in_transfer: Set(0),
+            net_out_transfer: Set(0),
+            load1: Set(0.0),
+            load5: Set(0.0),
+            load15: Set(0.0),
+            tcp_conn: Set(0),
+            udp_conn: Set(0),
+            process_count: Set(0),
+            temperature: Set(None),
+            gpu_usage: Set(None),
+            disk_io_json: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("hourly insert should succeed");
+
+        // Range of 48h (>24h) under "auto" must hit the hourly table.
+        let now = Utc::now();
+        let from = now - Duration::hours(48);
+        let result = RecordService::query_history(&db, "srv-auto-hourly", from, now, "auto")
+            .await
+            .expect("query_history should succeed");
+        match result {
+            QueryHistoryResult::Hourly(records) => {
+                assert_eq!(records.len(), 1, "auto long range should read hourly table");
+                assert!((records[0].cpu - 33.0).abs() < f64::EPSILON);
+            }
+            QueryHistoryResult::Raw(_) => panic!("auto long range should be Hourly"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_query_history_excludes_out_of_window_records() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-window").await;
+
+        let now = Utc::now();
+        // One record inside the window, one well before it.
+        insert_record_at(&db, "srv-window", now - Duration::minutes(30), None).await;
+        insert_record_at(&db, "srv-window", now - Duration::hours(5), None).await;
+
+        let from = now - Duration::hours(1);
+        let result = RecordService::query_history(&db, "srv-window", from, now, "raw")
+            .await
+            .expect("query_history should succeed");
+        match result {
+            QueryHistoryResult::Raw(records) => {
+                assert_eq!(
+                    records.len(),
+                    1,
+                    "only the in-window record should be returned"
+                );
+            }
+            QueryHistoryResult::Hourly(_) => panic!("Expected Raw result"),
+        }
+    }
+
+    // --- save_gpu_records / query_gpu_history ---
+
+    #[tokio::test]
+    async fn test_save_and_query_gpu_records() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-gpu-1").await;
+
+        let gpu = GpuReport {
+            count: 2,
+            average_usage: 50.0,
+            detailed_info: vec![
+                GpuInfo {
+                    name: "GPU0".to_string(),
+                    mem_total: 8000,
+                    mem_used: 4000,
+                    utilization: 40.0,
+                    temperature: 55.0,
+                },
+                GpuInfo {
+                    name: "GPU1".to_string(),
+                    mem_total: 16000,
+                    mem_used: 2000,
+                    utilization: 60.0,
+                    temperature: 65.0,
+                },
+            ],
+        };
+
+        RecordService::save_gpu_records(&db, "srv-gpu-1", &gpu)
+            .await
+            .expect("save_gpu_records should succeed");
+
+        let now = Utc::now();
+        let from = now - Duration::hours(1);
+        let records = RecordService::query_gpu_history(&db, "srv-gpu-1", from, now)
+            .await
+            .expect("query_gpu_history should succeed");
+
+        assert_eq!(records.len(), 2, "both GPU devices should be persisted");
+        // device_index is assigned from enumerate order.
+        let dev0 = records
+            .iter()
+            .find(|r| r.device_index == 0)
+            .expect("device 0 should exist");
+        assert_eq!(dev0.device_name, "GPU0");
+        assert_eq!(dev0.mem_total, 8000);
+        let dev1 = records
+            .iter()
+            .find(|r| r.device_index == 1)
+            .expect("device 1 should exist");
+        assert_eq!(dev1.device_name, "GPU1");
+        assert!((dev1.utilization - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_save_gpu_records_empty_detailed_info_inserts_nothing() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-gpu-empty").await;
+
+        // Empty detailed_info => the loop body never runs, nothing is inserted.
+        let gpu = GpuReport {
+            count: 0,
+            average_usage: 0.0,
+            detailed_info: vec![],
+        };
+        RecordService::save_gpu_records(&db, "srv-gpu-empty", &gpu)
+            .await
+            .expect("save_gpu_records should succeed with empty info");
+
+        let now = Utc::now();
+        let from = now - Duration::hours(1);
+        let records = RecordService::query_gpu_history(&db, "srv-gpu-empty", from, now)
+            .await
+            .expect("query_gpu_history should succeed");
+        assert!(records.is_empty(), "no GPU records should be inserted");
+    }
+
+    #[tokio::test]
+    async fn test_query_gpu_history_filters_by_window() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-gpu-win").await;
+
+        // Insert one in-window and one out-of-window gpu record directly.
+        let now = Utc::now();
+        gpu_record::ActiveModel {
+            id: NotSet,
+            server_id: Set("srv-gpu-win".to_string()),
+            time: Set(now - Duration::minutes(10)),
+            device_index: Set(0),
+            device_name: Set("inwin".to_string()),
+            mem_total: Set(1),
+            mem_used: Set(1),
+            utilization: Set(1.0),
+            temperature: Set(1.0),
+        }
+        .insert(&db)
+        .await
+        .expect("in-window gpu insert");
+        gpu_record::ActiveModel {
+            id: NotSet,
+            server_id: Set("srv-gpu-win".to_string()),
+            time: Set(now - Duration::hours(10)),
+            device_index: Set(0),
+            device_name: Set("outwin".to_string()),
+            mem_total: Set(1),
+            mem_used: Set(1),
+            utilization: Set(1.0),
+            temperature: Set(1.0),
+        }
+        .insert(&db)
+        .await
+        .expect("out-of-window gpu insert");
+
+        let from = now - Duration::hours(1);
+        let records = RecordService::query_gpu_history(&db, "srv-gpu-win", from, now)
+            .await
+            .expect("query_gpu_history should succeed");
+        assert_eq!(records.len(), 1, "only in-window gpu record returned");
+        assert_eq!(records[0].device_name, "inwin");
+    }
+
+    // --- aggregate_hourly edge branches ---
+
+    #[tokio::test]
+    async fn test_aggregate_hourly_no_records_returns_zero() {
+        let (db, _tmp) = setup_test_db().await;
+        // No records exist in the previous-hour window => rows_affected == 0 => Ok(0).
+        let rows = RecordService::aggregate_hourly(&db)
+            .await
+            .expect("aggregate_hourly should succeed");
+        assert_eq!(rows, 0, "empty window should aggregate zero rows");
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_hourly_null_disk_io_writes_null() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-agg-null").await;
+
+        // Place a record in the previous-hour bucket with NO disk_io_json. This drives the
+        // None => Value::String(None) UPDATE branch in aggregate_hourly.
+        let now = Utc::now();
+        let hour = now
+            .duration_trunc(chrono::Duration::hours(1))
+            .expect("duration_trunc should succeed");
+        let hour_start = hour - chrono::Duration::hours(1);
+        let record_time = hour_start + chrono::Duration::minutes(20);
+        insert_record_at(&db, "srv-agg-null", record_time, None).await;
+
+        let rows = RecordService::aggregate_hourly(&db)
+            .await
+            .expect("aggregate_hourly should succeed");
+        assert_eq!(rows, 1, "one server bucket should be aggregated");
+
+        let from = now - Duration::hours(2);
+        let result = RecordService::query_history(&db, "srv-agg-null", from, now, "hourly")
+            .await
+            .expect("query_history should succeed");
+        match result {
+            QueryHistoryResult::Hourly(records) => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(
+                    records[0].disk_io_json, None,
+                    "all-null source disk_io should aggregate to NULL"
+                );
+            }
+            QueryHistoryResult::Raw(_) => panic!("Expected Hourly result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_hourly_idempotent_upsert() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-agg-upsert").await;
+
+        let now = Utc::now();
+        let hour = now
+            .duration_trunc(chrono::Duration::hours(1))
+            .expect("duration_trunc should succeed");
+        let hour_start = hour - chrono::Duration::hours(1);
+        let record_time = hour_start + chrono::Duration::minutes(15);
+
+        // Seed a single record in the previous-hour bucket so aggregation has input.
+        record::ActiveModel {
+            id: NotSet,
+            server_id: Set("srv-agg-upsert".to_string()),
+            time: Set(record_time),
+            cpu: Set(80.0),
+            mem_used: Set(0),
+            swap_used: Set(0),
+            disk_used: Set(0),
+            net_in_speed: Set(0),
+            net_out_speed: Set(0),
+            net_in_transfer: Set(0),
+            net_out_transfer: Set(0),
+            load1: Set(0.0),
+            load5: Set(0.0),
+            load15: Set(0.0),
+            tcp_conn: Set(0),
+            udp_conn: Set(0),
+            process_count: Set(0),
+            temperature: Set(None),
+            gpu_usage: Set(None),
+            disk_io_json: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("second record insert should succeed");
+
+        // First aggregation creates the hourly bucket.
+        let first = RecordService::aggregate_hourly(&db)
+            .await
+            .expect("first aggregate should succeed");
+        assert_eq!(first, 1, "first run should affect one row");
+
+        // Second aggregation over the same window must upsert (not duplicate) the bucket.
+        let second = RecordService::aggregate_hourly(&db)
+            .await
+            .expect("second aggregate should succeed");
+        assert_eq!(second, 1, "upsert should affect one row");
+
+        // Only a single hourly row should exist for this server.
+        let from = now - Duration::hours(2);
+        let result = RecordService::query_history(&db, "srv-agg-upsert", from, now, "hourly")
+            .await
+            .expect("query_history should succeed");
+        match result {
+            QueryHistoryResult::Hourly(records) => {
+                assert_eq!(records.len(), 1, "upsert must not create duplicate rows");
+            }
+            QueryHistoryResult::Raw(_) => panic!("Expected Hourly result"),
+        }
+    }
+
+    // --- cleanup_expired branch coverage ---
+
+    #[tokio::test]
+    async fn test_cleanup_expired_unknown_table_returns_bad_request() {
+        let (db, _tmp) = setup_test_db().await;
+        let err = RecordService::cleanup_expired(&db, 7, "not_a_table")
+            .await
+            .expect_err("unknown table should error");
+        match err {
+            AppError::BadRequest(msg) => {
+                assert!(
+                    msg.contains("not_a_table"),
+                    "error should name the unknown table"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_hourly_table() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-clean-hourly").await;
+
+        // Old hourly row (10 days ago) should be deleted with 0-day retention.
+        record_hourly::ActiveModel {
+            id: NotSet,
+            server_id: Set("srv-clean-hourly".to_string()),
+            time: Set(Utc::now() - Duration::days(10)),
+            cpu: Set(1.0),
+            mem_used: Set(0),
+            swap_used: Set(0),
+            disk_used: Set(0),
+            net_in_speed: Set(0),
+            net_out_speed: Set(0),
+            net_in_transfer: Set(0),
+            net_out_transfer: Set(0),
+            load1: Set(0.0),
+            load5: Set(0.0),
+            load15: Set(0.0),
+            tcp_conn: Set(0),
+            udp_conn: Set(0),
+            process_count: Set(0),
+            temperature: Set(None),
+            gpu_usage: Set(None),
+            disk_io_json: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("hourly insert should succeed");
+
+        let deleted = RecordService::cleanup_expired(&db, 0, "records_hourly")
+            .await
+            .expect("cleanup_expired should succeed");
+        assert_eq!(deleted, 1, "the old hourly row should be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_gpu_table() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-clean-gpu").await;
+
+        // Old gpu row (10 days ago) should be deleted with 0-day retention.
+        gpu_record::ActiveModel {
+            id: NotSet,
+            server_id: Set("srv-clean-gpu".to_string()),
+            time: Set(Utc::now() - Duration::days(10)),
+            device_index: Set(0),
+            device_name: Set("g".to_string()),
+            mem_total: Set(1),
+            mem_used: Set(1),
+            utilization: Set(1.0),
+            temperature: Set(1.0),
+        }
+        .insert(&db)
+        .await
+        .expect("gpu insert should succeed");
+
+        let deleted = RecordService::cleanup_expired(&db, 0, "gpu_records")
+            .await
+            .expect("cleanup_expired should succeed");
+        assert_eq!(deleted, 1, "the old gpu row should be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_retains_recent_records() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-clean-keep").await;
+
+        // A fresh record (now) with 30-day retention must be retained.
+        let report = SystemReport::default();
+        RecordService::save_report(&db, "srv-clean-keep", &report)
+            .await
+            .expect("save_report should succeed");
+
+        let deleted = RecordService::cleanup_expired(&db, 30, "records")
+            .await
+            .expect("cleanup_expired should succeed");
+        assert_eq!(deleted, 0, "recent record should not be deleted");
+
+        let now = Utc::now();
+        let from = now - Duration::hours(1);
+        let result = RecordService::query_history(&db, "srv-clean-keep", from, now, "raw")
+            .await
+            .expect("query_history should succeed");
+        match result {
+            QueryHistoryResult::Raw(records) => assert_eq!(records.len(), 1, "record retained"),
+            QueryHistoryResult::Hourly(_) => panic!("Expected Raw result"),
+        }
+    }
+
+    // NOTE: All RecordService methods (save_report, query_history, aggregate_hourly,
+    // cleanup_expired) require a DatabaseConnection. There are no pure helper
+    // functions to unit-test in isolation.
+    //
+    // The tests below verify the QueryHistoryResult enum and the interval
+    // selection logic that can be exercised without a database.
+
+    #[test]
+    fn test_query_history_result_variants() {
+        // Verify the Raw variant can be constructed
+        let raw: QueryHistoryResult = QueryHistoryResult::Raw(vec![]);
+        assert!(matches!(raw, QueryHistoryResult::Raw(v) if v.is_empty()));
+
+        // Verify the Hourly variant can be constructed
+        let hourly: QueryHistoryResult = QueryHistoryResult::Hourly(vec![]);
+        assert!(matches!(hourly, QueryHistoryResult::Hourly(v) if v.is_empty()));
+    }
+
+    /// Verify the retention cutoff calculation used in cleanup_expired.
+    #[test]
+    fn test_retention_cutoff_calculation() {
+        let retention_days: u32 = 30;
+        let now = Utc::now();
+        let cutoff = now - Duration::days(retention_days as i64);
+
+        // Cutoff should be approximately 30 days ago
+        let diff = now - cutoff;
+        assert_eq!(diff.num_days(), 30);
+
+        // A record from 31 days ago should be before the cutoff (eligible for cleanup)
+        let old_time = now - Duration::days(31);
+        assert!(
+            old_time < cutoff,
+            "31-day-old record should be before cutoff"
+        );
+
+        // A record from 29 days ago should be after the cutoff (retained)
+        let recent_time = now - Duration::days(29);
+        assert!(
+            recent_time > cutoff,
+            "29-day-old record should be after cutoff"
+        );
+    }
+
+    /// Verify the hourly aggregation averaging logic (extracted computation).
+    #[test]
+    fn test_hourly_aggregation_averages() {
+        // Simulate the averaging computation used in aggregate_hourly
+        let cpu_values = [80.0_f64, 90.0, 70.0, 85.0, 95.0];
+        let count = cpu_values.len() as f64;
+        let avg_cpu = cpu_values.iter().sum::<f64>() / count;
+        assert!(
+            (avg_cpu - 84.0).abs() < f64::EPSILON,
+            "average of [80, 90, 70, 85, 95] should be 84.0"
+        );
+
+        // Integer averaging (mem_used style)
+        let mem_values: Vec<i64> = vec![1000, 2000, 3000];
+        let mem_count = mem_values.len() as f64;
+        let avg_mem = (mem_values.iter().sum::<i64>() as f64 / mem_count) as i64;
+        assert_eq!(
+            avg_mem, 2000,
+            "average of [1000, 2000, 3000] should be 2000"
+        );
+
+        // Optional field averaging (temperature style)
+        let temp_values: Vec<Option<f64>> = vec![Some(50.0), None, Some(60.0), None];
+        let temps: Vec<f64> = temp_values.into_iter().flatten().collect();
+        let avg_temp = if temps.is_empty() {
+            None
+        } else {
+            Some(temps.iter().sum::<f64>() / temps.len() as f64)
+        };
+        assert_eq!(
+            avg_temp,
+            Some(55.0),
+            "average of [50, 60] (skipping None) should be 55"
+        );
+
+        // All None case
+        let no_temps: Vec<Option<f64>> = vec![None, None, None];
+        let filtered: Vec<f64> = no_temps.into_iter().flatten().collect();
+        let avg_no_temp = if filtered.is_empty() {
+            None
+        } else {
+            Some(filtered.iter().sum::<f64>() / filtered.len() as f64)
+        };
+        assert_eq!(avg_no_temp, None, "all-None should produce None average");
+    }
+}

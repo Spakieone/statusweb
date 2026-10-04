@@ -1,0 +1,198 @@
+//! File control-response relay and download/upload transfer streaming.
+//!
+//! Control responses (list/stat/read/op) relay to pending HTTP requests via
+//! the AgentManager. Download chunks stream into a server-side temp file;
+//! upload acks wake the HTTP upload handler through per-transfer pending keys.
+
+use std::sync::Arc;
+
+use crate::service::agent_manager::AgentManager;
+use crate::state::AppState;
+use serverbee_common::protocol::AgentMessage;
+
+/// Relay a file control response (list/stat/read/op result) to the pending
+/// HTTP request that initiated it.
+pub(super) fn relay_control_response(
+    state: &Arc<AppState>,
+    server_id: &str,
+    msg_id: &str,
+    msg: &AgentMessage,
+) {
+    if !state
+        .agent_manager
+        .dispatch_pending_response(server_id, msg_id, msg.clone())
+    {
+        tracing::debug!("Orphaned file control response for msg_id={msg_id}");
+    }
+}
+
+/// Transfer ids are agent-supplied, so only the agent a transfer was started
+/// on may drive it. Unknown transfers are ignored silently (late frames after
+/// cleanup); transfers owned by another server are dropped with a warning.
+fn sender_owns_transfer(state: &Arc<AppState>, server_id: &str, transfer_id: &str) -> bool {
+    match state.file_transfers.server_id_of(transfer_id) {
+        Some(owner) if owner == server_id => true,
+        Some(owner) => {
+            tracing::warn!(
+                "Dropping file transfer frame for {transfer_id}: server_id mismatch (transfer={owner}, sender={server_id})"
+            );
+            false
+        }
+        None => false,
+    }
+}
+
+pub(super) async fn on_download_ready(
+    state: &Arc<AppState>,
+    server_id: &str,
+    transfer_id: &str,
+    size: u64,
+) {
+    if !sender_owns_transfer(state, server_id, transfer_id) {
+        return;
+    }
+    state.file_transfers.update_size(transfer_id, size);
+    state.file_transfers.mark_in_progress(transfer_id);
+    // Create the temp file and keep it open for the duration of the transfer
+    if let Some(path) = state.file_transfers.temp_file_path(transfer_id) {
+        match tokio::fs::File::create(&path).await {
+            Ok(file) => {
+                state.file_transfers.store_file_handle(transfer_id, file);
+            }
+            Err(e) => {
+                tracing::error!("Failed to create temp file for transfer {transfer_id}: {e}");
+                state
+                    .file_transfers
+                    .mark_failed(transfer_id, format!("Failed to create temp file: {e}"));
+            }
+        }
+    }
+}
+
+pub(super) async fn on_download_chunk(
+    state: &Arc<AppState>,
+    server_id: &str,
+    transfer_id: &str,
+    offset: u64,
+    data: &str,
+) {
+    use base64::Engine;
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+    if !sender_owns_transfer(state, server_id, transfer_id) {
+        return;
+    }
+    if let Some(file_handle) = state.file_transfers.get_file_handle(transfer_id) {
+        match base64::engine::general_purpose::STANDARD.decode(data) {
+            Ok(bytes) => {
+                let result = async {
+                    let mut file = file_handle.lock().await;
+                    file.seek(std::io::SeekFrom::Start(offset)).await?;
+                    file.write_all(&bytes).await?;
+                    Ok::<(), std::io::Error>(())
+                }
+                .await;
+                match result {
+                    Ok(()) => {
+                        state
+                            .file_transfers
+                            .update_progress(transfer_id, offset + bytes.len() as u64);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to write chunk for transfer {transfer_id}: {e}");
+                        state
+                            .file_transfers
+                            .mark_failed(transfer_id, format!("Write error: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to decode base64 chunk for transfer {transfer_id}: {e}");
+                state
+                    .file_transfers
+                    .mark_failed(transfer_id, format!("Base64 decode error: {e}"));
+            }
+        }
+    }
+}
+
+pub(super) fn on_download_end(state: &Arc<AppState>, server_id: &str, transfer_id: &str) {
+    if !sender_owns_transfer(state, server_id, transfer_id) {
+        return;
+    }
+    state.file_transfers.remove_file_handle(transfer_id);
+    state.file_transfers.mark_ready(transfer_id);
+}
+
+pub(super) fn on_download_error(
+    state: &Arc<AppState>,
+    server_id: &str,
+    transfer_id: &str,
+    error: &str,
+) {
+    if !sender_owns_transfer(state, server_id, transfer_id) {
+        return;
+    }
+    state.file_transfers.remove_file_handle(transfer_id);
+    state
+        .file_transfers
+        .mark_failed(transfer_id, error.to_string());
+}
+
+pub(super) fn on_upload_ack(
+    state: &Arc<AppState>,
+    server_id: &str,
+    transfer_id: &str,
+    offset: u64,
+    msg: &AgentMessage,
+) {
+    if !sender_owns_transfer(state, server_id, transfer_id) {
+        return;
+    }
+    state.file_transfers.update_progress(transfer_id, offset);
+    let ack_key = AgentManager::upload_ack_key(transfer_id);
+    state
+        .agent_manager
+        .dispatch_pending_response(server_id, &ack_key, msg.clone());
+}
+
+pub(super) fn on_upload_complete(
+    state: &Arc<AppState>,
+    server_id: &str,
+    transfer_id: &str,
+    msg: &AgentMessage,
+) {
+    if !sender_owns_transfer(state, server_id, transfer_id) {
+        return;
+    }
+    state.file_transfers.mark_ready(transfer_id);
+    let complete_key = AgentManager::upload_complete_key(transfer_id);
+    state
+        .agent_manager
+        .dispatch_pending_response(server_id, &complete_key, msg.clone());
+}
+
+pub(super) fn on_upload_error(
+    state: &Arc<AppState>,
+    server_id: &str,
+    transfer_id: &str,
+    error: &str,
+    msg: &AgentMessage,
+) {
+    if !sender_owns_transfer(state, server_id, transfer_id) {
+        return;
+    }
+    state
+        .file_transfers
+        .mark_failed(transfer_id, error.to_string());
+    // The HTTP handler may be waiting on either an ack or complete key — try both.
+    let ack_key = AgentManager::upload_ack_key(transfer_id);
+    let complete_key = AgentManager::upload_complete_key(transfer_id);
+    if !state
+        .agent_manager
+        .dispatch_pending_response(server_id, &complete_key, msg.clone())
+    {
+        state
+            .agent_manager
+            .dispatch_pending_response(server_id, &ack_key, msg.clone());
+    }
+}

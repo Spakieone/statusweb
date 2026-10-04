@@ -1,0 +1,15 @@
+{
+  "title": "登录 ServerBee",
+  "subtitle": "输入凭据以继续",
+  "username": "用户名",
+  "username_placeholder": "admin",
+  "password": "密码",
+  "two_factor_code": "双因素验证码",
+  "two_factor_hint": "输入验证器应用中的验证码",
+  "signing_in": "登录中…",
+  "sign_in": "登录",
+  "login_failed": "登录失败，请重试。",
+  "unauthorized": "用户名或密码有误，请检查后重试。",
+  "rate_limited": "登录尝试过于频繁，请 15 分钟后再试。",
+  "or_continue_with": "或通过以下方式登录"
+}

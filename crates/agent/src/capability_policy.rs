@@ -1,0 +1,426 @@
+use anyhow::bail;
+use serverbee_common::constants::{
+    CAP_DEFAULT, CAP_FILE, CAP_FIREWALL_BLOCK, CAP_VALID_MASK, CapabilityKey, has_capability,
+};
+
+use crate::config::{CapabilitiesConfig, FileConfig};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityCliOverrides {
+    pub allow_caps: Vec<CapabilityKey>,
+    pub deny_caps: Vec<CapabilityKey>,
+}
+
+/// Parse a `[capabilities]` config block (string keys) into typed
+/// allow/deny capability lists. Unknown keys are a hard error so a typo in
+/// the agent config fails fast at startup rather than silently dropping a
+/// capability the operator intended to enable.
+fn parse_config_capabilities(
+    config: &CapabilitiesConfig,
+) -> anyhow::Result<CapabilityCliOverrides> {
+    let parse_list = |keys: &[String]| -> anyhow::Result<Vec<CapabilityKey>> {
+        keys.iter()
+            .map(|key| key.parse::<CapabilityKey>().map_err(anyhow::Error::msg))
+            .collect()
+    };
+    Ok(CapabilityCliOverrides {
+        allow_caps: parse_list(&config.allow)?,
+        deny_caps: parse_list(&config.deny)?,
+    })
+}
+
+fn apply_overrides(mut capabilities: u32, overrides: &CapabilityCliOverrides) -> u32 {
+    for capability in &overrides.allow_caps {
+        capabilities |= capability.to_bit();
+    }
+    for capability in &overrides.deny_caps {
+        capabilities &= !capability.to_bit();
+    }
+    capabilities
+}
+
+/// Compute the agent's local capability bitmask. The config file is the
+/// source of truth (`[capabilities]` allow/deny over `CAP_DEFAULT`); CLI
+/// `--allow-cap` / `--deny-cap` flags layer on top for ad-hoc overrides.
+/// Within each layer `deny` wins; the CLI layer wins over the config layer.
+pub fn compute_local_capabilities(
+    config: &CapabilitiesConfig,
+    cli: &CapabilityCliOverrides,
+) -> anyhow::Result<u32> {
+    let config_overrides = parse_config_capabilities(config)?;
+    let capabilities = apply_overrides(CAP_DEFAULT, &config_overrides);
+    let capabilities = apply_overrides(capabilities, cli);
+    Ok(capabilities & CAP_VALID_MASK)
+}
+
+/// Reconcile the `file` capability bit against the file subsystem config.
+///
+/// File management is a two-layer feature: the `file` capability bit advertises
+/// the control plane, but the agent only actually serves file requests when
+/// `[file].enabled = true` and at least one `root_path` is configured (an empty
+/// allow-list rejects every operation). If the capability is set but the
+/// subsystem is not operational, clear the bit so the server never dispatches
+/// file messages and the UI hides the file feature — instead of showing a
+/// button that fails with "File capability disabled". This mirrors the runtime
+/// firewall probe, which only advertises `CAP_FIREWALL_BLOCK` when `nft` is
+/// actually usable.
+pub fn reconcile_file_capability(capabilities: u32, file: &FileConfig) -> u32 {
+    if has_capability(capabilities, CAP_FILE) && (!file.enabled || file.root_paths.is_empty()) {
+        capabilities & !CAP_FILE
+    } else {
+        capabilities
+    }
+}
+
+/// Reconcile the firewall-block capability bit against the runtime nft probe.
+///
+/// The reported capability must mean "operator allows it AND the subsystem can
+/// actually serve it". `CAP_FIREWALL_BLOCK` is in `CAP_DEFAULT`, so when the
+/// nft probe fails the bit must be stripped — otherwise the server advertises
+/// a firewall the agent silently cannot enforce (blocks are accepted and
+/// counted but no rule ever lands). When the probe succeeds the computed
+/// capabilities are left untouched, so an operator's explicit
+/// `deny = ["firewall_block"]` is respected instead of being OR-ed back on.
+pub fn reconcile_firewall_capability(capabilities: u32, probe_ok: bool) -> u32 {
+    if probe_ok {
+        capabilities
+    } else {
+        capabilities & !CAP_FIREWALL_BLOCK
+    }
+}
+
+pub fn parse_capability_args<I>(args: I) -> anyhow::Result<CapabilityCliOverrides>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut allow_caps = Vec::new();
+    let mut deny_caps = Vec::new();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--allow-cap" => {
+                let value = match args.next() {
+                    Some(value) if !value.starts_with("--") => value,
+                    _ => bail!("missing value for --allow-cap"),
+                };
+                let capability = value.parse::<CapabilityKey>().map_err(anyhow::Error::msg)?;
+                allow_caps.push(capability);
+            }
+            "--deny-cap" => {
+                let value = match args.next() {
+                    Some(value) if !value.starts_with("--") => value,
+                    _ => bail!("missing value for --deny-cap"),
+                };
+                let capability = value.parse::<CapabilityKey>().map_err(anyhow::Error::msg)?;
+                deny_caps.push(capability);
+            }
+            _ if is_unknown_capability_flag(&arg) => {
+                bail!("unknown capability flag: {arg}");
+            }
+            _ => {}
+        }
+    }
+
+    Ok(CapabilityCliOverrides {
+        allow_caps,
+        deny_caps,
+    })
+}
+
+fn is_unknown_capability_flag(arg: &str) -> bool {
+    (arg.starts_with("--allow-cap") && arg != "--allow-cap")
+        || (arg.starts_with("--deny-cap") && arg != "--deny-cap")
+}
+
+#[cfg(test)]
+mod tests {
+    use serverbee_common::constants::{
+        CAP_DEFAULT, CAP_DOCKER, CAP_EXEC, CAP_FILE, CAP_PING_HTTP, CAP_TERMINAL, CapabilityKey,
+        has_capability,
+    };
+
+    use super::{
+        CapabilityCliOverrides, compute_local_capabilities, parse_capability_args,
+        reconcile_file_capability, reconcile_firewall_capability,
+    };
+    use crate::config::{CapabilitiesConfig, FileConfig};
+
+    fn no_cli() -> CapabilityCliOverrides {
+        CapabilityCliOverrides {
+            allow_caps: vec![],
+            deny_caps: vec![],
+        }
+    }
+
+    #[test]
+    fn test_parse_capability_args_ignores_unrelated_segments() {
+        let overrides = parse_capability_args(vec![
+            "serverbee-agent".to_string(),
+            "--config".to_string(),
+            "agent.toml".to_string(),
+            "--allow-cap".to_string(),
+            "file".to_string(),
+            "--deny-cap".to_string(),
+            "ping_http".to_string(),
+        ])
+        .expect("parser should accept known capability flags");
+
+        assert_eq!(overrides.allow_caps, vec![CapabilityKey::File]);
+        assert_eq!(overrides.deny_caps, vec![CapabilityKey::PingHttp]);
+    }
+
+    #[test]
+    fn test_parse_capability_args_rejects_missing_allow_cap_value() {
+        let error = parse_capability_args(vec![
+            "serverbee-agent".to_string(),
+            "--allow-cap".to_string(),
+        ])
+        .expect_err("missing allow value should fail");
+
+        assert!(error.to_string().contains("missing value for --allow-cap"));
+    }
+
+    #[test]
+    fn test_parse_capability_args_rejects_unknown_capability_like_flag() {
+        let error = parse_capability_args(vec![
+            "serverbee-agent".to_string(),
+            "--allow-caps".to_string(),
+            "file".to_string(),
+        ])
+        .expect_err("unknown capability-like flag should fail");
+
+        assert!(error.to_string().contains("unknown capability flag"));
+    }
+
+    #[test]
+    fn test_parse_capability_args_rejects_unknown_capability_name() {
+        let error = parse_capability_args(vec![
+            "serverbee-agent".to_string(),
+            "--allow-cap".to_string(),
+            "nope".to_string(),
+        ])
+        .expect_err("unknown capability name should fail");
+
+        assert!(error.to_string().contains("unknown capability"));
+    }
+
+    #[test]
+    fn test_empty_config_and_cli_defaults_to_cap_default() {
+        let caps = compute_local_capabilities(&CapabilitiesConfig::default(), &no_cli())
+            .expect("default config should compute");
+        assert_eq!(caps, CAP_DEFAULT);
+    }
+
+    #[test]
+    fn test_cli_applies_allow_and_deny_with_deny_winning() {
+        let cli = CapabilityCliOverrides {
+            allow_caps: vec![CapabilityKey::File, CapabilityKey::Exec, CapabilityKey::File],
+            deny_caps: vec![CapabilityKey::PingHttp, CapabilityKey::Exec],
+        };
+
+        let caps = compute_local_capabilities(&CapabilitiesConfig::default(), &cli)
+            .expect("config should compute");
+        assert_eq!(caps, (CAP_DEFAULT | CAP_FILE) & !CAP_PING_HTTP);
+        assert_eq!(caps & CAP_EXEC, 0);
+        assert_eq!(caps & CAP_PING_HTTP, 0);
+    }
+
+    #[test]
+    fn test_config_file_allow_and_deny_apply_over_default() {
+        // The agent config file is the source of truth: allow adds high-risk
+        // caps, deny strips defaults.
+        let config = CapabilitiesConfig {
+            allow: vec!["terminal".to_string(), "file".to_string()],
+            deny: vec!["ip_quality".to_string()],
+            ..Default::default()
+        };
+        let caps =
+            compute_local_capabilities(&config, &no_cli()).expect("config should compute");
+        assert!(has_capability(caps, CAP_TERMINAL));
+        assert!(has_capability(caps, CAP_FILE));
+        assert!(!has_capability(caps, serverbee_common::constants::CAP_IP_QUALITY));
+    }
+
+    #[test]
+    fn test_cli_layer_overrides_config_layer() {
+        // Config allows docker; CLI denies it. CLI is applied last and wins.
+        let config = CapabilitiesConfig {
+            allow: vec!["docker".to_string()],
+            deny: vec![],
+            ..Default::default()
+        };
+        let cli = CapabilityCliOverrides {
+            allow_caps: vec![],
+            deny_caps: vec![CapabilityKey::Docker],
+        };
+        let caps = compute_local_capabilities(&config, &cli).expect("config should compute");
+        assert!(!has_capability(caps, CAP_DOCKER));
+    }
+
+    #[test]
+    fn test_config_file_unknown_capability_key_is_rejected() {
+        let config = CapabilitiesConfig {
+            allow: vec!["definitely_not_a_cap".to_string()],
+            deny: vec![],
+            ..Default::default()
+        };
+        let err = compute_local_capabilities(&config, &no_cli())
+            .expect_err("unknown config capability key should fail");
+        assert!(err.to_string().contains("unknown capability"));
+    }
+
+    #[test]
+    fn test_config_file_unknown_deny_capability_key_is_rejected() {
+        // The deny list is parsed by the same parse_list closure; a bad key
+        // there must also fail fast.
+        let config = CapabilitiesConfig {
+            allow: vec![],
+            deny: vec!["not_a_cap".to_string()],
+            ..Default::default()
+        };
+        let err = compute_local_capabilities(&config, &no_cli())
+            .expect_err("unknown deny capability key should fail");
+        assert!(err.to_string().contains("unknown capability"));
+    }
+
+    #[test]
+    fn test_parse_capability_args_rejects_missing_deny_cap_value() {
+        let error = parse_capability_args(vec![
+            "serverbee-agent".to_string(),
+            "--deny-cap".to_string(),
+        ])
+        .expect_err("missing deny value should fail");
+        assert!(error.to_string().contains("missing value for --deny-cap"));
+    }
+
+    #[test]
+    fn test_parse_capability_args_rejects_deny_cap_value_that_looks_like_flag() {
+        // A `--deny-cap` immediately followed by another `--flag` means the
+        // value is missing (the next token starts with `--`).
+        let error = parse_capability_args(vec![
+            "--deny-cap".to_string(),
+            "--allow-cap".to_string(),
+        ])
+        .expect_err("flag-shaped deny value should fail");
+        assert!(error.to_string().contains("missing value for --deny-cap"));
+    }
+
+    #[test]
+    fn test_parse_capability_args_rejects_allow_cap_value_that_looks_like_flag() {
+        let error = parse_capability_args(vec![
+            "--allow-cap".to_string(),
+            "--deny-cap".to_string(),
+        ])
+        .expect_err("flag-shaped allow value should fail");
+        assert!(error.to_string().contains("missing value for --allow-cap"));
+    }
+
+    #[test]
+    fn test_parse_capability_args_rejects_unknown_deny_cap_like_flag() {
+        let error = parse_capability_args(vec![
+            "--deny-caps".to_string(),
+            "file".to_string(),
+        ])
+        .expect_err("unknown deny-cap-like flag should fail");
+        assert!(error.to_string().contains("unknown capability flag"));
+    }
+
+    #[test]
+    fn test_parse_capability_args_rejects_unknown_deny_capability_name() {
+        let error = parse_capability_args(vec![
+            "--deny-cap".to_string(),
+            "nope".to_string(),
+        ])
+        .expect_err("unknown deny capability name should fail");
+        assert!(error.to_string().contains("unknown capability"));
+    }
+
+    #[test]
+    fn test_reconcile_file_capability_drops_bit_when_subsystem_disabled() {
+        // Capability allowed via [capabilities], but [file].enabled defaults to
+        // false: CAP_FILE must be stripped so the UI does not advertise a file
+        // feature that would fail with "File capability disabled".
+        let caps = CAP_DEFAULT | CAP_FILE;
+        let file = FileConfig {
+            enabled: false,
+            root_paths: vec!["/home".to_string()],
+            ..Default::default()
+        };
+        let reconciled = reconcile_file_capability(caps, &file);
+        assert!(!has_capability(reconciled, CAP_FILE));
+        assert_eq!(reconciled, CAP_DEFAULT);
+    }
+
+    #[test]
+    fn test_reconcile_file_capability_drops_bit_when_no_root_paths() {
+        // enabled=true but an empty root_paths allow-list rejects every file
+        // operation, so the capability is not actually usable.
+        let caps = CAP_DEFAULT | CAP_FILE;
+        let file = FileConfig {
+            enabled: true,
+            root_paths: vec![],
+            ..Default::default()
+        };
+        let reconciled = reconcile_file_capability(caps, &file);
+        assert!(!has_capability(reconciled, CAP_FILE));
+    }
+
+    #[test]
+    fn test_reconcile_file_capability_keeps_bit_when_operational() {
+        let caps = CAP_DEFAULT | CAP_FILE;
+        let file = FileConfig {
+            enabled: true,
+            root_paths: vec!["/home".to_string()],
+            ..Default::default()
+        };
+        let reconciled = reconcile_file_capability(caps, &file);
+        assert!(has_capability(reconciled, CAP_FILE));
+        assert_eq!(reconciled, caps);
+    }
+
+    #[test]
+    fn test_reconcile_firewall_capability_strips_bit_when_probe_fails() {
+        // CAP_FIREWALL_BLOCK is in CAP_DEFAULT; a failed nft probe must strip
+        // it so the server never advertises a firewall the agent cannot
+        // enforce (blocks would be accepted but silently never applied).
+        use serverbee_common::constants::CAP_FIREWALL_BLOCK;
+        let reconciled = reconcile_firewall_capability(CAP_DEFAULT, false);
+        assert!(!has_capability(reconciled, CAP_FIREWALL_BLOCK));
+        assert_eq!(reconciled, CAP_DEFAULT & !CAP_FIREWALL_BLOCK);
+    }
+
+    #[test]
+    fn test_reconcile_firewall_capability_keeps_bit_when_probe_succeeds() {
+        use serverbee_common::constants::CAP_FIREWALL_BLOCK;
+        let reconciled = reconcile_firewall_capability(CAP_DEFAULT, true);
+        assert!(has_capability(reconciled, CAP_FIREWALL_BLOCK));
+        assert_eq!(reconciled, CAP_DEFAULT);
+    }
+
+    #[test]
+    fn test_reconcile_firewall_capability_respects_operator_deny() {
+        // Operator denied firewall_block in [capabilities]; a successful probe
+        // must NOT resurrect the bit (the old code OR-ed it back on).
+        use serverbee_common::constants::CAP_FIREWALL_BLOCK;
+        let denied = CAP_DEFAULT & !CAP_FIREWALL_BLOCK;
+        let reconciled = reconcile_firewall_capability(denied, true);
+        assert!(!has_capability(reconciled, CAP_FIREWALL_BLOCK));
+    }
+
+    #[test]
+    fn test_reconcile_file_capability_noop_when_bit_absent() {
+        // No CAP_FILE requested: an unconfigured [file] block must not matter.
+        let file = FileConfig::default();
+        let reconciled = reconcile_file_capability(CAP_DEFAULT, &file);
+        assert_eq!(reconciled, CAP_DEFAULT);
+    }
+
+    #[test]
+    fn test_parse_capability_args_empty_yields_no_overrides() {
+        let overrides = parse_capability_args(Vec::<String>::new())
+            .expect("empty args should parse");
+        assert!(overrides.allow_caps.is_empty());
+        assert!(overrides.deny_caps.is_empty());
+    }
+}

@@ -1,0 +1,161 @@
+import { Dialog as DialogPrimitive } from '@base-ui/react/dialog'
+import { XIcon } from 'lucide-react'
+import type * as React from 'react'
+import { useTranslation } from 'react-i18next'
+import { Button } from '@/components/ui/button'
+import { ScrollArea } from '@/components/ui/scroll-area'
+import { cn } from '@/lib/utils'
+
+function Dialog({ ...props }: DialogPrimitive.Root.Props) {
+  return <DialogPrimitive.Root data-slot="dialog" {...props} />
+}
+
+function DialogTrigger({ ...props }: DialogPrimitive.Trigger.Props) {
+  return <DialogPrimitive.Trigger data-slot="dialog-trigger" {...props} />
+}
+
+function DialogPortal({ ...props }: DialogPrimitive.Portal.Props) {
+  return <DialogPrimitive.Portal data-slot="dialog-portal" {...props} />
+}
+
+function DialogClose({ ...props }: DialogPrimitive.Close.Props) {
+  return <DialogPrimitive.Close data-slot="dialog-close" {...props} />
+}
+
+function DialogOverlay({ className, ...props }: DialogPrimitive.Backdrop.Props) {
+  return (
+    <DialogPrimitive.Backdrop
+      className={cn(
+        'data-open:fade-in-0 data-closed:fade-out-0 fixed inset-0 isolate z-50 bg-black/10 duration-100 data-closed:animate-out data-open:animate-in supports-backdrop-filter:backdrop-blur-xs',
+        className
+      )}
+      data-slot="dialog-overlay"
+      {...props}
+    />
+  )
+}
+
+function DialogContent({
+  className,
+  children,
+  showCloseButton = true,
+  ...props
+}: DialogPrimitive.Popup.Props & {
+  showCloseButton?: boolean
+}) {
+  const { t } = useTranslation('common')
+  return (
+    <DialogPortal>
+      <DialogOverlay />
+      <DialogPrimitive.Popup
+        className={cn(
+          // top-1/2!/left-1/2! use !important to beat base-ui Popup's unlayered
+          // `inset: 0` (unlayered third-party CSS otherwise wins over Tailwind's
+          // layered utilities, pinning the dialog to 0,0 so translate(-50%) shoves
+          // it half off the left/top edge on narrow viewports).
+          'data-open:fade-in-0 data-open:zoom-in-95 data-closed:fade-out-0 data-closed:zoom-out-95 fixed top-1/2! left-1/2! z-50 flex max-h-[calc(100vh-4rem)] w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col gap-4 overflow-hidden rounded-xl bg-background p-4 text-sm outline-none ring-1 ring-foreground/10 duration-100 data-closed:animate-out data-open:animate-in sm:max-w-sm',
+          className
+        )}
+        data-slot="dialog-content"
+        {...props}
+      >
+        {children}
+        {showCloseButton && (
+          <DialogPrimitive.Close
+            data-slot="dialog-close"
+            render={<Button className="absolute top-2 right-2" size="icon-sm" variant="ghost" />}
+          >
+            <XIcon />
+            <span className="sr-only">{t('a11y.close')}</span>
+          </DialogPrimitive.Close>
+        )}
+      </DialogPrimitive.Popup>
+    </DialogPortal>
+  )
+}
+
+function DialogHeader({ className, ...props }: React.ComponentProps<'div'>) {
+  return <div className={cn('flex flex-col gap-2', className)} data-slot="dialog-header" {...props} />
+}
+
+function DialogBody({ className, children, ...props }: React.ComponentProps<'div'>) {
+  return (
+    <ScrollArea
+      className="-mx-4 max-h-[calc(100vh-14rem)] min-h-0 flex-1"
+      // base-ui's ScrollArea.Content sets an inline `min-width: fit-content` to
+      // enable horizontal scrolling; in a dialog that lets long unbreakable
+      // strings (e.g. a truncated enrollment code) push content past the edge.
+      // Override it (important beats the inline style) so the body stays within
+      // the dialog width and descendants with min-w-0/truncate can shrink.
+      contentClassName="min-w-0!"
+      data-slot="dialog-body"
+    >
+      <div className={cn('px-4', className)} {...props}>
+        {children}
+      </div>
+    </ScrollArea>
+  )
+}
+
+function DialogFooter({
+  className,
+  showCloseButton = false,
+  children,
+  ...props
+}: React.ComponentProps<'div'> & {
+  showCloseButton?: boolean
+}) {
+  const { t } = useTranslation('common')
+  return (
+    <div
+      className={cn(
+        '-mx-4 -mb-4 flex flex-col-reverse gap-2 rounded-b-xl border-t bg-muted/50 p-4 sm:flex-row sm:justify-end',
+        className
+      )}
+      data-slot="dialog-footer"
+      {...props}
+    >
+      {children}
+      {showCloseButton && (
+        <DialogPrimitive.Close render={<Button variant="outline" />}>{t('a11y.close')}</DialogPrimitive.Close>
+      )}
+    </div>
+  )
+}
+
+function DialogTitle({ className, ...props }: DialogPrimitive.Title.Props) {
+  return (
+    <DialogPrimitive.Title
+      className={cn('font-medium text-base leading-none', className)}
+      data-slot="dialog-title"
+      {...props}
+    />
+  )
+}
+
+function DialogDescription({ className, ...props }: DialogPrimitive.Description.Props) {
+  return (
+    <DialogPrimitive.Description
+      className={cn(
+        'text-muted-foreground text-sm *:[a]:underline *:[a]:underline-offset-3 *:[a]:hover:text-foreground',
+        className
+      )}
+      data-slot="dialog-description"
+      {...props}
+    />
+  )
+}
+
+export {
+  Dialog,
+  DialogBody,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogOverlay,
+  DialogPortal,
+  DialogTitle,
+  DialogTrigger
+}

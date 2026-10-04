@@ -1,0 +1,77 @@
+---
+title: Cost Insights
+description: How ServerBee turns billing fields plus agent metrics into burn rate, per-resource unit cost, and objective cost advisories.
+icon: CircleDollarSign
+---
+
+ServerBee combines admin-entered billing fields (`price`, `billing_cycle`, `currency`, `expired_at`, ...) with the resource capacity, utilization, and uptime each agent reports, then derives a set of objective cost signals: burn rate, per-resource unit cost, and per-server **advisories**. These appear in the server list, the dashboard server card, and the cost panel on the server detail page.
+
+To learn how to enter billing data in the UI, see the [Billing Information section in the admin guide](/en/docs/admin#billing-information).
+
+## Derived outputs
+
+Every server with a valid billing configuration produces the fields below (exposed via both `GET /api/cost/overview` and `GET /api/servers/{id}/cost-insights`):
+
+| Field | Meaning |
+|-------|---------|
+| `cost_per_second / per_hour / per_day` | Cost amortized to a single unit of time within the current billing cycle |
+| `cost_per_month_equivalent` | Cost normalized to "per 30 days" so cycles of different lengths can be compared |
+| `cycle_cost_elapsed / cycle_cost_remaining` | Money already burned vs. left in the current cycle |
+| `cycle_burn_percent` | Elapsed portion of the cycle expressed as a percentage |
+| `days_remaining` | Days left in the current billing cycle |
+| `resource_value.cost_per_cpu_core` | Monthly-equivalent unit cost per CPU core |
+| `resource_value.cost_per_gb_memory` | Monthly-equivalent unit cost per GB of memory |
+| `resource_value.cost_per_gb_disk` | Monthly-equivalent unit cost per GB of disk |
+| `resource_value.cost_per_tb_traffic_limit` | Monthly-equivalent cost per TB of `traffic_limit`, when configured |
+| `advisories` | Objective per-server warnings (see below); an empty array when nothing applies |
+| `invalid_reason` | Populated instead of the cost fields when billing fields fail validation |
+
+<Callout type="info">
+ServerBee deliberately does **not** compute a single composite "value score". A server's cost-effectiveness is best judged from the objective unit costs above (which need no fleet comparison) plus the actionable advisories below — not from an opaque 0–100 number that conflates unrelated dimensions.
+</Callout>
+
+## Input validation
+
+The cost breakdown is skipped when any of the following are true. The reason is surfaced via `invalid_reason` so the UI can flag the entry rather than silently treating it as configured:
+
+| `invalid_reason` | Trigger |
+|------------------|---------|
+| `missing_price` | `price` is NULL |
+| `missing_billing_cycle` | `billing_cycle` is NULL or empty |
+| `invalid_billing_cycle` | `billing_cycle` is not in the recognized set (`monthly`, `quarterly`, `yearly`) |
+| `invalid_price` | `price < 0` or NaN |
+
+`price == 0` is treated as a valid "free server" entry: it gets the full cost breakdown (all zeros) but never raises the `idle_burn` / `sleeping_money` advisories, which only make sense when money is actually being spent.
+
+## Cost advisories
+
+Each advisory is an objective fact about a single server, computed without any fleet comparison, so it is meaningful even for a one-server deployment. They are emitted in the priority order below and rendered as warning chips next to the cost figures.
+
+| Advisory | Trigger | What it suggests |
+|----------|---------|------------------|
+| `expired_billing` | `expired_at` is in the past | Renew before you lose the host |
+| `sleeping_money` | Offline, with no recent samples, while paying a non-zero bill | Investigate why a paid host is down |
+| `idle_burn` | Resources idle (avg CPU &lt; 5%, avg memory &lt; 20%, no real network/disk I/O over the last 24h) while paying a non-zero bill | Consider downsizing or consolidating |
+| `low_uptime` | 30-day uptime ratio below 90% | Investigate reliability |
+
+`sleeping_money` and `idle_burn` are mutually exclusive: "sleeping" requires the absence of recent samples, while "idle" requires the low-usage samples that prove the host was recently alive.
+
+## Data sources and refresh cadence
+
+- Advisories and cost figures are computed on demand by the server; there is no persisted cache
+- Utilization averages come from the `record` table (the same table the monitoring charts use), 24h lookback (`RECORD_LOOKBACK_HOURS`). Network activity is judged from per-window throughput rates, not the cumulative byte counters
+- Uptime ratio is aggregated from `uptime_daily` over a 30-day lookback (`UPTIME_RECENT_DAYS`)
+- Resource capacity (CPU cores / total memory / total disk) comes from each agent's last `SystemInfo`; the last known value is reused while the agent is disconnected
+
+## Known limitations
+
+- Per-resource unit costs are absolute (cost ÷ capacity); they are not ranked against other servers, so judging "cheap vs. expensive" is left to you
+- `idle_burn` inspects CPU + memory + I/O activity, not application-level usefulness. A host that is up but doing nothing useful while its CPU/RAM are idle reads as idle
+- When `traffic_limit` is missing, `cost_per_tb_traffic_limit` is omitted
+- Monthly-equivalent conversion uses a fixed 30-day basis. Quarterly / yearly cycles are converted into this single basis first
+
+<Cards>
+  <Card title="Billing fields" href="/en/docs/admin#billing-information" />
+  <Card title="API reference" href="/en/docs/api-reference#authenticated-read-endpoints" />
+  <Card title="Alerts" href="/en/docs/alerts" />
+</Cards>

@@ -1,0 +1,1657 @@
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use dashmap::DashMap;
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+
+use serverbee_common::constants::{CAP_DOCKER, has_capability};
+use serverbee_common::docker_types::*;
+use serverbee_common::protocol::{
+    AgentMessage, BrowserMessage, RecordedProtocol, ServerMessage, TemporaryGrant,
+};
+use serverbee_common::types::{LiveMetrics, SystemReport, TracerouteHop};
+
+use crate::error::AppError;
+use crate::state::AppState;
+
+/// Error taxonomy for a request/reply exchange with an agent. Callers match on
+/// intent (offline vs timeout); the HTTP mapping lives in the `From<AppError>`
+/// impl so routes can simply use `?`.
+#[derive(Debug)]
+pub enum AgentRequestError {
+    /// No live WS connection for this server.
+    Offline,
+    /// The outbound channel to the agent closed mid-send.
+    SendFailed,
+    /// The agent disconnected before replying.
+    Disconnected,
+    /// No reply within the deadline.
+    Timeout(std::time::Duration),
+}
+
+impl From<AgentRequestError> for AppError {
+    fn from(err: AgentRequestError) -> Self {
+        match err {
+            AgentRequestError::Offline => AppError::NotFound("Server offline".into()),
+            AgentRequestError::SendFailed => AppError::Internal("Failed to send to agent".into()),
+            AgentRequestError::Disconnected => AppError::Internal("Agent disconnected".into()),
+            AgentRequestError::Timeout(timeout) => AppError::RequestTimeout(format!(
+                "Agent did not respond within {}s",
+                timeout.as_secs()
+            )),
+        }
+    }
+}
+
+/// Sum per-device disk I/O rates into a single (read, write) pair for broadcast.
+pub(crate) fn aggregate_disk_io(report: &SystemReport) -> (u64, u64) {
+    let Some(devices) = report.disk_io.as_ref() else {
+        return (0, 0);
+    };
+    devices.iter().fold((0u64, 0u64), |(r, w), d| {
+        (
+            r.saturating_add(d.read_bytes_per_sec),
+            w.saturating_add(d.write_bytes_per_sec),
+        )
+    })
+}
+
+/// Sender for forwarding terminal output from agent to browser WS.
+pub type TerminalOutputTx = mpsc::Sender<TerminalSessionEvent>;
+
+/// Events sent from agent handler to browser terminal WS.
+pub enum TerminalSessionEvent {
+    Output(String), // base64 encoded data
+    Started,
+    Error(String),
+}
+
+struct TerminalSession {
+    server_id: String,
+    tx: TerminalOutputTx,
+}
+
+#[derive(Clone, Debug)]
+pub struct TracerouteRequestMeta {
+    pub server_id: String,
+    pub target: String,
+    pub protocol: RecordedProtocol,
+    pub started_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct TracerouteSnapshot {
+    pub server_id: String,
+    pub target: String,
+    pub protocol: RecordedProtocol,
+    pub started_at: i64,
+    pub round: u32,
+    pub total_rounds: u32,
+    pub completed: bool,
+    pub hops: Vec<TracerouteHop>,
+    pub error: Option<String>,
+}
+
+struct TracerouteCacheEntry {
+    meta: TracerouteRequestMeta,
+    round: u32,
+    total_rounds: u32,
+    hops: Vec<TracerouteHop>,
+    completed: bool,
+    error: Option<String>,
+    created_at: Instant,
+    completed_at: Option<Instant>,
+}
+
+pub struct AgentManager {
+    connections: DashMap<String, AgentConnection>,
+    latest_reports: DashMap<String, CachedReport>,
+    browser_tx: broadcast::Sender<BrowserMessage>,
+    /// Maps session_id -> terminal output channel (for routing agent output to browser WS)
+    terminal_sessions: DashMap<String, TerminalSession>,
+    /// Maps msg_id -> pending response slot for HTTP→WS relay
+    pending_requests: DashMap<String, PendingRequest>,
+    // Docker caches
+    docker_containers: DashMap<String, Vec<DockerContainer>>,
+    docker_stats: DashMap<String, Vec<DockerContainerStats>>,
+    docker_info: DashMap<String, DockerSystemInfo>,
+    features: DashMap<String, Vec<String>>,
+    /// Capabilities the agent reports it supports (from `SystemInfo`). This is
+    /// the sole source of truth — capabilities are owned by the agent host and
+    /// the server cannot modify them, only mirror what the agent reports.
+    agent_local_capabilities: DashMap<String, u32>,
+    /// Active temporary capability grants reported by each agent (in-memory,
+    /// transient — re-reported on reconnect). Drives the UI countdown.
+    temporary_grants: DashMap<String, Vec<TemporaryGrant>>,
+    /// Maps server_id -> (session_id -> log entry sender)
+    docker_log_sessions: DashMap<String, DashMap<String, mpsc::Sender<Vec<DockerLogEntry>>>>,
+    /// Maps request_id -> traceroute result entry (cached for polling)
+    traceroute_results: DashMap<String, TracerouteCacheEntry>,
+    server_lifecycle_locks: DashMap<String, Arc<Mutex<()>>>,
+    next_connection_id: AtomicU64,
+}
+
+/// A response slot awaiting an agent reply. Tied to the server it was sent
+/// to so disconnect cleanup can fail the waiter immediately instead of
+/// letting it hang until the ack timeout.
+struct PendingRequest {
+    tx: oneshot::Sender<AgentMessage>,
+    server_id: String,
+    created_at: std::time::Instant,
+    ttl: std::time::Duration,
+}
+
+#[allow(dead_code)]
+pub struct AgentConnection {
+    pub connection_id: u64,
+    pub server_id: String,
+    pub server_name: String,
+    pub tx: mpsc::Sender<ServerMessage>,
+    pub connected_at: Instant,
+    pub last_report_at: Instant,
+    pub remote_addr: SocketAddr,
+    pub protocol_version: u32,
+    pub os: String,
+    pub arch: String,
+}
+
+#[allow(dead_code)]
+pub struct CachedReport {
+    pub report: Arc<SystemReport>,
+    pub received_at: Instant,
+}
+
+impl AgentManager {
+    pub fn new(browser_tx: broadcast::Sender<BrowserMessage>) -> Self {
+        Self {
+            connections: DashMap::new(),
+            latest_reports: DashMap::new(),
+            browser_tx,
+            terminal_sessions: DashMap::new(),
+            pending_requests: DashMap::new(),
+            docker_containers: DashMap::new(),
+            docker_stats: DashMap::new(),
+            docker_info: DashMap::new(),
+            features: DashMap::new(),
+            agent_local_capabilities: DashMap::new(),
+            temporary_grants: DashMap::new(),
+            docker_log_sessions: DashMap::new(),
+            traceroute_results: DashMap::new(),
+            server_lifecycle_locks: DashMap::new(),
+            next_connection_id: AtomicU64::new(1),
+        }
+    }
+
+    /// Register a new agent connection and broadcast ServerOnline to browsers.
+    pub fn add_connection(
+        &self,
+        server_id: String,
+        server_name: String,
+        tx: mpsc::Sender<ServerMessage>,
+        remote_addr: SocketAddr,
+    ) -> u64 {
+        let now = Instant::now();
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        self.connections.insert(
+            server_id.clone(),
+            AgentConnection {
+                connection_id,
+                server_id: server_id.clone(),
+                server_name,
+                tx,
+                connected_at: now,
+                last_report_at: now,
+                remote_addr,
+                protocol_version: 1,
+                os: String::new(),
+                arch: String::new(),
+            },
+        );
+
+        let _ = self
+            .browser_tx
+            .send(BrowserMessage::ServerOnline { server_id });
+
+        connection_id
+    }
+
+    /// Unregister an agent connection and broadcast ServerOffline to browsers.
+    pub fn remove_connection(&self, server_id: &str) {
+        if self.connections.remove(server_id).is_some() {
+            self.finish_connection_removal(server_id);
+        }
+    }
+
+    pub fn remove_connection_if_current(
+        &self,
+        server_id: &str,
+        expected_connection_id: u64,
+    ) -> bool {
+        let removed = self.connections.remove_if(server_id, |_, connection| {
+            connection.connection_id == expected_connection_id
+        });
+        if removed.is_some() {
+            self.finish_connection_removal(server_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn broadcast_agent_authority_changed(
+        &self,
+        server_id: String,
+        agent_authority: serverbee_common::types::AgentAuthorityStateSummary,
+    ) {
+        let _ = self.browser_tx.send(BrowserMessage::AgentAuthorityChanged {
+            server_id,
+            agent_authority,
+        });
+    }
+
+    pub fn is_current_connection(&self, server_id: &str, expected_connection_id: u64) -> bool {
+        self.connections
+            .get(server_id)
+            .is_some_and(|connection| connection.connection_id == expected_connection_id)
+    }
+
+    /// Update the latest report for a server and broadcast an Update to browsers.
+    pub fn update_report(&self, server_id: &str, report: SystemReport) {
+        let now = Instant::now();
+
+        // Update last_report_at on the connection
+        if let Some(mut conn) = self.connections.get_mut(server_id) {
+            conn.last_report_at = now;
+        }
+
+        let (disk_read_bytes_per_sec, disk_write_bytes_per_sec) = aggregate_disk_io(&report);
+
+        let metrics = LiveMetrics {
+            id: server_id.to_string(),
+            name: self
+                .connections
+                .get(server_id)
+                .map(|c| c.server_name.clone())
+                .unwrap_or_default(),
+            online: true,
+            last_active: chrono::Utc::now().timestamp(),
+            uptime: report.uptime,
+            cpu: report.cpu,
+            mem_used: report.mem_used,
+            swap_used: report.swap_used,
+            disk_used: report.disk_used,
+            net_in_speed: report.net_in_speed,
+            net_out_speed: report.net_out_speed,
+            net_in_transfer: report.net_in_transfer,
+            net_out_transfer: report.net_out_transfer,
+            load1: report.load1,
+            load5: report.load5,
+            load15: report.load15,
+            tcp_conn: report.tcp_conn,
+            udp_conn: report.udp_conn,
+            process_count: report.process_count,
+            disk_read_bytes_per_sec,
+            disk_write_bytes_per_sec,
+        };
+
+        let _ = self.browser_tx.send(BrowserMessage::Update {
+            servers: vec![metrics],
+        });
+
+        // Cache the report
+        self.latest_reports.insert(
+            server_id.to_string(),
+            CachedReport {
+                report: Arc::new(report),
+                received_at: now,
+            },
+        );
+    }
+
+    /// Check if a server is currently connected.
+    pub fn is_online(&self, server_id: &str) -> bool {
+        self.connections.contains_key(server_id)
+    }
+
+    pub fn server_lifecycle_lock(&self, server_id: &str) -> Arc<Mutex<()>> {
+        self.server_lifecycle_locks
+            .entry(server_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Return the number of currently connected agents.
+    #[allow(dead_code)]
+    pub fn online_count(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// Get the latest cached report for a server.
+    pub fn get_latest_report(&self, server_id: &str) -> Option<Arc<SystemReport>> {
+        self.latest_reports
+            .get(server_id)
+            .map(|r| Arc::clone(&r.report))
+    }
+
+    /// Get all latest cached reports as (server_id, report) pairs.
+    pub fn all_latest_reports(&self) -> Vec<(String, Arc<SystemReport>)> {
+        self.latest_reports
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(&entry.value().report)))
+            .collect()
+    }
+
+    /// Cached reports for servers that are *currently connected* only.
+    ///
+    /// The record writer must persist only live data: a disconnected agent's
+    /// last report lingers in `latest_reports` (it still backs the "last known
+    /// metrics" display for offline servers), so flushing the raw cache would
+    /// stamp fresh rows with `Utc::now()` every tick for machines that are no
+    /// longer reporting, fabricating history and writing unboundedly.
+    pub fn online_latest_reports(&self) -> Vec<(String, Arc<SystemReport>)> {
+        self.latest_reports
+            .iter()
+            .filter(|entry| self.connections.contains_key(entry.key()))
+            .map(|entry| (entry.key().clone(), Arc::clone(&entry.value().report)))
+            .collect()
+    }
+
+    /// Drop the cached report for a server. Call this only when the server row
+    /// itself is gone (deletion), so the display cache doesn't outlive it. A
+    /// plain disconnect must *not* call this — the cache backs offline display.
+    pub fn remove_cached_report(&self, server_id: &str) {
+        self.latest_reports.remove(server_id);
+    }
+
+    /// Get the mpsc sender for a specific agent to send commands to it.
+    pub fn get_sender(&self, server_id: &str) -> Option<mpsc::Sender<ServerMessage>> {
+        self.connections.get(server_id).map(|c| c.tx.clone())
+    }
+
+    /// Get all connected agent server IDs.
+    pub fn connected_server_ids(&self) -> Vec<String> {
+        self.connections.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Snapshot of currently connected agents with their negotiated
+    /// `protocol_version`. Used by the firewall pusher to gate sends on
+    /// `FIREWALL_MIN_PROTOCOL`.
+    pub fn online_agents(&self) -> Vec<(String, u32)> {
+        self.connections
+            .iter()
+            .map(|e| (e.key().clone(), e.value().protocol_version))
+            .collect()
+    }
+
+    /// Get the remote address of a connected agent.
+    pub fn get_remote_addr(&self, server_id: &str) -> Option<SocketAddr> {
+        self.connections.get(server_id).map(|c| c.remote_addr)
+    }
+
+    /// Update the last_report_at timestamp for a connection (e.g., on Pong).
+    pub fn touch_connection(&self, server_id: &str) {
+        if let Some(mut conn) = self.connections.get_mut(server_id) {
+            conn.last_report_at = Instant::now();
+        }
+    }
+
+    /// Register a terminal session for routing output from agent to browser.
+    pub fn register_terminal_session(
+        &self,
+        session_id: String,
+        server_id: String,
+        tx: TerminalOutputTx,
+    ) {
+        self.terminal_sessions
+            .insert(session_id, TerminalSession { server_id, tx });
+    }
+
+    /// Unregister a terminal session.
+    pub fn unregister_terminal_session(&self, session_id: &str) {
+        self.terminal_sessions.remove(session_id);
+    }
+
+    /// Unregister a terminal session on behalf of agent `server_id`. Sessions
+    /// owned by another server are left untouched.
+    pub fn unregister_agent_terminal_session(&self, server_id: &str, session_id: &str) {
+        self.terminal_sessions
+            .remove_if(session_id, |_, session| session.server_id == server_id);
+    }
+
+    /// Get the terminal output sender for a session opened on `server_id`.
+    /// Returns None for unknown sessions and for sessions owned by another
+    /// server, so an agent can only feed its own terminal sessions.
+    pub fn get_terminal_session(
+        &self,
+        server_id: &str,
+        session_id: &str,
+    ) -> Option<TerminalOutputTx> {
+        self.terminal_sessions
+            .get(session_id)
+            .filter(|session| session.server_id == server_id)
+            .map(|session| session.tx.clone())
+    }
+
+    /// Find agents that have not reported for `threshold_secs` seconds.
+    pub fn stale_connection_candidates(&self, threshold_secs: u64) -> Vec<(String, u64)> {
+        let now = Instant::now();
+        let mut stale_connections = Vec::new();
+
+        for entry in self.connections.iter() {
+            let elapsed = now.duration_since(entry.value().last_report_at);
+            if elapsed.as_secs() >= threshold_secs {
+                stale_connections.push((entry.key().clone(), entry.value().connection_id));
+            }
+        }
+
+        stale_connections
+    }
+
+    /// Find agents that have not reported for `threshold_secs` seconds,
+    /// remove them, and return their server IDs.
+    #[cfg(test)]
+    pub fn check_offline(&self, threshold_secs: u64) -> Vec<String> {
+        let mut offline_ids = Vec::new();
+        for (server_id, connection_id) in self.stale_connection_candidates(threshold_secs) {
+            if self.remove_connection_if_current(&server_id, connection_id) {
+                offline_ids.push(server_id);
+            }
+        }
+
+        offline_ids
+    }
+
+    fn finish_connection_removal(&self, server_id: &str) {
+        self.agent_local_capabilities.remove(server_id);
+        self.temporary_grants.remove(server_id);
+        // Fail in-flight request/response waiters (uploads, exec, listings)
+        // immediately: the reply can never arrive on a removed connection, so
+        // dropping the sender surfaces Disconnected instead of an ack timeout.
+        self.pending_requests
+            .retain(|_, pending| pending.server_id != server_id);
+        self.terminal_sessions
+            .retain(|_, session| session.server_id != server_id);
+        self.remove_docker_log_sessions_for_server(server_id);
+        self.clear_docker_caches(server_id);
+
+        let _ = self.browser_tx.send(BrowserMessage::ServerOffline {
+            server_id: server_id.to_string(),
+        });
+    }
+
+    pub fn set_protocol_version(&self, server_id: &str, version: u32) {
+        if let Some(mut conn) = self.connections.get_mut(server_id) {
+            conn.protocol_version = version;
+        }
+    }
+
+    pub fn get_protocol_version(&self, server_id: &str) -> Option<u32> {
+        self.connections.get(server_id).map(|c| c.protocol_version)
+    }
+
+    pub fn update_agent_platform(&self, server_id: &str, os: String, arch: String) {
+        if let Some(mut conn) = self.connections.get_mut(server_id) {
+            conn.os = os;
+            conn.arch = arch;
+        }
+    }
+
+    pub fn get_agent_platform(&self, server_id: &str) -> Option<(String, String)> {
+        self.connections
+            .get(server_id)
+            .map(|c| (c.os.clone(), c.arch.clone()))
+    }
+
+    pub fn broadcast_browser(&self, msg: BrowserMessage) {
+        let _ = self.browser_tx.send(msg);
+    }
+
+    /// Pending-request key for a streaming upload's ack exchanges. Uploads
+    /// cannot use the one-shot `request()` seam (init-ack, per-chunk ack and
+    /// complete are separate exchanges over one transfer id), so the HTTP
+    /// producer and the WS consumer must form identical keys — the format
+    /// lives here and nowhere else.
+    pub fn upload_ack_key(transfer_id: &str) -> String {
+        format!("upload-ack-{transfer_id}")
+    }
+
+    /// Pending-request key for a streaming upload's completion. See
+    /// [`Self::upload_ack_key`].
+    pub fn upload_complete_key(transfer_id: &str) -> String {
+        format!("upload-complete-{transfer_id}")
+    }
+
+    /// Register a pending request for HTTP→WS relay with a custom TTL.
+    /// Returns a oneshot receiver that will receive the agent's response.
+    /// The slot is dropped (failing the receiver) if `server_id` disconnects.
+    pub fn register_pending_request_with_ttl(
+        &self,
+        server_id: &str,
+        msg_id: String,
+        ttl: std::time::Duration,
+    ) -> oneshot::Receiver<AgentMessage> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_requests.insert(
+            msg_id,
+            PendingRequest {
+                tx,
+                server_id: server_id.to_string(),
+                created_at: std::time::Instant::now(),
+                ttl,
+            },
+        );
+        rx
+    }
+
+    /// Check if a pending request exists for the given msg_id.
+    pub fn has_pending_request(&self, msg_id: &str) -> bool {
+        self.pending_requests.contains_key(msg_id)
+    }
+
+    /// Register a pending request for HTTP→WS relay with a default 60s TTL.
+    /// Returns a oneshot receiver that will receive the agent's response.
+    pub fn register_pending_request(
+        &self,
+        server_id: &str,
+        msg_id: String,
+    ) -> oneshot::Receiver<AgentMessage> {
+        self.register_pending_request_with_ttl(
+            server_id,
+            msg_id,
+            std::time::Duration::from_secs(60),
+        )
+    }
+
+    /// Remove a pending response slot when the request owner stops waiting.
+    pub fn cancel_pending_request(&self, msg_id: &str) {
+        self.pending_requests.remove(msg_id);
+    }
+
+    /// Send a request to an agent and await its correlated reply.
+    ///
+    /// Owns the whole request/reply choreography: generates the correlation id,
+    /// registers the pending slot, resolves the agent's sender, sends, and
+    /// enforces the deadline. `build_msg` receives the generated id and must
+    /// embed it in the outbound message so the agent's reply can be matched.
+    pub async fn request(
+        &self,
+        server_id: &str,
+        timeout: std::time::Duration,
+        build_msg: impl FnOnce(String) -> ServerMessage,
+    ) -> Result<AgentMessage, AgentRequestError> {
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        self.request_with_id(server_id, msg_id, timeout, build_msg)
+            .await
+    }
+
+    /// Like [`Self::request`], but with a caller-supplied correlation id (e.g.
+    /// scheduled tasks encode task/run/attempt into it).
+    pub async fn request_with_id(
+        &self,
+        server_id: &str,
+        msg_id: String,
+        timeout: std::time::Duration,
+        build_msg: impl FnOnce(String) -> ServerMessage,
+    ) -> Result<AgentMessage, AgentRequestError> {
+        let sender = self
+            .get_sender(server_id)
+            .ok_or(AgentRequestError::Offline)?;
+        // TTL is a backstop above the await deadline; failure paths below
+        // remove the slot eagerly so the sweep never has to.
+        let rx = self.register_pending_request_with_ttl(
+            server_id,
+            msg_id.clone(),
+            timeout + std::time::Duration::from_secs(10),
+        );
+        if sender.send(build_msg(msg_id.clone())).await.is_err() {
+            self.pending_requests.remove(&msg_id);
+            return Err(AgentRequestError::SendFailed);
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(message)) => Ok(message),
+            Ok(Err(_)) => Err(AgentRequestError::Disconnected),
+            Err(_) => {
+                self.pending_requests.remove(&msg_id);
+                Err(AgentRequestError::Timeout(timeout))
+            }
+        }
+    }
+
+    /// Dispatch a response from agent `server_id` to a pending HTTP request.
+    ///
+    /// The slot is only consumed when it was registered for the same server:
+    /// correlation ids are agent-supplied, so a reply naming another server's
+    /// request is dropped and that request keeps waiting for its own agent.
+    /// Returns true if the response was delivered, false otherwise.
+    pub fn dispatch_pending_response(
+        &self,
+        server_id: &str,
+        msg_id: &str,
+        message: AgentMessage,
+    ) -> bool {
+        if let Some((_, pending)) = self
+            .pending_requests
+            .remove_if(msg_id, |_, pending| pending.server_id == server_id)
+        {
+            let _ = pending.tx.send(message);
+            return true;
+        }
+        if let Some(pending) = self.pending_requests.get(msg_id) {
+            tracing::warn!(
+                "Dropping agent response {msg_id}: server_id mismatch (pending={}, sender={server_id})",
+                pending.server_id
+            );
+        }
+        false
+    }
+
+    // --- Docker cache methods ---
+
+    pub fn update_docker_containers(&self, server_id: &str, containers: Vec<DockerContainer>) {
+        self.docker_containers
+            .insert(server_id.to_string(), containers);
+    }
+
+    pub fn get_docker_containers(&self, server_id: &str) -> Option<Vec<DockerContainer>> {
+        self.docker_containers.get(server_id).map(|v| v.clone())
+    }
+
+    pub fn update_docker_stats(&self, server_id: &str, stats: Vec<DockerContainerStats>) {
+        self.docker_stats.insert(server_id.to_string(), stats);
+    }
+
+    pub fn get_docker_stats(&self, server_id: &str) -> Option<Vec<DockerContainerStats>> {
+        self.docker_stats.get(server_id).map(|v| v.clone())
+    }
+
+    pub fn update_docker_info(&self, server_id: &str, info: DockerSystemInfo) {
+        self.docker_info.insert(server_id.to_string(), info);
+    }
+
+    pub fn get_docker_info(&self, server_id: &str) -> Option<DockerSystemInfo> {
+        self.docker_info.get(server_id).map(|v| v.clone())
+    }
+
+    pub fn clear_docker_caches(&self, server_id: &str) {
+        self.docker_containers.remove(server_id);
+        self.docker_stats.remove(server_id);
+        self.docker_info.remove(server_id);
+    }
+
+    // --- Features cache ---
+
+    pub fn update_features(&self, server_id: &str, features: Vec<String>) {
+        self.features.insert(server_id.to_string(), features);
+    }
+
+    pub fn get_features(&self, server_id: &str) -> Vec<String> {
+        self.features
+            .get(server_id)
+            .map(|features| features.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn has_feature(&self, server_id: &str, feature: &str) -> bool {
+        self.features
+            .get(server_id)
+            .is_some_and(|f| f.contains(&feature.to_string()))
+    }
+
+    // --- Capabilities cache ---
+    //
+    // Capabilities are owned by the agent host. The server keeps only the
+    // agent-reported value (live, from `SystemInfo`) plus a persisted mirror in
+    // `servers.capabilities`. There is no independent server-side capability —
+    // the server can never enable/disable a capability the agent did not.
+
+    pub fn update_agent_local_capabilities(&self, server_id: &str, caps: u32) {
+        self.agent_local_capabilities
+            .insert(server_id.to_string(), caps);
+    }
+
+    pub fn get_agent_local_capabilities(&self, server_id: &str) -> Option<u32> {
+        self.agent_local_capabilities.get(server_id).map(|cap| *cap)
+    }
+
+    /// Effective capabilities == the agent's reported capabilities. Kept as a
+    /// named accessor so call sites read intent clearly even though there is no
+    /// longer a server-side mask to intersect with.
+    pub fn get_effective_capabilities(&self, server_id: &str) -> Option<u32> {
+        self.get_agent_local_capabilities(server_id)
+    }
+
+    /// The one encoding of the capability priority rule: the live
+    /// agent-reported bitmask decides, and `mirror_caps` (the persisted
+    /// `servers.capabilities` mirror) fills the brief window before the
+    /// agent's first `SystemInfo` (or while it is offline). Every "is this
+    /// capability effective" answer must resolve through here.
+    pub fn effective_capabilities_or(&self, server_id: &str, mirror_caps: u32) -> u32 {
+        self.get_agent_local_capabilities(server_id)
+            .unwrap_or(mirror_caps)
+    }
+
+    /// Returns `Some(reason)` when `cap_bit` is NOT available on the agent, or
+    /// `None` when it is allowed. The reason is always agent-side: the server
+    /// has no say in capabilities.
+    pub fn capability_denied_reason(
+        &self,
+        server_id: &str,
+        mirror_caps: u32,
+        cap_bit: u32,
+    ) -> Option<&'static str> {
+        if has_capability(
+            self.effective_capabilities_or(server_id, mirror_caps),
+            cap_bit,
+        ) {
+            None
+        } else {
+            Some("agent_capability_disabled")
+        }
+    }
+
+    // --- Temporary grants cache ---
+
+    pub fn update_temporary_grants(&self, server_id: &str, grants: Vec<TemporaryGrant>) {
+        if grants.is_empty() {
+            self.temporary_grants.remove(server_id);
+        } else {
+            self.temporary_grants.insert(server_id.to_string(), grants);
+        }
+    }
+
+    pub fn get_temporary_grants(&self, server_id: &str) -> Vec<TemporaryGrant> {
+        self.temporary_grants
+            .get(server_id)
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn has_docker_capability(&self, server_id: &str) -> bool {
+        self.get_agent_local_capabilities(server_id)
+            .is_some_and(|cap| has_capability(cap, CAP_DOCKER))
+    }
+
+    pub async fn preload_capabilities(
+        &self,
+        db: &sea_orm::DatabaseConnection,
+    ) -> Result<(), sea_orm::DbErr> {
+        use crate::entity::server;
+        use sea_orm::{EntityTrait, QuerySelect};
+
+        let servers = server::Entity::find()
+            .select_only()
+            .column(server::Column::Id)
+            .column(server::Column::Capabilities)
+            .column(server::Column::Features)
+            .into_tuple::<(String, i32, String)>()
+            .all(db)
+            .await?;
+        for (id, caps, features_json) in servers {
+            // Seed the last-known agent capabilities from the persisted mirror
+            // so display/enforcement has a value before the agent reconnects.
+            self.agent_local_capabilities
+                .insert(id.clone(), caps as u32);
+            let features: Vec<String> = serde_json::from_str(&features_json).unwrap_or_default();
+            self.features.insert(id, features);
+        }
+        Ok(())
+    }
+
+    // --- Docker log session routing ---
+
+    pub fn add_docker_log_session(
+        &self,
+        server_id: &str,
+        session_id: String,
+        tx: mpsc::Sender<Vec<DockerLogEntry>>,
+    ) {
+        self.docker_log_sessions
+            .entry(server_id.to_string())
+            .or_default()
+            .insert(session_id, tx);
+    }
+
+    pub fn get_docker_log_session(
+        &self,
+        server_id: &str,
+        session_id: &str,
+    ) -> Option<mpsc::Sender<Vec<DockerLogEntry>>> {
+        self.docker_log_sessions
+            .get(server_id)?
+            .get(session_id)
+            .map(|tx| tx.clone())
+    }
+
+    pub fn remove_docker_log_session(&self, server_id: &str, session_id: &str) -> bool {
+        if let Some(inner) = self.docker_log_sessions.get(server_id) {
+            return inner.remove(session_id).is_some();
+        }
+        false
+    }
+
+    pub fn remove_docker_log_sessions_for_server(&self, server_id: &str) -> Vec<String> {
+        if let Some((_, inner)) = self.docker_log_sessions.remove(server_id) {
+            inner.into_iter().map(|(id, _)| id).collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Remove pending requests that have exceeded their per-entry TTL.
+    pub fn cleanup_expired_requests(&self) {
+        let now = std::time::Instant::now();
+        self.pending_requests
+            .retain(|_, pending| now.duration_since(pending.created_at) < pending.ttl);
+    }
+
+    // --- Traceroute cache ---
+
+    pub fn insert_traceroute_placeholder(&self, request_id: &str, meta: TracerouteRequestMeta) {
+        self.traceroute_results.insert(
+            request_id.to_string(),
+            TracerouteCacheEntry {
+                meta,
+                round: 0,
+                total_rounds: 0,
+                hops: vec![],
+                completed: false,
+                error: None,
+                created_at: Instant::now(),
+                completed_at: None,
+            },
+        );
+    }
+
+    /// Apply one round of trippy data to the cache. Drops the message if no
+    /// placeholder exists (e.g., cache evicted or stale agent reply).
+    /// Returns the snapshot AFTER applying, or None if dropped.
+    pub fn update_traceroute_round(
+        &self,
+        request_id: &str,
+        round: u32,
+        total_rounds: u32,
+        hops: Vec<TracerouteHop>,
+        completed: bool,
+        error: Option<String>,
+    ) -> Option<TracerouteSnapshot> {
+        let mut entry = self.traceroute_results.get_mut(request_id)?;
+        entry.round = round;
+        entry.total_rounds = total_rounds;
+        entry.hops = hops;
+        entry.completed = completed;
+        entry.error = error;
+        if completed && entry.completed_at.is_none() {
+            entry.completed_at = Some(Instant::now());
+        }
+        Some(TracerouteSnapshot {
+            server_id: entry.meta.server_id.clone(),
+            target: entry.meta.target.clone(),
+            protocol: entry.meta.protocol,
+            started_at: entry.meta.started_at,
+            round: entry.round,
+            total_rounds: entry.total_rounds,
+            completed: entry.completed,
+            hops: entry.hops.clone(),
+            error: entry.error.clone(),
+        })
+    }
+
+    pub fn get_traceroute_snapshot(&self, request_id: &str) -> Option<TracerouteSnapshot> {
+        self.traceroute_results
+            .get(request_id)
+            .map(|e| TracerouteSnapshot {
+                server_id: e.meta.server_id.clone(),
+                target: e.meta.target.clone(),
+                protocol: e.meta.protocol,
+                started_at: e.meta.started_at,
+                round: e.round,
+                total_rounds: e.total_rounds,
+                completed: e.completed,
+                hops: e.hops.clone(),
+                error: e.error.clone(),
+            })
+    }
+
+    pub fn get_traceroute_meta(&self, request_id: &str) -> Option<TracerouteRequestMeta> {
+        self.traceroute_results
+            .get(request_id)
+            .map(|e| e.meta.clone())
+    }
+
+    pub fn set_traceroute_meta_protocol(&self, request_id: &str, protocol: RecordedProtocol) {
+        if let Some(mut entry) = self.traceroute_results.get_mut(request_id) {
+            entry.meta.protocol = protocol;
+        }
+    }
+
+    /// Evict cache entries 120s after `completed_at` (or 120s after creation
+    /// for stuck/never-completed traces).
+    pub fn cleanup_traceroute_results(&self) {
+        let now = Instant::now();
+        self.traceroute_results.retain(|_, entry| {
+            let anchor = entry.completed_at.unwrap_or(entry.created_at);
+            now.duration_since(anchor).as_secs() < 120
+        });
+    }
+}
+
+/// Clean up Docker viewer tracking, features, and broadcast availability change.
+///
+/// Docker caches (containers, stats, info) and log sessions are intentionally NOT
+/// cleared here — they are already handled by `finish_connection_removal()` on the
+/// disconnect path, and by `handle_docker_unavailable()` for the DockerUnavailable
+/// message path.
+pub async fn cleanup_disconnected_docker_state(state: &AppState, server_id: &str) {
+    state.docker_viewers.remove_all_for_server(server_id);
+
+    let mut features = state.agent_manager.get_features(server_id);
+    features.retain(|feature| feature != "docker");
+    let persisted_features = features.clone();
+    state.agent_manager.update_features(server_id, features);
+
+    let _ = crate::service::server::ServerService::update_features(
+        &state.db,
+        server_id,
+        &persisted_features,
+    )
+    .await;
+
+    state
+        .agent_manager
+        .broadcast_browser(BrowserMessage::DockerAvailabilityChanged {
+            server_id: server_id.to_string(),
+            available: false,
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serverbee_common::constants::{CAP_DOCKER, CAP_EXEC, CAP_FILE};
+    use serverbee_common::protocol::{AgentMessage, RecordedProtocol};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn test_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
+    }
+
+    fn make_manager() -> (AgentManager, broadcast::Receiver<BrowserMessage>) {
+        let (tx, rx) = broadcast::channel(16);
+        (AgentManager::new(tx), rx)
+    }
+
+    fn make_manager_simple() -> AgentManager {
+        let (tx, _rx) = broadcast::channel(16);
+        AgentManager::new(tx)
+    }
+
+    #[test]
+    fn test_insert_placeholder_then_get_returns_meta() {
+        let m = make_manager_simple();
+        m.insert_traceroute_placeholder(
+            "rid",
+            TracerouteRequestMeta {
+                server_id: "s".into(),
+                target: "1.1.1.1".into(),
+                protocol: RecordedProtocol::Udp,
+                started_at: 1_716_500_000_000,
+            },
+        );
+        let snap = m.get_traceroute_snapshot("rid").expect("snapshot present");
+        assert_eq!(snap.server_id, "s");
+        assert_eq!(snap.target, "1.1.1.1");
+        assert_eq!(snap.protocol, RecordedProtocol::Udp);
+        assert_eq!(snap.started_at, 1_716_500_000_000);
+        assert!(snap.hops.is_empty());
+        assert!(!snap.completed);
+    }
+
+    #[test]
+    fn test_update_round_overwrites_hops_and_marks_completed() {
+        let m = make_manager_simple();
+        m.insert_traceroute_placeholder(
+            "rid",
+            TracerouteRequestMeta {
+                server_id: "s".into(),
+                target: "1.1.1.1".into(),
+                protocol: RecordedProtocol::Icmp,
+                started_at: 0,
+            },
+        );
+        let hop = TracerouteHop {
+            hop: 1,
+            ip: None,
+            hostname: None,
+            rtt1: None,
+            rtt2: None,
+            rtt3: None,
+            asn: None,
+            ips: vec!["10.0.0.1".into()],
+            total_sent: Some(2),
+            total_recv: Some(2),
+            loss_pct: Some(0.0),
+            best_ms: Some(1.0),
+            worst_ms: Some(1.0),
+            avg_ms: Some(1.0),
+            stddev_ms: Some(0.0),
+            jitter_ms: Some(0.0),
+        };
+        m.update_traceroute_round("rid", 1, 5, vec![hop.clone()], false, None);
+        m.update_traceroute_round("rid", 5, 5, vec![hop.clone()], true, None);
+        let snap = m.get_traceroute_snapshot("rid").unwrap();
+        assert_eq!(snap.round, 5);
+        assert_eq!(snap.total_rounds, 5);
+        assert!(snap.completed);
+        assert_eq!(snap.hops.len(), 1);
+    }
+
+    #[test]
+    fn test_update_with_missing_meta_is_dropped_silently() {
+        let m = make_manager_simple();
+        // No placeholder inserted → update should be a no-op (and not panic).
+        m.update_traceroute_round("ghost", 1, 1, vec![], true, None);
+        assert!(m.get_traceroute_snapshot("ghost").is_none());
+    }
+
+    #[test]
+    fn test_add_and_remove_connection() {
+        let (mgr, _rx) = make_manager();
+        let (tx, _) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "Server1".into(), tx, test_addr());
+        assert!(mgr.is_online("s1"));
+        assert_eq!(mgr.online_count(), 1);
+        mgr.remove_connection("s1");
+        assert!(!mgr.is_online("s1"));
+        assert_eq!(mgr.online_count(), 0);
+    }
+
+    #[test]
+    fn test_broadcast_online_offline() {
+        let (mgr, mut rx) = make_manager();
+        let (tx, _) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "Srv".into(), tx, test_addr());
+        let msg = rx.try_recv().unwrap();
+        assert!(matches!(msg, BrowserMessage::ServerOnline { server_id } if server_id == "s1"));
+        mgr.remove_connection("s1");
+        let msg = rx.try_recv().unwrap();
+        assert!(matches!(msg, BrowserMessage::ServerOffline { server_id } if server_id == "s1"));
+    }
+
+    #[test]
+    fn test_update_report_and_cache() {
+        let (mgr, _rx) = make_manager();
+        let (tx, _) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "Srv".into(), tx, test_addr());
+        let report = SystemReport {
+            cpu: 42.5,
+            mem_used: 8_000_000_000,
+            ..Default::default()
+        };
+        mgr.update_report("s1", report);
+        let cached = mgr.get_latest_report("s1").unwrap();
+        assert!((cached.cpu - 42.5).abs() < f64::EPSILON);
+        assert_eq!(cached.mem_used, 8_000_000_000);
+    }
+
+    /// Update frames are a partial projection: static facts must be absent
+    /// from the wire entirely, so clients keep their cached values on merge
+    /// instead of having them stomped by zero placeholders.
+    #[test]
+    fn test_update_report_broadcast_omits_static_fields() {
+        let (mgr, mut rx) = make_manager();
+        let (tx, _) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "Srv".into(), tx, test_addr());
+        let _ = rx.try_recv(); // ServerOnline
+
+        mgr.update_report(
+            "s1",
+            SystemReport {
+                cpu: 42.5,
+                swap_used: 1024,
+                ..Default::default()
+            },
+        );
+
+        let msg = rx.try_recv().unwrap();
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "update");
+        let server = &json["servers"][0];
+        assert_eq!(server["id"], "s1");
+        // `id` and `name` are the only keys shipped iOS decoders require; a
+        // frame missing either is dropped wholesale on old builds.
+        assert_eq!(server["name"], "Srv");
+        assert!((server["cpu"].as_f64().unwrap() - 42.5).abs() < f64::EPSILON);
+        assert_eq!(server["swap_used"], 1024);
+        for key in [
+            "mem_total",
+            "swap_total",
+            "disk_total",
+            "cpu_name",
+            "os",
+            "region",
+            "country_code",
+            "group_id",
+            "features",
+            "tags",
+            "cpu_cores",
+            "has_token",
+            "outstanding_enrollment",
+        ] {
+            assert!(
+                server.get(key).is_none(),
+                "update frame must not carry static field `{key}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_latest_reports() {
+        let (mgr, _rx) = make_manager();
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "A".into(), tx1, test_addr());
+        mgr.add_connection("s2".into(), "B".into(), tx2, test_addr());
+        mgr.update_report(
+            "s1",
+            SystemReport {
+                cpu: 10.0,
+                ..Default::default()
+            },
+        );
+        mgr.update_report(
+            "s2",
+            SystemReport {
+                cpu: 20.0,
+                ..Default::default()
+            },
+        );
+        let all = mgr.all_latest_reports();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_online_latest_reports_excludes_disconnected() {
+        let (mgr, _rx) = make_manager();
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "A".into(), tx1, test_addr());
+        mgr.add_connection("s2".into(), "B".into(), tx2, test_addr());
+        mgr.update_report("s1", SystemReport::default());
+        mgr.update_report("s2", SystemReport::default());
+
+        // s2 disconnects: its report stays cached for offline display, but the
+        // record writer must not see it (else it fabricates rows forever).
+        mgr.remove_connection("s2");
+
+        let online = mgr.online_latest_reports();
+        assert_eq!(online.len(), 1, "only the connected agent is flushed");
+        assert_eq!(online[0].0, "s1");
+
+        // Cache itself is retained so the offline server can still display its
+        // last known metrics.
+        assert!(
+            mgr.get_latest_report("s2").is_some(),
+            "disconnect keeps the display cache"
+        );
+        assert_eq!(mgr.all_latest_reports().len(), 2);
+
+        // Deleting the server row purges the cache to close the leak.
+        mgr.remove_cached_report("s2");
+        assert!(mgr.get_latest_report("s2").is_none());
+        assert_eq!(mgr.all_latest_reports().len(), 1);
+    }
+
+    #[test]
+    fn test_connected_server_ids() {
+        let (mgr, _rx) = make_manager();
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "A".into(), tx1, test_addr());
+        mgr.add_connection("s2".into(), "B".into(), tx2, test_addr());
+        let ids = mgr.connected_server_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"s1".to_string()));
+        assert!(ids.contains(&"s2".to_string()));
+    }
+
+    #[test]
+    fn test_terminal_session_lifecycle() {
+        let (mgr, _rx) = make_manager();
+        let (tx, _) = mpsc::channel(1);
+        mgr.register_terminal_session("sess1".into(), "server1".into(), tx);
+        assert!(mgr.get_terminal_session("server1", "sess1").is_some());
+        mgr.unregister_terminal_session("sess1");
+        assert!(mgr.get_terminal_session("server1", "sess1").is_none());
+    }
+
+    #[test]
+    fn test_check_offline() {
+        let (mgr, _rx) = make_manager();
+        let (tx, _) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "Old".into(), tx, test_addr());
+        let offline = mgr.check_offline(0);
+        assert_eq!(offline, vec!["s1"]);
+        assert!(!mgr.is_online("s1"));
+    }
+
+    #[test]
+    fn test_check_offline_within_threshold() {
+        let (mgr, _rx) = make_manager();
+        let (tx, _) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "Fresh".into(), tx, test_addr());
+        let offline = mgr.check_offline(9999);
+        assert!(offline.is_empty());
+        assert!(mgr.is_online("s1"));
+    }
+
+    #[test]
+    fn test_protocol_version() {
+        let (mgr, _rx) = make_manager();
+        let (tx, _) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "Srv".into(), tx, test_addr());
+        assert_eq!(mgr.get_protocol_version("s1"), Some(1));
+        mgr.set_protocol_version("s1", 2);
+        assert_eq!(mgr.get_protocol_version("s1"), Some(2));
+    }
+
+    #[test]
+    fn test_effective_capabilities_equal_agent_reported_caps() {
+        let (mgr, _rx) = make_manager();
+        // The server has no independent capability value: effective caps are
+        // exactly what the agent reports.
+        mgr.update_agent_local_capabilities("s1", CAP_FILE);
+
+        assert_eq!(mgr.get_agent_local_capabilities("s1"), Some(CAP_FILE));
+        assert_eq!(mgr.get_effective_capabilities("s1"), Some(CAP_FILE));
+    }
+
+    #[test]
+    fn test_effective_capabilities_are_none_without_agent_report() {
+        let (mgr, _rx) = make_manager();
+
+        assert_eq!(mgr.get_agent_local_capabilities("s1"), None);
+        assert_eq!(mgr.get_effective_capabilities("s1"), None);
+    }
+
+    #[test]
+    fn test_capability_denied_reason_falls_back_to_mirror_then_agent_report() {
+        let (mgr, _rx) = make_manager();
+        // No agent report yet: the persisted mirror gates the decision.
+        assert_eq!(mgr.capability_denied_reason("s1", CAP_FILE, CAP_FILE), None);
+        assert_eq!(
+            mgr.capability_denied_reason("s1", CAP_FILE, CAP_EXEC),
+            Some("agent_capability_disabled")
+        );
+        // Once the agent reports, its live value takes precedence over the
+        // mirror — the server cannot widen caps the agent disabled.
+        mgr.update_agent_local_capabilities("s1", 0);
+        assert_eq!(
+            mgr.capability_denied_reason("s1", CAP_FILE, CAP_FILE),
+            Some("agent_capability_disabled")
+        );
+    }
+
+    #[test]
+    fn test_remove_connection_clears_runtime_capability_state() {
+        let (mgr, _rx) = make_manager();
+        let (tx, _) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "Srv".into(), tx, test_addr());
+        mgr.update_agent_local_capabilities("s1", CAP_DOCKER);
+
+        assert!(mgr.has_docker_capability("s1"));
+
+        mgr.remove_connection("s1");
+
+        assert_eq!(mgr.get_agent_local_capabilities("s1"), None);
+        assert_eq!(mgr.get_effective_capabilities("s1"), None);
+        assert!(!mgr.has_docker_capability("s1"));
+    }
+
+    #[test]
+    fn test_remove_connection_clears_docker_caches() {
+        let (mgr, _rx) = make_manager();
+        let (tx, _) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "Srv".into(), tx, test_addr());
+
+        mgr.update_docker_containers("s1", vec![]);
+        mgr.update_docker_stats("s1", vec![]);
+        mgr.update_docker_info(
+            "s1",
+            DockerSystemInfo {
+                docker_version: "26.1.0".into(),
+                api_version: "1.45".into(),
+                os: "linux".into(),
+                arch: "amd64".into(),
+                containers_running: 1,
+                containers_paused: 0,
+                containers_stopped: 0,
+                images: 1,
+                memory_total: 1024,
+            },
+        );
+
+        mgr.remove_connection("s1");
+
+        assert!(mgr.get_docker_containers("s1").is_none());
+        assert!(mgr.get_docker_stats("s1").is_none());
+        assert!(mgr.get_docker_info("s1").is_none());
+    }
+
+    #[test]
+    fn test_remove_connection_if_current_does_not_remove_newer_connection() {
+        let (mgr, _rx) = make_manager();
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        let first_connection_id = mgr.add_connection("s1".into(), "Srv".into(), tx1, test_addr());
+        let second_connection_id = mgr.add_connection("s1".into(), "Srv".into(), tx2, test_addr());
+
+        mgr.update_docker_containers("s1", vec![]);
+
+        assert_ne!(first_connection_id, second_connection_id);
+        assert!(!mgr.remove_connection_if_current("s1", first_connection_id));
+        assert!(mgr.is_online("s1"));
+        assert!(mgr.get_sender("s1").is_some());
+        assert!(mgr.get_docker_containers("s1").is_some());
+    }
+
+    #[test]
+    fn test_remove_connection_if_current_scopes_temporary_grant_cleanup() {
+        let (mgr, _rx) = make_manager();
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        let first_connection_id = mgr.add_connection("s1".into(), "Srv".into(), tx1, test_addr());
+        let second_connection_id = mgr.add_connection("s1".into(), "Srv".into(), tx2, test_addr());
+        mgr.update_temporary_grants(
+            "s1",
+            vec![TemporaryGrant {
+                cap: "terminal".into(),
+                granted_at: 1,
+                expires_at: 100,
+            }],
+        );
+
+        assert!(!mgr.remove_connection_if_current("s1", first_connection_id));
+        assert_eq!(mgr.get_temporary_grants("s1").len(), 1);
+
+        assert!(mgr.remove_connection_if_current("s1", second_connection_id));
+        assert!(mgr.get_temporary_grants("s1").is_empty());
+    }
+
+    #[test]
+    fn test_stale_connection_candidates_do_not_remove_newer_connection() {
+        let (mgr, _rx) = make_manager();
+        let (tx1, _) = mpsc::channel(1);
+        let (tx2, _) = mpsc::channel(1);
+        let first_connection_id = mgr.add_connection("s1".into(), "Srv".into(), tx1, test_addr());
+
+        let stale_candidates = mgr.stale_connection_candidates(0);
+        assert_eq!(
+            stale_candidates,
+            vec![("s1".to_string(), first_connection_id)]
+        );
+
+        let second_connection_id = mgr.add_connection("s1".into(), "Srv".into(), tx2, test_addr());
+        assert_ne!(first_connection_id, second_connection_id);
+
+        assert!(!mgr.remove_connection_if_current("s1", stale_candidates[0].1));
+        assert!(!mgr.is_current_connection("s1", first_connection_id));
+        assert!(mgr.is_current_connection("s1", second_connection_id));
+        assert!(mgr.is_online("s1"));
+    }
+
+    #[test]
+    fn test_get_report_nonexistent() {
+        let (mgr, _rx) = make_manager();
+        assert!(mgr.get_latest_report("nope").is_none());
+    }
+
+    #[test]
+    fn test_cleanup_expired_requests() {
+        let (mgr, _rx) = make_manager();
+        let _rx1 = mgr.register_pending_request_with_ttl(
+            "s1",
+            "old".into(),
+            std::time::Duration::from_millis(1),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        mgr.cleanup_expired_requests();
+        let dispatched = mgr.dispatch_pending_response(
+            "s1",
+            "old",
+            AgentMessage::FileOpResult {
+                msg_id: "old".into(),
+                success: true,
+                error: None,
+            },
+        );
+        assert!(!dispatched); // should have been cleaned up
+    }
+
+    #[test]
+    fn test_pending_request_lifecycle() {
+        let (mgr, _rx) = make_manager();
+        let mut rx = mgr.register_pending_request("s1", "req1".into());
+        assert!(rx.try_recv().is_err());
+
+        let dispatched = mgr.dispatch_pending_response(
+            "s1",
+            "req1",
+            AgentMessage::FileOpResult {
+                msg_id: "req1".into(),
+                success: true,
+                error: None,
+            },
+        );
+        assert!(dispatched);
+
+        let dispatched2 = mgr.dispatch_pending_response(
+            "s1",
+            "req1",
+            AgentMessage::FileOpResult {
+                msg_id: "req1".into(),
+                success: true,
+                error: None,
+            },
+        );
+        assert!(!dispatched2);
+    }
+
+    #[test]
+    fn test_pending_response_from_other_server_is_dropped() {
+        let (mgr, _rx) = make_manager();
+        let mut rx = mgr.register_pending_request("s1", "req1".into());
+        let reply = |output: &str| AgentMessage::TaskResult {
+            msg_id: "m".into(),
+            result: serverbee_common::types::TaskResult {
+                task_id: "req1".into(),
+                output: output.into(),
+                exit_code: 0,
+            },
+        };
+
+        // A reply naming s1's request but sent by s2 must not consume the slot.
+        assert!(!mgr.dispatch_pending_response("s2", "req1", reply("forged")));
+        assert!(mgr.has_pending_request("req1"));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        // The genuine reply from s1 is still delivered afterwards.
+        assert!(mgr.dispatch_pending_response("s1", "req1", reply("genuine")));
+        match rx.try_recv() {
+            Ok(AgentMessage::TaskResult { result, .. }) => assert_eq!(result.output, "genuine"),
+            other => panic!("unexpected pending result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_terminal_session_is_bound_to_its_server() {
+        let (mgr, _rx) = make_manager();
+        let (tx, _trx) = mpsc::channel(1);
+        mgr.register_terminal_session("sess1".into(), "server1".into(), tx);
+
+        assert!(mgr.get_terminal_session("server2", "sess1").is_none());
+        mgr.unregister_agent_terminal_session("server2", "sess1");
+        assert!(mgr.get_terminal_session("server1", "sess1").is_some());
+
+        mgr.unregister_agent_terminal_session("server1", "sess1");
+        assert!(mgr.get_terminal_session("server1", "sess1").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_fails_pending_requests_for_that_server_only() {
+        let (mgr, _brx) = make_manager();
+        let (tx1, _rx1) = mpsc::channel(8);
+        let (tx2, _rx2) = mpsc::channel(8);
+        mgr.add_connection("s1".into(), "A".into(), tx1, test_addr());
+        mgr.add_connection("s2".into(), "B".into(), tx2, test_addr());
+        let mut pending_s1 = mgr.register_pending_request("s1", "req-s1".into());
+        let mut pending_s2 = mgr.register_pending_request("s2", "req-s2".into());
+
+        mgr.remove_connection("s1");
+
+        // The disconnected server's waiter fails immediately instead of
+        // hanging until its ack timeout; the other server's slot survives.
+        assert!(matches!(
+            pending_s1.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(!mgr.has_pending_request("req-s1"));
+        assert!(matches!(
+            pending_s2.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(mgr.has_pending_request("req-s2"));
+    }
+
+    #[test]
+    fn test_cleanup_expired_requests_per_entry_ttl() {
+        let (mgr, _rx) = make_manager();
+        let _rx1 = mgr.register_pending_request_with_ttl(
+            "s1",
+            "short".into(),
+            std::time::Duration::from_millis(10),
+        );
+        let _rx2 = mgr.register_pending_request_with_ttl(
+            "s1",
+            "long".into(),
+            std::time::Duration::from_secs(300),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        mgr.cleanup_expired_requests();
+        assert!(!mgr.has_pending_request("short"));
+        assert!(mgr.has_pending_request("long"));
+    }
+
+    #[tokio::test]
+    async fn test_request_offline() {
+        let (mgr, _brx) = make_manager();
+        let result = mgr
+            .request("nope", std::time::Duration::from_secs(1), |msg_id| {
+                ServerMessage::FileStat {
+                    msg_id,
+                    path: "/".into(),
+                }
+            })
+            .await;
+        assert!(matches!(result, Err(AgentRequestError::Offline)));
+    }
+
+    #[tokio::test]
+    async fn test_request_round_trip() {
+        let (mgr, _brx) = make_manager();
+        let (tx, mut agent_rx) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "Srv".into(), tx, test_addr());
+
+        let request_fut = mgr.request("s1", std::time::Duration::from_secs(5), |msg_id| {
+            ServerMessage::FileStat {
+                msg_id,
+                path: "/tmp".into(),
+            }
+        });
+        let responder_fut = async {
+            let msg = agent_rx.recv().await.expect("agent should receive request");
+            let ServerMessage::FileStat { msg_id, .. } = msg else {
+                panic!("unexpected outbound message");
+            };
+            assert!(mgr.dispatch_pending_response(
+                "s1",
+                &msg_id,
+                AgentMessage::FileOpResult {
+                    msg_id: msg_id.clone(),
+                    success: true,
+                    error: None,
+                },
+            ));
+        };
+        let (result, ()) = tokio::join!(request_fut, responder_fut);
+        match result {
+            Ok(AgentMessage::FileOpResult { success, .. }) => assert!(success),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_timeout_removes_pending_slot() {
+        let (mgr, _brx) = make_manager();
+        let (tx, _agent_rx) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "Srv".into(), tx, test_addr());
+
+        let result = mgr
+            .request_with_id(
+                "s1",
+                "corr-1".into(),
+                std::time::Duration::from_millis(10),
+                |msg_id| ServerMessage::FileStat {
+                    msg_id,
+                    path: "/".into(),
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(AgentRequestError::Timeout(_))));
+        assert!(!mgr.has_pending_request("corr-1"));
+    }
+
+    #[tokio::test]
+    async fn test_request_send_failure_removes_pending_slot() {
+        let (mgr, _brx) = make_manager();
+        let (tx, agent_rx) = mpsc::channel(1);
+        mgr.add_connection("s1".into(), "Srv".into(), tx, test_addr());
+        drop(agent_rx);
+
+        let result = mgr
+            .request_with_id(
+                "s1",
+                "corr-2".into(),
+                std::time::Duration::from_secs(1),
+                |msg_id| ServerMessage::FileStat {
+                    msg_id,
+                    path: "/".into(),
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(AgentRequestError::SendFailed)));
+        assert!(!mgr.has_pending_request("corr-2"));
+    }
+
+    #[test]
+    fn temporary_grants_round_trip_and_clear() {
+        let mgr = make_manager_simple();
+        mgr.update_temporary_grants(
+            "s1",
+            vec![serverbee_common::protocol::TemporaryGrant {
+                cap: "terminal".into(),
+                granted_at: 1,
+                expires_at: 100,
+            }],
+        );
+        assert_eq!(mgr.get_temporary_grants("s1").len(), 1);
+        assert_eq!(mgr.get_temporary_grants("s1")[0].cap, "terminal");
+        assert_eq!(mgr.get_temporary_grants("missing").len(), 0);
+        mgr.update_temporary_grants("s1", vec![]);
+        assert!(mgr.get_temporary_grants("s1").is_empty());
+    }
+}

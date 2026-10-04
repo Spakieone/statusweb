@@ -1,61 +1,68 @@
-# Rust build artifacts
-panel/agent/target/
-panel/backend/target/
-panel/cli/target/
-panel/mcp/target/
+# Dependencies
+node_modules
+.pnp
+.pnp.js
 
-# Node.js
-panel/frontend/node_modules/
-panel/frontend/dist/
-website/client/node_modules/
-website/client/dist/
-website/server/node_modules/
+# Build outputs
+dist
+build
+target
+docker-bins
+*.tsbuildinfo
 
-# Environment files
+# Environment variables
 .env
-*.env
-!api.env.example
+.env*.local
+.env.test
 
-# OS files
-.DS_Store
-Thumbs.db
-
-# Claude Code local settings
-.claude/settings.local.json
-
-# IDE
-.vscode/
-.idea/
+# IDEs and editors
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea
 *.swp
 *.swo
+*~
+.DS_Store
 
 # Logs
+logs
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
 
-# SSL/TLS material
-*.pem
-*.key
-*.cert
-*.crt
-!panel/agent/src/**
+# Turbo
+.turbo
+.nx
 
-# Databases
-*.sqlite
+# Testing
+coverage
+.nyc_output
+
+# Misc
+*.tgz
+.cache
+tmp
+temp
+
+# Runtime data
+data/
+agent.toml
 *.db
+*.db-wal
+*.db-shm
+.make-history
 
-# mdBook build output
-docs/book/
-.cargo/
-dist/
+# Git worktrees
+.worktrees
+.superpowers/
+.testloop/*
+!.testloop/reports/
 
-# Staged from scripts/install-agent.sh by the frontend prebuild step — a build
-# artefact, never a second committed copy of the installer.
-panel/frontend/public/install-agent.sh
-
-# Scratch git worktrees created by parallel agent fan-outs. They are full
-# checkouts of this repo living INSIDE it, so `git add -A` during a fan-out
-# would stage six copies of the tree. They also inflate any pin that enumerates
-# files by path rather than by `git ls-files` — s340 saw ssl-correctness report
-# 119 assertions instead of 83 because it counted each worktree's frontend as
-# another frontend. CI is unaffected (fresh checkout), local sweeps are not.
-.claude/worktrees/
+# Personal Lefthook overrides
+lefthook-local.yml

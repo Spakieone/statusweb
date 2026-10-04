@@ -1,0 +1,267 @@
+---
+title: Admin Guide
+description: User management, audit logs, remote commands, and billing management.
+icon: UserCog
+---
+
+This page covers features available only to administrators (Admin role).
+
+## User Management
+
+ServerBee supports multiple users across two roles:
+
+| Role | Permissions |
+|------|-------------|
+| **Admin** | Full management: users, server config, alert rules, notifications, audit logs, etc. |
+| **Member** | Read-only access to **all** servers' monitoring data — dashboards, server details, Ping results, security events, public IPs — plus self-service settings (own password, 2FA, API key list, mobile devices) |
+
+<Callout type="warn">
+Member visibility is fleet-wide; there is no per-server scoping. A member account is for trusted collaborators only. To show selected servers to outsiders (e.g., customers), use a [status page](/en/docs/status-page) instead.
+</Callout>
+
+### Managing Users
+
+Go to Settings → Users:
+
+- **Create user**: Enter username, password, and role
+- **Edit role**: Change a user's role (Admin/Member)
+- **Delete user**: Remove a user account (cannot delete the last Admin)
+
+### Recovering a Lost Admin Account
+
+There is no password-recovery flow (self-hosted deployments have no mail channel), and passwords are argon2 hashes that cannot be hand-edited into the database. If the only admin credential (password or 2FA device) is lost:
+
+1. Stop the server.
+2. Run `sqlite3 /path/to/serverbee.db "DELETE FROM users;"`.
+3. Start the server — with an empty users table it re-creates the `admin` user and prints a fresh one-time password banner in the startup log.
+
+This removes **all** user accounts, and their API keys stop working. Monitoring data, servers, and configuration are untouched.
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/users` | GET | List all users |
+| `/api/users` | POST | Create a user |
+| `/api/users/{id}` | GET | Get user details |
+| `/api/users/{id}` | PUT | Update user role |
+| `/api/users/{id}` | DELETE | Delete a user |
+
+## Audit Logs
+
+ServerBee automatically records audit logs for critical operations so administrators can track security events.
+
+### Recorded Events
+
+- User login (success/failure)
+- Password changes
+- 2FA enable/disable
+- Terminal connect/disconnect
+- Capability denial events
+- `capability_temporarily_granted` — a host-local temporary grant turned an off-by-default capability on
+- `capability_grant_expired` — a temporary grant reached its deadline and the capability turned back off
+- `capability_grant_revoked` — a host operator revoked a temporary grant early
+
+### Viewing Audit Logs
+
+Go to Settings → Audit Logs:
+
+- Browse all audit records (paginated)
+- View user, action type, details, IP address, and timestamp
+
+### API Endpoint
+
+```
+GET /api/audit-logs?limit=50&offset=0
+```
+
+Returns a paginated list of audit records. Each entry contains:
+
+```json
+{
+  "id": 1,
+  "user_id": "user-uuid",
+  "action": "login",
+  "detail": "Login successful",
+  "ip": "192.168.1.100",
+  "created_at": "2026-03-14T10:30:00Z"
+}
+```
+
+Audit logs are retained for 180 days by default (configurable via `retention.audit_logs_days`).
+
+## Remote Commands
+
+Administrators can dispatch commands to online servers and retrieve execution results.
+
+### Usage
+
+1. Go to Settings → Tasks
+2. Enter the command to execute
+3. Select target servers (multi-select supported)
+4. Click **Execute**
+
+### Execution Flow
+
+1. Server creates a Task record
+2. Sends the command to each target agent via WebSocket
+3. Agent executes the command, reports stdout/stderr and exit_code
+4. Results are stored in the `task_results` table
+
+### Limitations
+
+- Command execution timeout: 300 seconds
+- Requires the target agent to have the `exec` capability (CAP_EXEC), which is off by default. Capabilities are agent-owned — enable it on the agent host by adding `exec` to its `[capabilities]` allow list (or `--allow-cap exec`). See [Capabilities](/en/docs/capabilities)
+- Servers whose agent does not report CAP_EXEC receive a synthetic result: `exit_code = -2`, message: "Capability disabled"
+- Only Admin role can create tasks
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/tasks` | POST | Create and dispatch a command |
+| `/api/tasks/{id}` | GET | Get task details |
+| `/api/tasks/{id}/results` | GET | Get execution results |
+
+Request body for creating a one-shot task:
+
+```json
+{
+  "command": "uptime",
+  "server_ids": ["server-id-1", "server-id-2"],
+  "timeout": 60
+}
+```
+
+## Scheduled Tasks
+
+Scheduled tasks extend remote commands with cron-based execution, retries, and run history.
+
+### Creating a Scheduled Task
+
+1. Go to **Settings → Tasks**.
+2. Switch to the scheduled task section.
+3. Enter a name, command, cron expression, target servers, timeout, retry count, and retry interval.
+4. Save the task. Enabled tasks are registered with the server-side scheduler immediately.
+
+Scheduled tasks use the server's `scheduler.timezone` setting when calculating `next_run_at`.
+
+### Fields
+
+| Field | Description |
+|-------|-------------|
+| `name` | Display name for the scheduled task |
+| `task_type` | Use `scheduled` for cron tasks; omitted/default is `oneshot` |
+| `cron_expression` | Cron expression parsed by the server scheduler |
+| `command` | Shell command sent to each target agent |
+| `server_ids` | Target servers |
+| `timeout` | Per-attempt command timeout in seconds; default execution timeout is 300 seconds |
+| `retry_count` | Number of retry attempts after the first attempt; must be 0-10 |
+| `retry_interval` | Seconds to wait between retries; must be at least 1 |
+| `enabled` | Disabled tasks are removed from the scheduler and do not run automatically |
+
+### Execution Behavior
+
+- Each scheduled trigger creates a `run_id` used to group results from all target servers and retry attempts.
+- ServerBee prevents overlapping runs of the same scheduled task. If the previous run is still active, the new trigger is skipped.
+- `POST /api/tasks/{id}/run` starts a manual run and skips retry logic.
+- Disabling or deleting a task cancels its active run.
+- Results include an `attempt` number so you can distinguish retries.
+
+Synthetic exit codes:
+
+| Exit code | Meaning |
+|-----------|---------|
+| `-2` | `CAP_EXEC` disabled or blocked by agent-local capability policy |
+| `-3` | Server offline or dispatch failed |
+| `-4` | No agent response before timeout |
+
+### API Example
+
+```json
+{
+  "task_type": "scheduled",
+  "name": "Daily disk check",
+  "command": "df -h",
+  "server_ids": ["server-id-1"],
+  "cron_expression": "0 0 8 * * *",
+  "timeout": 120,
+  "retry_count": 2,
+  "retry_interval": 60
+}
+```
+
+Relevant endpoints:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/tasks?type=scheduled` | GET | List scheduled tasks |
+| `/api/tasks` | POST | Create one-shot or scheduled task |
+| `/api/tasks/{id}` | PUT | Update task fields, enable/disable, and scheduler registration |
+| `/api/tasks/{id}` | DELETE | Delete a task and cancel active execution |
+| `/api/tasks/{id}/run` | POST | Manually run a task |
+| `/api/tasks/{id}/results` | GET | Fetch task results grouped by task/run/attempt |
+
+## Billing Information
+
+Administrators can record billing details for each server to track VPS costs and expiration dates.
+
+### Managing Billing Info
+
+1. Go to server detail page → click Edit
+2. Fill in the "Billing" section:
+
+| Field | Description |
+|-------|-------------|
+| `price` | Price amount |
+| `billing_cycle` | Billing cycle (monthly/quarterly/yearly, etc.) |
+| `currency` | Currency unit (CNY/USD, etc.) |
+| `expired_at` | Expiration date |
+| `traffic_limit` | Traffic limit in bytes |
+
+### Expiration Alerts
+
+Create an `expiration` alert rule to receive notifications before a server expires:
+
+1. Go to Settings → Alerts
+2. Create a new rule with metric type **expiration**
+3. Set the threshold to the number of days before expiration (e.g., 7 for 7-day advance notice)
+4. Link a notification group
+
+### Traffic Alerts
+
+Use `transfer_in_cycle` / `transfer_out_cycle` / `transfer_all_cycle` alert types to monitor cumulative traffic within the current billing cycle. See [Alerts](/en/docs/alerts) for details.
+
+### Cost Insights
+
+Once `price` and `billing_cycle` are set, ServerBee derives cost-aware signals from the recorded billing inputs and the agent's reported resources, utilization, and uptime. Insights are surfaced in three places:
+
+- **Servers list cost cell** -- The `/servers` table shows each server's monthly-equivalent cost plus any advisory warnings, so cost sits next to CPU/memory/disk/traffic instead of being hidden in the edit dialog
+- **Dashboard server card** -- Each card shows a compact cost signal with a footnote summarizing burn rate. The signal is hidden when cost config is missing or invalid
+- **Per-server cost insights panel** -- The server detail page renders the full breakdown: monthly-equivalent cost, billing-cycle elapsed/remaining cost and burn percent, days remaining, normalized resource unit costs (per CPU core, per GB memory, per GB disk, per TB traffic limit), and any cost advisories
+
+#### Cost advisories
+
+Instead of a composite value score, each configured server surfaces a list of objective, per-server `advisories` -- `expired_billing`, `sleeping_money`, `idle_burn`, and `low_uptime` -- each computed without any fleet comparison. The exact triggers, input validation, and data sources live in [Cost Insights](/en/docs/cost-insights).
+
+#### API
+
+For automation, the same data is exposed read-only at `GET /api/cost/overview` (fleet-wide currency totals + per-server summaries) and `GET /api/servers/{id}/cost-insights` (full per-server breakdown). See the [API Reference](/en/docs/api-reference#authenticated-read-endpoints) for authentication details.
+
+## Agent Authority Management
+
+Admins manage onboarding and re-enrollment from **Add Server** and each Server's detail actions. Adding a Server creates its profile and one bound enrollment offer atomically. The plaintext code is displayed once; later views expose only the offer ID, prefix, expiry, and Agent Authority state.
+
+For an unclaimed Server, an admin may issue an offer. For a claimed Server, start either graceful re-enrollment (keep current authority until the replacement claim) or emergency re-enrollment (revoke and fence it immediately). Only one offer may be outstanding, and replacement or revocation targets that exact offer ID. Revoking Agent Authority is a separate action and never creates an offer implicitly.
+
+The Agent Authority history records actor, source, transition, mode, offer outcome, and before/after status without storing plaintext secrets. These events survive Server deletion for operational investigation.
+
+### Clean Up Unconnected Placeholders
+
+Abandoned onboarding can leave behind offline Server placeholders. The Servers page then shows a **Clean up unconnected** action that removes only never-initialized offline placeholders and deliberately keeps online-but-uninitialized agents.
+
+<Cards>
+  <Card title="Capabilities" href="/en/docs/capabilities" />
+  <Card title="Security" href="/en/docs/security" />
+  <Card title="Alerts" href="/en/docs/alerts" />
+</Cards>

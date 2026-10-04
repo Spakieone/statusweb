@@ -1,0 +1,68 @@
+pub mod api;
+mod static_files;
+pub mod utils;
+pub mod ws;
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::http::{HeaderValue, Request};
+use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::trace::TraceLayer;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
+
+use crate::openapi::ApiDoc;
+use crate::state::AppState;
+
+pub fn create_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .nest("/api", api::router(state.clone()))
+        // Agent WS authenticates inside the handler. Current agents use the
+        // Authorization header; the handler retains query-token compatibility
+        // for upgrades from older releases.
+        .nest("/api", ws::agent::router())
+        // Browser WS: /api/ws/servers (auth checked inside handler)
+        .nest("/api", ws::browser::router())
+        // Terminal WS: /api/ws/terminal/:server_id (auth checked inside handler)
+        .nest("/api", ws::terminal::router())
+        // Docker logs WS: /api/ws/docker/logs/:server_id (auth checked inside handler)
+        .nest("/api", ws::docker_logs::router())
+        // Unknown API paths must not fall through to the SPA index with 200.
+        .route(
+            "/api/{*path}",
+            axum::routing::any(|| async { axum::http::StatusCode::NOT_FOUND }),
+        )
+        // Swagger UI
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        // Embedded frontend: serve the rust-embed SPA assets.
+        .fallback(static_files::spa_handler)
+        // Security headers
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::HeaderName::from_static("x-permitted-cross-domain-policies"),
+            HeaderValue::from_static("none"),
+        ))
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
+                tracing::info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    path = %request.uri().path()
+                )
+            }),
+        )
+        .with_state(state)
+}

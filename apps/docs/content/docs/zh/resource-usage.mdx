@@ -1,0 +1,68 @@
+---
+title: 资源开销
+description: ServerBee Agent 与 Server 的历史 CPU、内存、磁盘和网络观测记录。
+icon: Gauge
+---
+
+本页保留 ServerBee **Agent** 与 **Server** 的历史资源观测记录，不代表当前版本的基准测试。数据库增长估算见[存储与容量规划](/zh/docs/storage-sizing)。
+
+<Callout type="info">
+来源为本页原有的 v0.9.3 测量笔记，除另有说明外，日期为 2026-05-19。原始测试日志及二进制的具体链接方式未随笔记归档。内存和 CPU 数值是历史观测，Agent 网络用量则是按协议估算。设置资源限制前，请测量实际部署版本、分配器、Agent 数量、启用的采集器和查询负载。
+</Callout>
+
+## Agent
+
+原笔记记录的环境为：4 核 AMD EPYC 7B13 / 8 GB / Ubuntu 24.04（KVM），Agent v0.9.3，采集间隔 3 秒，启用温度采集，经 HTTPS WebSocket 上报至远端 Server。
+
+| 资源 | 冷启动（约 90 秒） | 运行 8 小时后 | 范围 |
+|------|-------------------|---------------|------|
+| 内存（systemd cgroup） | ~4.3 MB，峰值 ~5.1 MB | ~27 MB，峰值 ~28 MB | Cgroup 统计，与进程 RSS 口径不同 |
+| 内存（`ps` RSS） | ~10 MB | ~34 MB | 进程驻留内存，包含共享映射 |
+| CPU | ~0.7%（单核） | ~0.5%（单核） | 当时的采集负载 |
+| 线程数 | 10 | 9–10 | 当时的 tokio runtime |
+| 二进制大小 | ~11 MB | — | 历史 linux-amd64 二进制 |
+| 网络 | 估算 ≤ 1–2 KB/s | — | 每 3 秒一条 `SystemReport` JSON，加上 ping/pong；随指标项变化 |
+
+八小时观测期间内存有所增长。仅凭这些读数无法确认长期平台，也无法区分分配器驻留与内存泄漏。主机操作系统不能证明二进制实际使用的 libc。
+
+## Server
+
+### 历史 Railway 观测
+
+原页面记录过一个接入少量 Agent、环境中存在 `MALLOC_ARENA_MAX=2` 的实例，内存约 140–170 MB；另一次运行记录为 2–3 天后达到 800 MB–1 GB。笔记没有记录具体构建链接方式、Agent 数量、查询负载或受控对比。这些历史读数不能证明环境变量导致了差异，也不构成当前版本的内存目标。
+
+### 历史自托管空载观测
+
+v0.9.3 笔记描述了同一 VPS 上近乎空载、没有活跃 Agent 连接的 Server：
+
+| 资源 | 观测值 | 范围 |
+|------|--------|------|
+| 内存（systemd cgroup） | ~15 MB，峰值 ~23.8 MB | 历史空载观测，不代表带负载的资源需求 |
+| 线程数 | 7 | 当时的 tokio runtime |
+| CPU | 近乎为 0 | 空载负载 |
+| 二进制大小 | ~47 MB | 历史 linux-amd64 二进制，内嵌前端 SPA |
+
+### 分配器与构建范围
+
+`MALLOC_ARENA_MAX` 适用于 glibc 分配器。官方 Linux release 二进制和 Docker 镜像使用 musl，该变量对其无效，因此标准部署示例不设置它。自定义 glibc 构建应根据自身测量评估分配器行为，不能套用旧 Railway 数值。
+
+另一项发布工具链回归影响了 `v1.0.0-beta.1`：记录中的空载 Server 因 Zig 0.16 内置分配器的跨线程释放行为，每天增长约 20 MB。发布工作流现已固定 Zig 0.15.2，修正随 `v1.0.0-beta.2` 发布。原因、观测范围和复现方法见[发布版本内存浸泡流程](https://github.com/ZingerLittleBee/ServerBee/blob/main/tests/manual/server-memory-soak.md)。这与上方 v0.9.3 数值是不同的观测。请使用当前版本，并在实际部署构建上排查持续增长。
+
+### 磁盘
+
+Server 磁盘占用包括 SQLite、上传的品牌图片、下载的 GeoIP/ASN MMDB 文件和配置。数据库增长取决于 Agent 数量、启用功能和保留策略。数据库估算见[存储与容量规划](/zh/docs/storage-sizing)，SQLite 之外的文件见[备份与恢复](/zh/docs/deployment#persistent-data)。除基础数据库外，还需为 WAL、突发写入及完整备份预留空间。
+
+## 注意事项
+
+- 历史空载 Server 读数不代表大量 Agent 或高查询负载下的占用。
+- Cgroup 内存与进程 RSS 统计范围不同，应按相同口径比较。
+- Agent 网络用量是估算，没有对应的抓包基准测试。
+- 八小时内读数平稳不能证明长期稳定。排查异常增长时应同时考虑负载与分配器。
+
+## 相关文档
+
+<Cards>
+  <Card title="存储与容量规划" href="/zh/docs/storage-sizing" />
+  <Card title="Agent 安装配置" href="/zh/docs/agent" />
+  <Card title="部署指南" href="/zh/docs/deployment" />
+</Cards>

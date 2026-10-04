@@ -1,0 +1,269 @@
+import { Link } from '@tanstack/react-router'
+import { ArrowDown, ArrowUp, Clock, Cpu, HardDrive, MemoryStick, Network, Sigma } from 'lucide-react'
+import type { ReactNode } from 'react'
+import { useTranslation } from 'react-i18next'
+import { CountryFlag } from '@/components/country-flag'
+import { MetricValue } from '@/components/server/metric-value'
+import { StatusDot } from '@/components/server/status-dot'
+import { deriveServerStatus } from '@/components/server/status-dot-utils'
+import { TagChipRow } from '@/components/server/tag-chip'
+import type { TrafficOverviewItem } from '@/hooks/use-traffic-overview'
+import type { ServerMetrics } from '@/lib/server-catalog'
+import { computeTrafficQuota } from '@/lib/traffic'
+import {
+  getUtilizationBarColor as getBarColor,
+  getUtilizationTextColor as getBarTextColor
+} from '@/lib/utilization-colors'
+import { cn, formatUptime } from '@/lib/utils'
+import { formatRelativeTime } from '@/lib/widget-helpers'
+
+interface MetricBarRowProps {
+  ariaLabel?: string
+  icon: ReactNode
+  pct: number
+  showPct?: boolean
+  valueClassName?: string
+}
+
+export function MetricBarRow({ icon, pct, ariaLabel, valueClassName, showPct = true }: MetricBarRowProps) {
+  const clamped = Math.min(100, Math.max(0, pct))
+  const colorBg = getBarColor(clamped)
+  const colorText = getBarTextColor(clamped)
+  // Only apply role="img" when an ariaLabel is supplied; otherwise the role would be unnamed (a11y anti-pattern).
+  const imgProps = ariaLabel ? { role: 'img' as const, 'aria-label': ariaLabel } : {}
+  return (
+    <div className="flex items-center gap-1.5" {...imgProps}>
+      {icon !== null && <span className="inline-flex size-3.5 flex-none text-muted-foreground">{icon}</span>}
+      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+        <div
+          className={cn('h-full rounded-full', colorBg)}
+          data-slot="metric-bar-fill"
+          style={{ width: `${clamped}%` }}
+        />
+      </div>
+      {showPct && (
+        <span className={cn('w-10 text-right font-mono font-semibold text-xs tabular-nums', colorText, valueClassName)}>
+          {Math.round(clamped)}%
+        </span>
+      )}
+    </div>
+  )
+}
+
+// Back-compat: MiniBar keeps its existing public signature but now delegates to MetricBarRow.
+export function MiniBar({ pct, sub }: { pct: number; sub?: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <MetricBarRow icon={null} pct={pct} />
+      {sub !== undefined && <div className="text-muted-foreground text-xs">{sub}</div>}
+    </div>
+  )
+}
+
+export function PositionIndicator({ pct }: { pct: number }) {
+  const clamped = Math.min(100, Math.max(0, pct))
+  const barColor = getBarColor(clamped)
+  return (
+    <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted" data-slot="position-indicator">
+      <div
+        className={cn('h-full rounded-full', barColor)}
+        data-slot="position-indicator-fill"
+        style={{ width: `${clamped}%` }}
+      />
+    </div>
+  )
+}
+
+export function CpuCell({ server }: { server: ServerMetrics }) {
+  const { t } = useTranslation(['servers'])
+  if (!server.online) {
+    return <span className="text-muted-foreground">—</span>
+  }
+  const cores = server.cpu_cores ?? null
+  const pct = Math.round(Math.min(100, Math.max(0, server.cpu)))
+  const pctColor = getBarTextColor(pct)
+  return (
+    <div className="flex max-w-[160px] flex-col gap-0.5">
+      <div className="flex h-4 items-center gap-1.5 font-mono text-[10px] text-muted-foreground tabular-nums">
+        <Cpu aria-hidden="true" className="size-3.5 flex-none text-muted-foreground" />
+        <span>
+          {cores != null && `${cores} · `}
+          {t('card_load')} {server.load1.toFixed(2)}
+        </span>
+        <span className={cn('ml-auto font-semibold', pctColor)}>{pct}%</span>
+      </div>
+      <div className="flex h-4 items-center">
+        <PositionIndicator pct={pct} />
+      </div>
+    </div>
+  )
+}
+export function MemoryCell({ server }: { server: ServerMetrics }) {
+  if (!server.online) {
+    return <span className="text-muted-foreground">—</span>
+  }
+  const pct = server.mem_total > 0 ? (server.mem_used / server.mem_total) * 100 : 0
+  const roundedPct = Math.round(Math.min(100, Math.max(0, pct)))
+  const pctColor = getBarTextColor(roundedPct)
+  return (
+    <div className="flex max-w-[160px] flex-col gap-0.5">
+      <div className="flex h-4 items-center gap-1.5 font-mono text-[10px] text-muted-foreground tabular-nums">
+        <MemoryStick aria-hidden="true" className="size-3.5 flex-none text-muted-foreground" />
+        <span>
+          <MetricValue kind="bytes" value={server.mem_used} /> / <MetricValue kind="bytes" value={server.mem_total} />
+        </span>
+        <span className={cn('ml-auto font-semibold', pctColor)}>{roundedPct}%</span>
+      </div>
+      <div className="flex h-4 items-center">
+        <PositionIndicator pct={pct} />
+      </div>
+    </div>
+  )
+}
+export function DiskCell({ server }: { server: ServerMetrics }) {
+  if (!server.online) {
+    return <span className="text-muted-foreground">—</span>
+  }
+  return (
+    <div className="grid grid-cols-[max-content_max-content] gap-x-1.5 gap-y-0.5 font-mono text-[10px] text-muted-foreground tabular-nums">
+      <span className="flex h-4 items-center gap-1">
+        <HardDrive aria-hidden="true" className="size-3.5 flex-none text-muted-foreground" />
+        <MetricValue kind="bytes" value={server.disk_used} />
+      </span>
+      <span className="flex h-4 items-center gap-1">
+        <Sigma aria-hidden="true" className="size-3.5 flex-none text-muted-foreground" />
+        <MetricValue kind="bytes" value={server.disk_total} />
+      </span>
+      <span className="flex h-4 items-center gap-1">
+        <span className="inline-flex size-3.5 flex-none items-center justify-center rounded-sm bg-muted font-semibold text-foreground">
+          R
+        </span>
+        <MetricValue kind="speed" value={server.disk_read_bytes_per_sec} />
+      </span>
+      <span className="flex h-4 items-center gap-1">
+        <span className="inline-flex size-3.5 flex-none items-center justify-center rounded-sm bg-muted font-semibold text-foreground">
+          W
+        </span>
+        <MetricValue kind="speed" value={server.disk_write_bytes_per_sec} />
+      </span>
+    </div>
+  )
+}
+interface NetworkCellProps {
+  entry: TrafficOverviewItem | undefined
+  server: ServerMetrics
+}
+
+export function NetworkCell({ server, entry }: NetworkCellProps) {
+  const { used, limit } = computeTrafficQuota({
+    entry,
+    netInTransfer: server.net_in_transfer,
+    netOutTransfer: server.net_out_transfer
+  })
+  return (
+    <div className="grid grid-cols-[max-content_max-content] gap-x-1.5 gap-y-0.5 font-mono text-[10px] text-muted-foreground tabular-nums">
+      <span className="flex h-4 items-center gap-1">
+        <Network aria-hidden="true" className="size-3.5 flex-none text-muted-foreground" />
+        <MetricValue kind="bytes" value={used} />
+      </span>
+      <span className="flex h-4 items-center gap-1">
+        <Sigma aria-hidden="true" className="size-3.5 flex-none text-muted-foreground" />
+        <MetricValue kind="bytes" value={limit} />
+      </span>
+      {server.online && (
+        <>
+          <span className="flex h-4 items-center gap-1">
+            <span className="inline-flex size-3.5 flex-none items-center justify-center rounded-sm bg-muted text-foreground">
+              <ArrowDown aria-hidden="true" className="size-2.5" />
+            </span>
+            <MetricValue kind="speed" value={server.net_in_speed} />
+          </span>
+          <span className="flex h-4 items-center gap-1">
+            <span className="inline-flex size-3.5 flex-none items-center justify-center rounded-sm bg-muted text-foreground">
+              <ArrowUp aria-hidden="true" className="size-2.5" />
+            </span>
+            <MetricValue kind="speed" value={server.net_out_speed} />
+          </span>
+        </>
+      )}
+    </div>
+  )
+}
+
+function osEmoji(os: string | null): string {
+  if (!os) {
+    return ''
+  }
+  const l = os.toLowerCase()
+  if (l.includes('ubuntu') || l.includes('debian') || l.includes('linux')) {
+    return '🐧'
+  }
+  if (l.includes('windows')) {
+    return '🪟'
+  }
+  if (l.includes('macos') || l.includes('darwin')) {
+    return '🍎'
+  }
+  if (l.includes('freebsd') || l.includes('openbsd')) {
+    return '😈'
+  }
+  return ''
+}
+
+export function UptimeCell({ server }: { server: ServerMetrics }) {
+  const { t } = useTranslation(['servers'])
+  const emoji = osEmoji(server.os)
+  if (!server.online) {
+    return (
+      <div className="flex flex-col">
+        <span className="text-muted-foreground text-xs">{t('offline_label')}</span>
+        <span className="font-mono text-[10px] text-muted-foreground tabular-nums">
+          {t('last_seen_ago', { time: formatRelativeTime(server.last_active) })}
+        </span>
+      </div>
+    )
+  }
+  return (
+    <div className="flex flex-col">
+      <span className="inline-flex items-center gap-1 font-mono text-muted-foreground text-xs tabular-nums">
+        <Clock aria-hidden="true" className="size-3" />
+        {formatUptime(server.uptime)}
+      </span>
+      {server.os && (
+        <span className="font-mono text-[10px] text-muted-foreground tabular-nums">
+          {emoji && (
+            <span aria-hidden="true" className="mr-1">
+              {emoji}
+            </span>
+          )}
+          {server.os}
+        </span>
+      )}
+    </div>
+  )
+}
+
+export function NameCell({ server, rightSlot }: { rightSlot?: ReactNode; server: ServerMetrics }) {
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      <StatusDot className="flex-none" status={deriveServerStatus(server)} />
+      <div className="flex min-w-0 flex-col">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <Link
+            className="group/link flex min-w-0 items-center gap-1.5"
+            params={{ id: server.id }}
+            search={{ range: 'realtime' }}
+            to="/servers/$id"
+          >
+            <CountryFlag className="text-xs" code={server.country_code} />
+            <span className="truncate font-medium group-hover/link:underline" title={server.name}>
+              {server.name}
+            </span>
+          </Link>
+          {rightSlot}
+        </div>
+        <TagChipRow tags={server.tags} />
+      </div>
+    </div>
+  )
+}

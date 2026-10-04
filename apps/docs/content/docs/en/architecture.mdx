@@ -1,0 +1,429 @@
+---
+title: Architecture
+description: Technical overview of ServerBee's system design, components, and protocols.
+icon: Boxes
+---
+
+This page describes ServerBee's internal architecture for developers and operators who want to understand how the system works under the hood. ServerBee follows a hub-and-spoke design: a central **Server** receives metrics from distributed **Agents** over WebSocket, stores them in SQLite, and serves a React SPA dashboard.
+
+## System Overview
+
+```
++--------------------------------------------------+
+|              ServerBee Dashboard                  |
+|                                                   |
+|  +---------------------------------------------+ |
+|  | Frontend (React SPA, embedded via rust-embed)| |
+|  | React 19, TanStack Router/Query             | |
+|  | shadcn/ui, Tailwind CSS v4, Bklit charts        | |
+|  +---------------------------------------------+ |
+|  +---------------------------------------------+ |
+|  | Server (Rust)                                | |
+|  | Axum Router                                  | |
+|  |  +-- REST API handlers                      | |
+|  |  +-- WebSocket: Agent + Browser + Terminal   | |
+|  |  +-- Static files (rust-embed)              | |
+|  | Service Layer                                | |
+|  |  +-- AgentManager (connections/state)        | |
+|  |  +-- AlertService (rule evaluation)          | |
+|  |  +-- RecordService (metrics/aggregation)     | |
+|  |  +-- NotificationService (dispatch)          | |
+|  | Entity Layer (sea-orm)                       | |
+|  |  +-- SQLite                                  | |
+|  +---------------------------------------------+ |
++--------------------------+-----------------------+
+                           | WebSocket (JSON)
++--------------------------v-----------------------+
+|              ServerBee Agent (Rust)               |
+|  common crate (shared types/protocol)             |
+|  +-- Collector (system metrics)                   |
+|  +-- Reporter (WebSocket + reconnect)             |
+|  +-- Pinger (ICMP/TCP/HTTP probes)                |
+|  +-- TerminalManager (PTY sessions)               |
++---------------------------------------------------+
+```
+
+## Component Roles
+
+### Server (`crates/server`)
+
+The central hub that:
+
+- Serves the web dashboard (React SPA embedded via `rust-embed`)
+- Exposes REST API endpoints for CRUD operations
+- Manages WebSocket connections from agents and browsers
+- Stores all data in SQLite
+- Runs background tasks (record writing, aggregation, cleanup, alerting, offline detection)
+- Dispatches notifications
+
+Its main service modules are:
+
+| Module | Responsibility |
+|--------|----------------|
+| Axum Router | Routes and handles HTTP/WebSocket requests |
+| AgentManager | Manages agent WebSocket connections, the live metric cache, and update broadcasting |
+| AuthService | User login (argon2), session management, API key verification |
+| ServerService | Server CRUD, grouping, tagging, ordering |
+| RecordService | Metric writes, history queries, hourly aggregation, retention cleanup |
+| AlertService | Alert rule CRUD, periodic evaluation, notification dispatch |
+| NotificationService | Notification channel management and message dispatch (Webhook/Telegram/Email/Bark) |
+| PingService | Ping task CRUD, task assignment, result storage |
+| TaskService | Remote command dispatch, result queries |
+| ConfigService | System configuration read/write (key-value store) |
+| GeoIpService | IP geolocation lookup (MaxMind MMDB) |
+| UserService | User CRUD and role management |
+
+### Agent (`crates/agent`)
+
+A lightweight daemon deployed on each monitored server that:
+
+- Collects system metrics using the `sysinfo` crate
+- Reports metrics to the server over WebSocket every N seconds
+- Runs ping probes as instructed by the server
+- Provides PTY terminal sessions for remote shell access
+- Executes remote commands dispatched by the server
+- Supports self-upgrade when instructed
+
+Its main modules are:
+
+| Module | Responsibility |
+|--------|----------------|
+| Collector | Periodically collects CPU, memory, disk, network, and other metrics via `sysinfo` |
+| Reporter | Manages the WebSocket connection, reports metrics, handles server commands, reconnects on disconnect |
+| PingManager | Runs scheduled ICMP/TCP/HTTP ping tasks dispatched by the server |
+| NetworkProber | Runs scheduled network quality probes and reports aggregate results |
+| Terminal | Manages PTY terminal sessions and forwards terminal I/O |
+
+### Common (`crates/common`)
+
+A shared library crate containing the types and protocol shared between the agent and server:
+
+- **Protocol definitions** -- `AgentMessage`, `ServerMessage`, `BrowserMessage` enums
+- **Data types** -- `SystemInfo`, `SystemReport`, `GpuReport`, `PingResult`, `ServerStatus`, etc.
+- **Constants** -- Protocol version, default ports, timeouts, retention periods, alert parameters
+
+### Frontend (`apps/web`)
+
+A React 19 single-page application, embedded into the server binary via `rust-embed` after build:
+
+- **Routing** -- TanStack Router (file-based)
+- **Data fetching** -- TanStack Query for REST, native WebSocket for real-time updates (sharing the same cache)
+- **UI components** -- shadcn/ui with the base-nova theme
+- **Styling** -- Tailwind CSS v4
+- **Charts** -- Bklit chart primitives (visx) behind shared wrappers in `components/charts/`
+- **Terminal** -- xterm.js web terminal emulator
+- **Build** -- Vite 7
+
+The built frontend is embedded into the server binary at compile time, so there is nothing to deploy separately.
+
+## Communication Protocol
+
+Agent reporting and control traffic uses WebSocket. Browsers use REST for initial data, history, and management operations, plus WebSocket for real-time updates. WebSocket application messages are JSON text frames; terminal I/O data is carried inside the message's `data` field, base64-encoded. The current Agent protocol version is `6`, sent in the `Welcome` message on connect.
+
+The agent connects to `ws://<server>/api/agent/ws` and authenticates with `Authorization: Bearer <agent_token>`. The Server temporarily accepts the legacy `?token=` form so older Agents can reconnect and upgrade.
+
+### Agent to Server (`AgentMessage`)
+
+| Message Type | Purpose | Needs ACK |
+|-------------|---------|-----------|
+| `SystemInfo` | Static system information, sent once on connect/reconnect | Yes |
+| `Report` | Periodic metric report (every N seconds) | No |
+| `PingResult` | Result of a ping probe | No |
+| `TaskResult` | Output from a remote command execution | Yes |
+| `TerminalOutput` | PTY output data (base64-encoded) | No |
+| `TerminalStarted` | Confirmation that a PTY session was created | No |
+| `TerminalError` | Error from a terminal session | No |
+| `Pong` | Protocol-level heartbeat response | No |
+| `DockerInfo` | Docker system info and feature report | No |
+| `DockerContainers` | Current container list with status | No |
+| `DockerStats` | Container resource usage statistics | No |
+| `DockerLog` | Container log entries (batched) | No |
+| `DockerEvent` | Container lifecycle event | No |
+
+### Server to Agent (`ServerMessage`)
+
+| Message Type | Purpose |
+|-------------|---------|
+| `Welcome` | Sent on connect with server_id, protocol_version, report_interval |
+| `Ack` | Acknowledges a received message (by msg_id) |
+| `PingTasksSync` | Sync all assigned ping tasks to the agent |
+| `Exec` | Execute a shell command on the agent |
+| `TerminalOpen` | Request to open a new PTY session |
+| `TerminalInput` | Forward keyboard input to a PTY session |
+| `TerminalResize` | Resize a PTY session |
+| `TerminalClose` | Close a PTY session |
+| `Ping` | Protocol-level heartbeat (every 30s) |
+| `Upgrade` | Instruct the agent to self-upgrade |
+| `DockerLogsStart` | Start streaming logs for a container |
+| `DockerLogsStop` | Stop streaming logs |
+| `DockerAction` | Execute container action (start/stop/restart/remove) |
+
+### Server to Browser (`BrowserMessage`)
+
+Browsers obtain data two ways: the REST API for initial load and historical queries, and a WebSocket at `ws://<server>/api/ws/servers` for real-time pushes. The WebSocket is one-way (Server -> Browser). REST results and WebSocket messages are projected into the same live server catalog so views stay current.
+
+| Message Type | Purpose |
+|-------------|---------|
+| `FullSync` | Complete state of all servers (sent on browser connect) |
+| `Update` | Incremental update with latest metrics for changed servers |
+| `ServerOnline` | Notification that a server came online |
+| `ServerOffline` | Notification that a server went offline |
+| `DockerUpdate` | Docker container and stats update |
+| `DockerEvent` | Docker container lifecycle event |
+| `DockerAvailabilityChanged` | Docker daemon availability changed |
+
+### Handshake
+
+```
+Agent                              Server
+  |                                  |
+  |--- WebSocket connect + token --->|
+  |                                  | verify token, look up server
+  |<-- Welcome { server_id,         |
+  |     protocol_version: 6,        |
+  |     report_interval: 3 } -------|
+  |                                  |
+  |--- SystemInfo { cpu_name,       |  static info on connect/reconnect
+  |     os, mem_total, ... } ------>|
+  |<-- Ack { msg_id } -------------|
+  |                                  |
+  |--- Report (every 3s) ---------->|  periodic metric report
+```
+
+### Message Size Limits
+
+| Limit | Maximum Size |
+|-------|--------------|
+| WebSocket message size | 1 MB |
+| Command output | 512 KB |
+| Command length | 8 KB |
+
+### Terminal Data Transport
+
+Terminal traffic uses the same JSON text protocol as the rest of the system, relayed through the server:
+
+```
+Browser <--JSON WebSocket--> Server <--JSON WebSocket--> Agent (PTY)
+```
+
+The raw PTY byte stream is base64-encoded into the `data` field of a JSON message, because terminal output is not UTF-8 safe.
+
+`Browser <-> Server` messages (all JSON text):
+
+- Browser -> Server: `{ "type": "input", "data": <base64> }`, `{ "type": "resize", "rows": <n>, "cols": <n> }`
+- Server -> Browser: `{ "type": "session", "session_id": <id> }`, `{ "type": "started" }`, `{ "type": "output", "data": <base64> }`, `{ "type": "error", "error": <message> }`
+
+`Server <-> Agent` messages reuse the agent protocol:
+
+- Server -> Agent: `ServerMessage::TerminalOpen`, `TerminalInput` (`data` base64), `TerminalResize`, `TerminalClose`
+- Agent -> Server: `AgentMessage::TerminalStarted`, `TerminalOutput` (`data` base64), `TerminalError`
+
+## Database Design
+
+ServerBee uses SQLite (WAL mode), managed through sea-orm. The representative tables below cover the core schema, grouped by category.
+
+### Authentication
+
+| Table | Purpose |
+|-------|---------|
+| `users` | User accounts (id, username, argon2 password hash, role, TOTP secret) |
+| `sessions` | Active login sessions (token, IP, user agent, expiry) |
+| `api_keys` | API key credentials (argon2-hashed key, prefix, last used) |
+| `oauth_accounts` | Linked OAuth provider accounts |
+
+### Server Management
+
+| Table | Purpose |
+|-------|---------|
+| `servers` | Registered servers (token hash, system info, metadata, pricing, group assignment) |
+| `server_groups` | Logical groups for organizing servers |
+| `server_tags` | Tag labels attached to servers (many-to-many) |
+| `configs` | Key-value configuration store (runtime settings, etc.) |
+
+### Monitoring Data
+
+| Table | Purpose |
+|-------|---------|
+| `records` | Raw metric records, one row per server per minute (composite index server_id + time) |
+| `records_hourly` | Hourly aggregated metric averages (same shape as `records`) |
+| `gpu_records` | Per-GPU device metrics (device index, name, memory, utilization, temp) |
+| `ping_records` | Ping probe results (latency, success, error; composite index task_id + server_id + time) |
+| `ping_tasks` | Ping task definitions (probe type, target, interval, assigned servers) |
+| `traffic_hourly` | Hourly traffic byte counters (in/out) per server |
+| `traffic_daily` | Daily traffic byte counters (in/out) per server |
+| `traffic_state` | Last-known cumulative traffic counters for delta calculation |
+| `docker_events` | Docker container lifecycle events (start/stop/die/create) |
+
+### Alerting & Operations
+
+| Table | Purpose |
+|-------|---------|
+| `alert_rules` | Alert rule definitions (conditions, cover type, trigger mode) |
+| `alert_states` | Current alert state per rule/server pair (composite unique index rule_id + server_id) |
+| `notifications` | Notification channel configs (webhook, telegram, bark, email) |
+| `notification_groups` | Groups of notification channels |
+| `tasks` | Remote command tasks (command, target servers, created by) |
+| `task_results` | Command execution results (output, exit code) |
+| `audit_logs` | User action audit trail (action, detail, IP) |
+
+All tables use UTC timestamps. IDs are UUIDs (string type) for most entities, and auto-incrementing integers for high-volume records.
+
+### SQLite Configuration
+
+- **WAL mode** -- `PRAGMA journal_mode=WAL` runs on startup to improve concurrent read performance.
+- **Busy timeout** -- 5000ms; writers wait automatically on write contention.
+- **Synchronous mode** -- `PRAGMA synchronous=NORMAL`.
+- **Connection pool** -- Up to 10 connections, primarily for concurrent reads.
+
+## Background Tasks
+
+The server spawns several long-running background tasks via `tokio::spawn`:
+
+| Task | Interval | Description |
+|------|----------|-------------|
+| **RecordWriter** | 60s | Flushes the latest cached agent reports from memory to the `records` table |
+| **AlertEvaluator** | 60s (after record write) | Evaluates all enabled alert rules against current data and dispatches notifications |
+| **OfflineChecker** | 10s | Scans agent connection state and triggers offline events/alerts for agents with no heartbeat in 30 seconds |
+| **Aggregator** | 1 hour | Computes hourly averages from raw `records` into `records_hourly` for long-term storage |
+| **Cleanup** | 1 hour (after aggregation) | Deletes records, GPU data, ping records, and audit logs older than their retention periods |
+| **PingTasksSync** | On config change | Pushes `PingTasksSync` to the relevant agents |
+| **SessionCleaner** | 1 hour | Removes expired user login sessions |
+
+**Ordering guarantees:**
+
+- Hourly tasks: aggregation -> cleanup (aggregate before cleaning so no long-term data is lost).
+- Minute tasks: record write -> alert evaluation (so evaluation reads the freshly written data).
+
+## Security Model
+
+### Authentication Paths
+
+User-facing REST and WebSocket requests resolve a user from a session cookie, API key, or Bearer session token. The authorization check then uses that user's current role. Agent WebSocket connections use a separate per-Agent run token.
+
+```
+Request arrives
+  +-- Cookie: session_token=xxx         --> Session auth (browser)
+  +-- Header: X-API-Key: serverbee_xxx  --> API key auth (automation)
+  +-- Header: Authorization: Bearer xxx  --> Session auth (mobile)
+
+Agent WebSocket connects
+  +-- Header: Authorization: Bearer xxx  --> Agent run-token auth
+  +-- Query: ?token=xxx                  --> Legacy Agent compatibility only
+```
+
+#### Session-based (browser)
+
+- User logs in with username/password, verified with argon2.
+- A random 32-byte token (base64url-encoded) is generated.
+- The token is stored in the `sessions` table with an HttpOnly + SameSite=Strict cookie.
+- Sliding expiry: each valid request extends `expires_at` (default TTL 24 hours).
+
+#### API Key (automation)
+
+- Admin users can create named API keys for programmatic access.
+- Key format: `serverbee_` + 32 random bytes (base64url).
+- Keys are hashed with argon2; an 8-character plaintext prefix is stored for identification.
+- On verification, the prefix narrows the lookup, then argon2 verifies the key.
+- A key authenticates as its owning user and inherits that user's current `admin` or `member` role. An API key is a credential type, not a third role.
+
+#### Agent Token (agents)
+
+- An enrollment offer is bound to one Server, single-use, and short-lived. Its lifecycle is owned by the Agent Authority module.
+- Before claiming an offer, the Agent generates and persists its run token, then submits it as `proposed_run_token`. The Server never generates or returns that token.
+- The run token is hashed with argon2 and stored in the `servers` table; only the Agent retains the plaintext.
+- Agents authenticate with the `Authorization: Bearer <agent_token>` header. Current Agents never place the raw token in the URI; query-token authentication remains a deprecated compatibility path for older releases.
+- WebSocket admission has two stages: preflight validation before the HTTP upgrade, then final validation while holding the Server lifecycle lock. Authority transitions and frame dispatch share that lock, so a revoked or replaced connection cannot race through after fencing.
+- Every authority/offer transition appends a secret-free event. Events retain a snapshot of the Server identity and survive Server deletion.
+
+### Role-Based Access
+
+Two user roles exist: `admin` (full access) and `member` (read-only dashboard access). Session cookies, Bearer session tokens, and API keys are credentials for one of these users; they do not define additional roles.
+
+Browser-facing WebSockets re-check the persisted session or API key and the user's role while connected. Logout, API-key deletion, password-reset session revocation, account deletion, or a role change closes the existing socket within two seconds instead of preserving handshake-time privileges.
+
+| Resource | Admin user | Member user | Agent |
+|----------|------------|-------------|-------|
+| Server list/detail | Yes | Yes (limited) | - |
+| Server create/update/delete | Yes | No | - |
+| Alert rule management | Yes | No | - |
+| Notification config | Yes | No | - |
+| User management | Yes | No | - |
+| System settings | Yes | No | - |
+| Real-time server updates | Yes | Yes | - |
+| File Manager | Yes | No | - |
+| Web terminal | Yes | No | - |
+| Remote commands | Yes | No | - |
+| Metric reporting | - | - | Yes |
+
+### OAuth
+
+OAuth login is supported for GitHub, Google, and generic OIDC providers. The `allow_registration` flag controls whether new users are automatically created on first OAuth login.
+
+### Rate Limiting
+
+Implemented as `tower` middleware with an in-memory map of IP to counter. Login and agent registration endpoints are rate-limited per IP to prevent brute-force attacks.
+
+| Endpoint | Limit |
+|----------|-------|
+| `POST /api/auth/login` | 5 attempts per IP within a 15-minute window |
+| `POST /api/agent/register` | 10 attempts per IP within a 15-minute window |
+
+Exceeding a limit returns `429 Too Many Requests`. Admins can clear an active window from Settings → Rate limits.
+
+### TOTP
+
+Users can enable TOTP-based two-factor authentication for additional security.
+
+## Workspace Structure
+
+The project uses a Cargo workspace for the Rust crates. The frontend is a separate Bun/Node project under `apps/web/`.
+
+```
+ServerBee/
+  Cargo.toml                    # Workspace root
+  crates/
+    common/                     # Shared: protocol, data types, constants
+      src/
+        lib.rs
+        protocol.rs             # Agent <-> Server message types
+        types.rs                # SystemReport, GpuInfo, etc.
+        constants.rs            # Protocol version, default values
+    server/                     # Server binary (Axum, sea-orm, background tasks)
+      src/
+        main.rs
+        config.rs
+        state.rs                # AppState
+        router/                 # REST API + WebSocket handlers
+        service/                # Business logic
+        entity/                 # sea-orm entities (one module per table)
+        migration/              # Database migrations
+        middleware/             # Auth, logging middleware
+    agent/                      # Agent binary (collection, reporting, control)
+      src/
+        main.rs
+        config.rs
+        collector/              # Per-metric collectors
+        reporter/               # WebSocket reporting, reconnect, commands, and file operations
+        pinger.rs                # ICMP/TCP/HTTP ping tasks
+        probe_utils.rs           # Shared probe validation and networking helpers
+        network_prober.rs        # Scheduled network probes
+        traceroute.rs            # Traceroute execution
+        terminal.rs             # PTY terminal
+        file_manager.rs          # Restricted remote file operations
+        docker/                  # Docker inspection, actions, and log streaming
+        security/                # Host security event detection
+        firewall/                # Firewall block management
+        ip_quality/              # IP quality checks
+        upgrade.rs               # Self-upgrade coordinator
+        upgrade/                 # Transactional self-upgrade support
+  apps/
+    web/                        # React frontend (Vite, TanStack, shadcn/ui)
+    docs/                       # Documentation site (TanStack Start + Fumadocs)
+  docs/                         # Design documents and plans
+```
+
+<Cards>
+  <Card title="Deployment" href="/en/docs/deployment" />
+  <Card title="Configuration" href="/en/docs/configuration" />
+  <Card title="Monitoring" href="/en/docs/monitoring" />
+</Cards>

@@ -1,0 +1,321 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use dashmap::DashMap;
+use sea_orm::DatabaseConnection;
+use serverbee_common::protocol::BrowserMessage;
+use tokio::sync::broadcast;
+
+use crate::config::AppConfig;
+use crate::error::AppError;
+use crate::service::agent_authority::AgentAuthority;
+use crate::service::agent_manager::AgentManager;
+use crate::service::agent_reconcile::AgentDesiredStateReconciler;
+use crate::service::alert::AlertStateManager;
+use crate::service::asn::AsnService;
+use crate::service::docker_viewer::DockerViewerTracker;
+use crate::service::file_transfer::FileTransferManager;
+use crate::service::firewall::FirewallService;
+use crate::service::geoip::GeoIpService;
+use crate::service::high_risk_audit::{
+    DockerLogsAuditContext, ExecAuditContext, TerminalAuditContext,
+};
+use crate::service::monitor_check::MonitorCheckRunner;
+use crate::service::security::SecurityService;
+use crate::service::server_onboarding::ServerOnboarding;
+use crate::service::task_scheduler::TaskScheduler;
+use crate::service::upgrade_release::UpgradeReleaseService;
+use crate::service::upgrade_tracker::UpgradeJobTracker;
+
+/// Pending TOTP setup data, keyed by user_id.
+pub struct PendingTotp {
+    pub secret: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// In-flight OAuth login flow state, keyed by the CSRF `state` token.
+///
+/// `nonce` is mirrored into a short-lived HttpOnly pre-auth cookie set on the
+/// authorize redirect and re-checked on the callback, binding the flow to the
+/// browser that initiated it (defends against login CSRF / session fixation).
+pub struct OAuthFlowState {
+    pub provider: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub nonce: String,
+    pub pkce_verifier: String,
+}
+
+// Manual `Debug` that redacts the browser-binding nonce and the PKCE verifier so
+// these single-use secrets never land in logs or panic messages. (`Debug` is
+// still required because `Result::unwrap_err` formats the Ok value in tests.)
+impl std::fmt::Debug for OAuthFlowState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthFlowState")
+            .field("provider", &self.provider)
+            .field("created_at", &self.created_at)
+            .field("nonce", &"<redacted>")
+            .field("pkce_verifier", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Pending mobile pairing code, keyed by code string.
+pub struct PendingPair {
+    pub user_id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Rate limiter entry: (count, window_start).
+pub struct RateLimitEntry {
+    pub count: u32,
+    pub window_start: chrono::DateTime<chrono::Utc>,
+}
+
+pub struct AppState {
+    pub db: DatabaseConnection,
+    pub agent_manager: Arc<AgentManager>,
+    pub agent_authority: Arc<AgentAuthority>,
+    pub server_onboarding: Arc<ServerOnboarding>,
+    pub browser_tx: broadcast::Sender<BrowserMessage>,
+    pub config: AppConfig,
+    pub upgrade_tracker: UpgradeJobTracker,
+    pub upgrade_release_service: UpgradeReleaseService,
+    pub geoip: Arc<std::sync::RwLock<Option<GeoIpService>>>,
+    pub geoip_downloading: AtomicBool,
+    pub asn: Arc<std::sync::RwLock<Option<AsnService>>>,
+    pub asn_downloading: AtomicBool,
+    /// In-flight OAuth login flows, keyed by the CSRF `state` token.
+    pub oauth_states: DashMap<String, OAuthFlowState>,
+    /// Pending TOTP secrets for 2FA setup, keyed by user_id.
+    pub pending_totp: DashMap<String, PendingTotp>,
+    /// Rate limiter for login attempts, keyed by IP.
+    pub login_rate_limit: DashMap<String, RateLimitEntry>,
+    /// Rate limiter for agent registration attempts, keyed by IP.
+    pub register_rate_limit: DashMap<String, RateLimitEntry>,
+    /// Rate limiter for the public status surface (`/api/status/*`),
+    /// keyed by IP. Budget: 60 req / 60s, enforced by
+    /// `router::api::status::public_status_rate_limit`.
+    pub public_rate_limit: DashMap<String, RateLimitEntry>,
+    /// Manages file download/upload transfers between browser and agent.
+    pub file_transfers: Arc<FileTransferManager>,
+    /// Tracks browser connections subscribed to Docker updates per server.
+    pub docker_viewers: DockerViewerTracker,
+    /// Cron-based scheduled task scheduler.
+    pub task_scheduler: Arc<TaskScheduler>,
+    /// Shared alert state manager for dedup across poll-based and event-driven evaluation.
+    pub alert_state_manager: Arc<AlertStateManager>,
+    /// Service that persists agent-emitted security events and dispatches
+    /// inline alert notifications.
+    pub security_service: Arc<SecurityService>,
+    /// Firewall blocklist service. CRUD wiring lives in
+    /// `router::api::firewall`; WS push is invoked from there.
+    pub firewall: Arc<FirewallService>,
+    /// Projects server-owned desired state into full-state agent messages.
+    pub agent_desired_state: AgentDesiredStateReconciler,
+    /// Pending mobile pairing codes for QR login, keyed by code.
+    pub pending_pairs: DashMap<String, PendingPair>,
+    /// Terminal session audit contexts keyed by session_id.
+    pub terminal_audit_contexts: DashMap<String, TerminalAuditContext>,
+    /// Docker logs audit contexts keyed by session_id.
+    pub docker_logs_audit_contexts: DashMap<String, DockerLogsAuditContext>,
+    /// Manual scheduled-task exec audit contexts keyed by run_id.
+    pub exec_audit_contexts: DashMap<String, ExecAuditContext>,
+    /// DNS PTR enricher for traceroute hops (shared across requests).
+    pub traceroute_enricher: crate::service::traceroute_enrich::TracerouteEnricher,
+    /// Owns the service-monitor check transition (overlap guard, transactional
+    /// record/state write, maintenance gate, notifications) for both the
+    /// scheduler and the manual HTTP trigger.
+    pub monitor_check_runner: MonitorCheckRunner,
+}
+
+static RATE_CHECK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Remove entries older than `window_minutes` from the DashMap.
+fn cleanup_expired_entries(map: &DashMap<String, RateLimitEntry>, window_minutes: i64) {
+    let cutoff = chrono::Utc::now() - chrono::Duration::minutes(window_minutes);
+    map.retain(|_, entry| entry.window_start > cutoff);
+}
+
+impl AppState {
+    /// Check rate limit against a given DashMap. Returns true if allowed.
+    fn check_rate(map: &DashMap<String, RateLimitEntry>, ip: &str, max: u32) -> bool {
+        let count = RATE_CHECK_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if count.is_multiple_of(100) {
+            cleanup_expired_entries(map, 15);
+        }
+
+        let now = chrono::Utc::now();
+        let window = chrono::Duration::minutes(15);
+
+        let mut entry = map.entry(ip.to_string()).or_insert_with(|| RateLimitEntry {
+            count: 0,
+            window_start: now,
+        });
+
+        // Reset window if expired
+        if now - entry.window_start > window {
+            entry.count = 1;
+            entry.window_start = now;
+            return true;
+        }
+
+        // Check before incrementing so denied requests don't grow the counter
+        if entry.count >= max {
+            return false;
+        }
+
+        entry.count += 1;
+        true
+    }
+
+    /// Check if an IP has exceeded the login rate limit.
+    /// Returns true if allowed, false if rate-limited.
+    pub fn check_login_rate(&self, ip: &str) -> bool {
+        Self::check_rate(&self.login_rate_limit, ip, self.config.rate_limit.login_max)
+    }
+
+    /// Check if an IP has exceeded the registration rate limit.
+    /// Returns true if allowed, false if rate-limited.
+    pub fn check_register_rate(&self, ip: &str) -> bool {
+        Self::check_rate(
+            &self.register_rate_limit,
+            ip,
+            self.config.rate_limit.register_max,
+        )
+    }
+
+    pub async fn new(db: DatabaseConnection, config: AppConfig) -> Result<Arc<Self>, AppError> {
+        let (browser_tx, _) = broadcast::channel(256);
+        let agent_manager = Arc::new(AgentManager::new(browser_tx.clone()));
+        let agent_authority = Arc::new(AgentAuthority::new(db.clone(), agent_manager.clone()));
+        let server_onboarding = Arc::new(ServerOnboarding::new(
+            db.clone(),
+            agent_authority.clone(),
+            config.auth.max_servers,
+        ));
+        let upgrade_tracker = UpgradeJobTracker::new(browser_tx.clone());
+        let upgrade_release_service = UpgradeReleaseService::new(&config.upgrade);
+        let geoip = if !config.geoip.mmdb_path.is_empty() {
+            GeoIpService::load(&config.geoip.mmdb_path)
+        } else {
+            let default_path = std::path::Path::new(&config.server.data_dir)
+                .join(crate::service::geoip::DBIP_FILENAME);
+            GeoIpService::load(&default_path.display().to_string())
+        };
+        if geoip.is_some() {
+            tracing::info!("GeoIP database loaded");
+        } else {
+            tracing::info!(
+                "GeoIP database not available — download via Settings or Server Map widget"
+            );
+        }
+        let asn = if !config.asn.mmdb_path.is_empty() {
+            AsnService::load(&config.asn.mmdb_path)
+        } else {
+            let default_path = std::path::Path::new(&config.server.data_dir)
+                .join(crate::service::asn::DBIP_ASN_FILENAME);
+            AsnService::load(&default_path.display().to_string())
+        };
+        if asn.is_some() {
+            tracing::info!("ASN database loaded");
+        } else {
+            tracing::info!(
+                "ASN database not available — download via Settings to enrich traceroute hops"
+            );
+        }
+        let file_transfers = Arc::new(FileTransferManager::new(
+            std::env::temp_dir().join("serverbee-transfers"),
+        ));
+        let task_scheduler = Arc::new(TaskScheduler::new(&config.scheduler.timezone).await?);
+        let alert_state_manager = match AlertStateManager::load_from_db(&db).await {
+            Ok(sm) => Arc::new(sm),
+            Err(e) => {
+                tracing::warn!("Failed to load alert states from DB, starting empty: {e}");
+                Arc::new(AlertStateManager::new())
+            }
+        };
+        // Preload capabilities and features from DB
+        if let Err(e) = agent_manager.preload_capabilities(&db).await {
+            tracing::warn!("Failed to preload capabilities: {e}");
+        }
+        let config_arc = Arc::new(config.clone());
+        let firewall = Arc::new(FirewallService::new(
+            db.clone(),
+            config_arc.clone(),
+            browser_tx.clone(),
+        ));
+        let agent_desired_state =
+            AgentDesiredStateReconciler::new(db.clone(), agent_manager.clone(), firewall.clone());
+        let security_service = Arc::new(SecurityService::new(
+            db.clone(),
+            browser_tx.clone(),
+            alert_state_manager.clone(),
+            config_arc,
+            firewall.clone(),
+            agent_manager.clone(),
+        ));
+        let asn_arc = Arc::new(std::sync::RwLock::new(asn));
+        let traceroute_enricher =
+            crate::service::traceroute_enrich::TracerouteEnricher::new().with_asn(asn_arc.clone());
+        Ok(Arc::new(Self {
+            db,
+            agent_manager,
+            agent_authority,
+            server_onboarding,
+            browser_tx,
+            config,
+            upgrade_tracker,
+            upgrade_release_service,
+            geoip: Arc::new(std::sync::RwLock::new(geoip)),
+            geoip_downloading: AtomicBool::new(false),
+            asn: asn_arc,
+            asn_downloading: AtomicBool::new(false),
+            oauth_states: DashMap::new(),
+            pending_totp: DashMap::new(),
+            login_rate_limit: DashMap::new(),
+            register_rate_limit: DashMap::new(),
+            public_rate_limit: DashMap::new(),
+            file_transfers,
+            docker_viewers: DockerViewerTracker::new(),
+            task_scheduler,
+            alert_state_manager,
+            security_service,
+            firewall,
+            agent_desired_state,
+            pending_pairs: DashMap::new(),
+            terminal_audit_contexts: DashMap::new(),
+            docker_logs_audit_contexts: DashMap::new(),
+            exec_audit_contexts: DashMap::new(),
+            traceroute_enricher,
+            monitor_check_runner: MonitorCheckRunner::new(),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_entries_are_cleaned() {
+        let map: DashMap<String, RateLimitEntry> = DashMap::new();
+        map.insert(
+            "old_ip".to_string(),
+            RateLimitEntry {
+                count: 5,
+                window_start: chrono::Utc::now() - chrono::Duration::minutes(20),
+            },
+        );
+        map.insert(
+            "new_ip".to_string(),
+            RateLimitEntry {
+                count: 1,
+                window_start: chrono::Utc::now(),
+            },
+        );
+
+        cleanup_expired_entries(&map, 15);
+        assert!(!map.contains_key("old_ip"));
+        assert!(map.contains_key("new_ip"));
+    }
+}

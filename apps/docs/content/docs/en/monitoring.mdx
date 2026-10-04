@@ -1,0 +1,528 @@
+---
+title: Monitoring
+description: Real-time system monitoring, dashboards, historical data, and data retention.
+icon: Activity
+---
+
+ServerBee monitors all your connected servers in real time through a unified web dashboard. Metrics are streamed over WebSocket for instant updates without polling, with historical data available for querying and trend analysis.
+
+## Dashboard Overview
+
+The main dashboard shows all registered servers with their current status at a glance:
+
+- **Top summary cards** -- Online / Offline / Total counts, average CPU usage, average memory usage, and total bandwidth
+- **Online/Offline status** with color indicators
+- **Ring grid** of four donut charts per card: CPU, Memory, Disk, and monthly **Traffic quota** utilization. When no quota is configured the traffic ring falls back to cumulative bytes transferred, and when a billing cycle is active a "days remaining" hint is shown under the footer
+- **Disk I/O throughput** (read / write bytes per second, aggregated across devices) streamed live alongside network speed
+- **Network throughput** (upload / download speed)
+- **Load trend** (`load5 · load15` next to `load1`) and **uptime / swap / process / TCP / UDP** summary row
+- **Region and country** flags (when GeoIP is enabled)
+
+All data is driven over WebSocket, so the view refreshes in real time without a manual reload. Servers are organized by groups and sorted by weight. You can filter, search, and batch-operate on servers from this view.
+
+For custom operations views, use [Dashboards & Widgets](/en/docs/dashboards) to create additional dashboard layouts with charts, maps, service status widgets, Markdown notes, and uptime timelines.
+
+### GeoIP Display
+
+Region/country labels and the Server Map widget require GeoIP data. You can configure a custom MaxMind-compatible MMDB path with `geoip.mmdb_path`, or download the DB-IP Lite database from **Settings → GeoIP Database**. The status endpoint is `GET /api/geoip/status`, and administrators can trigger a download with `POST /api/geoip/download`.
+
+## Real-Time Updates
+
+The browser connects to the server via WebSocket at `/api/ws/servers`, then receives:
+
+| Message | When | Description |
+|---------|------|-------------|
+| `FullSync` | On connection | Current state of all servers |
+| `Update` | When an agent reports | Broadcast of changed server status |
+| `ServerOnline` | When an agent connects | A server has come online |
+| `ServerOffline` | When an agent disconnects | A server has gone offline |
+
+The dashboard therefore updates in real time -- no page refresh or polling interval required.
+
+## Metric Types
+
+The agent collects and reports the following metrics every 3 seconds. The server sends this fixed `report_interval` in the `Welcome` message:
+
+### System Resources
+
+| Metric | Unit | Description |
+|--------|------|-------------|
+| CPU Usage | % | Overall CPU utilization (0-100) |
+| Memory Used | bytes | Current RAM usage |
+| Swap Used | bytes | Current swap space usage |
+| Disk Used | bytes | Total disk space consumption |
+
+### Network
+
+| Metric | Unit | Description |
+|--------|------|-------------|
+| Network In Speed | bytes/sec | Current download speed |
+| Network Out Speed | bytes/sec | Current upload speed |
+| Network In Transfer | bytes | Cumulative total download since agent start |
+| Network Out Transfer | bytes | Cumulative total upload since agent start |
+
+### System Load
+
+| Metric | Description |
+|--------|-------------|
+| Load Average 1m | System load over the last 1 minute |
+| Load Average 5m | System load over the last 5 minutes |
+| Load Average 15m | System load over the last 15 minutes |
+
+### Connections and Processes
+
+| Metric | Description |
+|--------|-------------|
+| TCP Connections | Number of active TCP connections |
+| UDP Connections | Number of active UDP connections |
+| Process Count | Total number of running processes |
+
+### Environment
+
+| Metric | Description |
+|--------|-------------|
+| Temperature | CPU temperature in degrees Celsius (optional) |
+| Uptime | System uptime in seconds |
+
+### Disk I/O
+
+The agent collects per-disk read/write throughput on all major platforms:
+
+| Metric | Unit | Description |
+|--------|------|-------------|
+| Read Speed | bytes/sec | Read throughput per disk |
+| Write Speed | bytes/sec | Write throughput per disk |
+
+**Linux**: Reads `/proc/diskstats` directly. Only physical block devices are tracked (e.g., `sda`, `nvme0n1`). Virtual devices (`loop*`, `dm-*`, `ram*`, `sr*`) and partitions are excluded. DiskIo.name is the block device name.
+
+**macOS / Windows**: Uses sysinfo `Disk::usage()` API with `mount_point()` as the key. This provides per-mount-path semantics (e.g., `/`, `/home`, `C:\`) rather than per-physical-disk. Known limitation: on macOS with APFS, multiple volumes sharing one physical disk may report overlapping I/O counters.
+
+On the first sample after agent startup, a baseline is established and an empty list is reported. Subsequent samples compute delta-based rates.
+
+Disk I/O data is stored as a JSON column (`disk_io_json`) in the `records` and `records_hourly` tables. The hourly aggregator computes per-device average read/write rates.
+
+### GPU (Optional)
+
+When GPU monitoring is enabled (`enable_gpu = true`), per-device metrics are collected:
+
+| Metric | Description |
+|--------|-------------|
+| GPU Name | Device model name |
+| GPU Utilization | GPU core utilization percentage |
+| GPU Memory Used | VRAM usage in bytes |
+| GPU Memory Total | Total VRAM in bytes |
+| GPU Temperature | Device temperature in degrees Celsius |
+
+## Server Information
+
+In addition to periodic metrics, each agent reports static system information when it first connects:
+
+- CPU name, core count, and architecture
+- Operating system and kernel version
+- Total memory, swap, and disk capacity
+- IPv4 and IPv6 addresses
+- Virtualization type (KVM, Xen, Docker, etc.)
+- Agent version
+
+This information is displayed on the server detail page and stored in the database.
+
+## Historical Data and Charts
+
+ServerBee stores metric records at two levels of granularity:
+
+### Raw Records
+
+- Written every 60 seconds by the RecordWriter background task
+- Retained for **7 days** by default (configurable via `retention.records_days`)
+- Each record captures all metric values at a single point in time
+
+### Hourly Aggregated Records
+
+- Computed by the Aggregator background task
+- Averages of all raw records within each hour
+- Retained for **90 days** by default (configurable via `retention.records_hourly_days`)
+- Used for long-term trend visualization
+
+The dashboard charts automatically switch between raw and hourly data depending on the selected time range.
+
+### GPU Records
+
+GPU metrics are stored separately in a dedicated table with per-device granularity. Each record includes the device index, name, memory, utilization, and temperature. These are retained for **7 days** by default (configurable via `retention.gpu_records_days`).
+
+### Query Strategy
+
+Historical metrics are queried via the REST API:
+
+```
+GET /api/servers/:id/records?from=2026-03-13T00:00:00Z&to=2026-03-14T00:00:00Z&interval=auto
+```
+
+The `interval` parameter controls data granularity:
+
+| Value | Description |
+|-------|-------------|
+| `raw` | Returns raw minute-level records |
+| `hourly` | Returns hourly aggregated records |
+| `auto` | Chooses automatically: `raw` for ranges within 24 hours, `hourly` beyond 24 hours |
+
+### Storage Tiers
+
+```
+Agent report (every 3s)
+  --> In-memory cache: keeps only the latest sample per server (for real-time push)
+  --> Every 1 minute: written to the records table (minute-level records)
+  --> Every 1 hour: aggregated into the records_hourly table (averages)
+```
+
+## Server Details
+
+Each server has a detail page showing:
+
+- **Basic info** -- OS, CPU model, total memory, IP addresses, region, agent version
+- **Real-time streaming charts** (default mode) -- live data streamed from WebSocket updates
+- **Historical trend charts** -- switch to 1h / 6h / 24h / 7d / 30d to query records from the database
+- **Disk I/O charts** -- merged and per-disk views (all platforms, historical mode)
+- **90-day uptime timeline** -- daily availability breakdown as a colored bar chart
+- **GPU panel** -- per-GPU utilization and VRAM charts, if the server reports GPU data (historical mode only)
+- **Traffic statistics** -- cumulative network traffic summary
+- **Server metadata** -- group, tags, remarks, pricing
+- **Actions** -- terminal access, edit, delete
+
+### Real-Time Charts
+
+The server detail page defaults to **Real-time mode**. In this mode, charts display live data streamed from WebSocket updates:
+
+- **Data source**: Accumulated from `BrowserMessage::Update` events through the live server catalog
+- **Update interval**: ~3 seconds (matches the agent report interval)
+- **Buffer size**: Grows to 250 data points, then trims back to the newest 200 points
+- **Deduplication**: Uses the server-side `last_active` timestamp to filter duplicate events
+- **Available charts**: CPU, Memory, Disk, Network In/Out, Load Average (1m)
+- **Time axis**: First tick shows `HH:mm:ss`, subsequent ticks show `mm:ss`
+
+Temperature, GPU, and Disk I/O charts are not currently available in real-time mode. WebSocket `BrowserMessage::Update` messages include aggregate disk read/write rates in `LiveMetrics`, but the detail-page real-time chart model does not yet map those fields. Switch to a historical view to see temperature, GPU, and per-disk I/O data.
+
+### Disk I/O Charts
+
+When historical disk I/O data is available, the server detail page displays a Disk I/O chart with two views:
+
+- **Merged** -- Combined read/write throughput across all physical disks
+- **Per Disk** -- Individual charts for each physical disk (e.g., `sda`, `nvme0n1`)
+
+Both views show read speed (blue) and write speed (green) as area charts. Missing data points are filled with zero values to maintain a continuous timeline.
+
+### Uptime Timeline
+
+The server detail page includes an uptime card with a 90-day timeline. Each day is shown as a colored bar:
+
+- **Green** -- 100% uptime
+- **Yellow** -- Below the yellow threshold (degraded)
+- **Red** -- Below the red threshold (major outage)
+- **Gray** -- No data
+
+Uptime data is queried via `GET /api/servers/{server_id}/uptime-daily?days=90`. The endpoint returns a `UptimeDailyEntry` per day with `date`, `online_minutes`, `total_minutes`, and `uptime_percent` fields. Missing dates are gap-filled with zero values.
+
+## Data Retention
+
+ServerBee automatically cleans up expired data via a background task that runs once per hour:
+
+| Data Type | Default Retention | Config Key |
+|-----------|------------------|------------|
+| Minute-level metrics (records) | 7 days | `retention.records_days` |
+| Hourly metrics (records_hourly) | 90 days | `retention.records_hourly_days` |
+| GPU metrics (gpu_records) | 7 days | `retention.gpu_records_days` |
+| Ping probe records | 7 days | `retention.ping_records_days` |
+| Traffic hourly (traffic_hourly) | 7 days | `retention.traffic_hourly_days` |
+| Traffic daily (traffic_daily) | 400 days | `retention.traffic_daily_days` |
+| Task results (task_results) | 7 days | `retention.task_results_days` |
+| Audit logs | 180 days | `retention.audit_logs_days` |
+
+<Callout type="info">
+Aggregation and cleanup run as separate hourly background tasks with no fixed ordering. Cleanup starts with a 60-second offset, which only staggers their work. Each aggregation run rolls up only the previous completed hour, so a missed hour is not backfilled; monitor task errors if long-term hourly history matters.
+</Callout>
+
+Example of overriding the retention policy:
+
+```toml title="server.toml"
+[retention]
+records_days = 14          # keep minute-level data for 14 days
+records_hourly_days = 365  # keep hourly data for 1 year
+```
+
+### Disk Space Estimate
+
+Database growth depends on server count, enabled writers, sampling intervals, and retention settings. Use [Storage & Sizing](/en/docs/storage-sizing) as the sizing reference; it documents measured April 2026 results, a single 30-day baseline, feature multipliers, and WAL headroom.
+
+## Server Groups and Management
+
+### Server Groups
+
+Organize your servers into logical groups by purpose, region, or any other dimension:
+
+- Create groups with custom names and sort weights
+- Assign servers to different groups
+- The dashboard lists servers grouped by section
+- Sort weight controls the display order (lower weight = higher position)
+- Ungrouped servers appear in the default section
+
+Groups can represent environments (production, staging), regions (US-East, EU-West), providers (AWS, Hetzner), or any other organizational structure that makes sense for your setup.
+
+### Server Tags
+
+In addition to groups, you can attach multiple tags to a server for more flexible classification and filtering. Tags are a many-to-many relationship -- a single server can carry multiple tags.
+
+### Server Management Actions
+
+| Action | Description |
+|--------|-------------|
+| Edit name and remarks | Change the server's display name and remarks |
+| Set group | Assign the server to a specific group |
+| Manage tags | Add or remove server tags |
+| Adjust sorting | Control display order via the weight value |
+| Hide server | Hide a specific server on the dashboard |
+| Delete server | Remove the server and all of its historical data |
+| Batch operations | Delete multiple servers at once |
+
+## Data Flow
+
+```
+Agent                  Server                    Browser
+  |                      |                         |
+  |-- Report (3s) ------>|                         |
+  |                      |-- cache in AgentManager |
+  |                      |                         |
+  |                      |-- RecordWriter (60s) -->|
+  |                      |   writes to SQLite      |
+  |                      |                         |
+  |                      |-- Update (broadcast) -->|
+  |                      |                     real-time UI
+  |                      |                         |
+  |                      |-- Aggregator (hourly) ->|
+  |                      |   hourly averages       |
+  |                      |                         |
+  |                      |-- Cleanup (hourly) ---->|
+  |                      |   delete old records    |
+```
+
+The agent reports every 3 seconds. The server caches the latest report in memory and immediately broadcasts it to connected browsers. Every 60 seconds, all cached reports are batch-written to SQLite. Separate hourly tasks aggregate raw records into hourly summaries and clean up expired data based on retention settings.
+
+## Network Quality Views
+
+The `/network` overview and `/network/{server_id}` detail pages summarize configured probe targets for each server.
+
+- Newly assigned targets appear immediately, even before the first probe result is written
+- Targets without probe data render a no-data state instead of disappearing from the summary
+- The overview search box follows the active UI language
+
+### Time Range Selector
+
+The time range bar offers these options:
+
+| Mode | Data Source | Description |
+|------|-------------|-------------|
+| **Real-time** | WebSocket in-memory buffer | Live streaming data (default) |
+| **1h** | REST API (raw records) | Last 1 hour from database |
+| **6h** | REST API (raw records) | Last 6 hours |
+| **24h** | REST API (raw records) | Last 24 hours |
+| **7d** | REST API (hourly records) | Last 7 days (aggregated) |
+| **30d** | REST API (hourly records) | Last 30 days (aggregated) |
+
+When switching from Real-time to a historical view, the REST API queries are enabled and chart data loads from the database. When switching back to Real-time, the accumulated buffer data is displayed immediately (data continues to accumulate in the background even while viewing historical data).
+
+## Traffic Statistics
+
+ServerBee tracks network traffic at hourly and daily granularity, with billing cycle-aware usage and end-of-cycle prediction.
+
+### How It Works
+
+Traffic tracking is integrated into the existing metric recording pipeline:
+
+1. Each agent reports cumulative network byte counters (`net_in_transfer`, `net_out_transfer`) every 3 seconds
+2. The RecordWriter calculates the delta between consecutive reports and accumulates hourly traffic
+3. The Aggregator rolls up hourly data into daily totals (timezone-aware via `scheduler.timezone`)
+4. The Cleanup task removes expired traffic records based on retention settings
+
+### Traffic API
+
+Query traffic statistics for any server via `GET /api/servers/{id}/traffic`. The response includes:
+
+- **Cycle totals** -- Total bytes in/out for the current billing cycle
+- **Usage percentage** -- Traffic used vs. the server's traffic limit (if configured)
+- **Prediction** -- Estimated end-of-cycle usage based on current consumption rate
+- **Daily breakdown** -- Per-day traffic totals within the billing cycle
+- **Hourly breakdown** -- Per-hour traffic totals for today
+
+### Billing Cycles
+
+Traffic is queried within billing cycles determined by:
+
+- **`billing_cycle`** -- The cycle type: `monthly` (default), `quarterly`, or `yearly`
+- **`billing_start_day`** -- The day of month when the billing cycle starts (1-28, default 1)
+
+For example, if `billing_start_day = 15` and `billing_cycle = monthly`, the cycle runs from the 15th of each month to the 14th of the next month.
+
+### Frontend Display
+
+The server detail page shows a collapsible traffic card with:
+
+- **Progress bar** -- Visual usage against the traffic limit
+- **Daily chart** -- Bar chart showing daily in/out traffic within the cycle
+- **Hourly chart** -- Bar chart showing today's hourly traffic breakdown
+- **Prediction** -- Estimated total usage by end of cycle
+
+### Data Retention
+
+| Data Type | Default Retention | Config Key |
+|-----------|------------------|------------|
+| Traffic hourly | 7 days | `retention.traffic_hourly_days` |
+| Traffic daily | 400 days | `retention.traffic_daily_days` |
+
+### Scheduler Timezone
+
+Daily traffic aggregation respects the `scheduler.timezone` setting. Set this to your billing timezone (e.g., `Asia/Shanghai`) to ensure daily totals align with your billing provider's day boundaries.
+
+## Docker Container Monitoring
+
+ServerBee supports real-time Docker container monitoring when the agent has access to the Docker daemon. This feature requires the `docker` capability (`CAP_DOCKER`), which is off by default. Capabilities are agent-owned — enable it on the agent host by adding `docker` to its `[capabilities]` allow list (or `--allow-cap docker`) and restarting the agent. See [Capabilities](/en/docs/capabilities).
+
+### Overview
+
+The Docker monitoring page shows:
+
+- **Overview cards** -- Running/Stopped container counts, total CPU usage, total memory usage, Docker version
+- **Container list** -- Searchable, filterable table with Name, Image, Status, CPU%, Memory, Network I/O
+- **Events timeline** -- Container lifecycle events (start, stop, die, create, destroy) in reverse chronological order
+- **Networks dialog** -- List of Docker networks with driver, scope, and container count
+- **Volumes dialog** -- List of Docker volumes with driver, mountpoint, and creation time
+
+### Container Details
+
+Click any container row to view:
+
+- **Container info** -- Image, status, ports, creation time, container ID
+- **Stats cards** -- CPU usage, memory (with progress bar), network I/O, block I/O
+- **Log stream** -- Real-time log output with:
+  - stdout in white text, stderr in red text
+  - Follow toggle for auto-scrolling
+  - Clear button to reset the log view
+  - Connection status indicator (Connected/Disconnected)
+
+### How It Works
+
+1. When browsers navigate to the Docker page, a `DockerSubscribe` message is sent via WebSocket
+2. The server instructs the connected agent to start Docker monitoring
+3. The agent uses the bollard Docker API client to poll containers and stats
+4. Updates are broadcast to subscribing browsers in real time
+5. When all browsers leave the Docker page, monitoring stops automatically (viewer ref-counting)
+
+Container logs use a dedicated WebSocket endpoint (`/api/ws/docker/logs/{server_id}`) with subscribe/unsubscribe protocol for per-container log streaming.
+
+### Data Retention
+
+| Data Type | Default Retention | Config Key |
+|-----------|------------------|------------|
+| Docker events | 7 days | `retention.docker_events_days` |
+
+Container stats and logs are not persisted — they are streamed in real time only.
+
+## Network Quality Monitoring
+
+ServerBee includes a built-in network quality monitoring system that probes network targets from each agent and visualizes latency, packet loss, and anomalies.
+
+### Preset Targets
+
+96 preset probe targets are embedded in the server binary (not stored in the database):
+
+- **China Telecom** -- 31 provincial nodes (TCP probe via Zstatic CDN)
+- **China Unicom** -- 31 provincial nodes (TCP probe via Zstatic CDN)
+- **China Mobile** -- 31 provincial nodes (TCP probe via Zstatic CDN)
+- **International** -- Cloudflare (1.1.1.1), Google DNS (8.8.8.8), AWS Tokyo (ICMP probe)
+
+China targets use domain names (`{province}-{isp}-v4.ip.zstaticcdn.com:80`) that auto-resolve to the latest CDN node IPs. No IP maintenance is needed.
+
+Preset targets are read-only and cannot be edited or deleted. You can also create custom targets via the settings page.
+
+### Configuration
+
+Navigate to **Settings > Network Probes** to configure:
+
+- **Target Management** -- View all 96 preset targets (with lock icon and ISP label) and manage custom targets (create/edit/delete)
+- **Global Settings** -- Probe interval (30-600 seconds, default 60), packets per round (5-20, default 10), and default targets auto-assigned to new servers
+- **Per-Server Targets** -- Assign up to 20 probe targets per server via the network detail page's "Manage Targets" dialog
+
+### Network Overview Page
+
+The `/network` page shows a card for each server with:
+
+- Target count and average latency
+- Availability percentage
+- Anomaly count with severity indicators
+
+### Network Detail Page
+
+Click a server card to see `/network/:serverId` with:
+
+- **Time range selector** -- Real-time, 1h, 6h, 24h, 7d, 30d
+- **Target cards** -- Per-target latency and packet loss, with toggle visibility
+- **Multi-line latency chart** -- One colored line per target, tooltips with timestamps
+- **Anomaly table** -- High latency, high packet loss, and unreachable events
+- **Statistics bar** -- Average latency, availability percentage, target count
+- **CSV export** -- Download probe data for the selected time range
+
+### Traceroute
+
+The network detail page can run traceroute from the selected agent to a target host or IP to diagnose routing changes and packet loss.
+
+- Requires the agent's effective `CAP_PING_ICMP` capability.
+- The target may contain only letters, numbers, dots, hyphens, and colons.
+- The dialog exposes an ICMP / UDP / TCP protocol dropdown.
+- 5 rounds by default; each round is streamed over WebSocket and the table fills in real time with:
+  Hop / IP / Hostname / ASN / Loss% / Best / Avg / Worst / Jitter / StdDev.
+- For ECMP multi-path routes, a single TTL may have multiple IPs — the first row shows the primary IP, hover the `+N` chip to see the rest.
+- Completed traceroutes are persisted to local SQLite. Click any history row to load that snapshot;
+  admins can delete one row or clear the whole history.
+- Triggering a trace requires admin. Read-only members can browse history but cannot start a new trace or delete records.
+
+#### Privileges
+
+The ServerBee agent now embeds [trippy-core](https://crates.io/crates/trippy-core) to send raw ICMP/UDP/TCP probes directly,
+**no longer depending on the system `traceroute` / `mtr` binaries**. Raw sockets still require OS-level privileges:
+
+| Platform | Requirement |
+|----------|-------------|
+| Linux | `CAP_NET_RAW` or run as root. One-shot setup: `sudo setcap cap_net_raw+ep $(which serverbee-agent)` |
+| macOS | Run as root (sudo). In some scenarios, unprivileged ICMP datagram sockets work as a fallback. |
+| Windows | Start the agent as Administrator. |
+
+If privileges are missing, the traceroute call returns an error immediately with the matching platform hint — no agent restart needed.
+
+#### API flow
+
+```http
+POST   /api/servers/{id}/traceroute          { target, protocol? }   → { request_id }
+GET    /api/servers/{id}/traceroute/{rid}    → latest snapshot (protocol/started_at/round/total_rounds + full fields)
+GET    /api/servers/{id}/traceroute          → history summaries for that server, newest first
+DELETE /api/servers/{id}/traceroute/{rid}    → delete one (admin)
+DELETE /api/servers/{id}/traceroute          → clear all (admin)
+```
+
+The server broadcasts `BrowserMessage::TracerouteUpdate` carrying the incremental result of each round. After a WebSocket reconnect, clients can re-fetch the latest cumulative snapshot via the per-record GET endpoint.
+
+### Data Retention
+
+Network probe records follow the same two-tier storage as system metrics:
+
+- **Raw records** -- Retained for 7 days (configurable via `retention.network_probe_days`)
+- **Hourly aggregates** -- Retained for 90 days (configurable via `retention.network_probe_hourly_days`)
+
+### Alert Integration
+
+Two alert rule types are available for network quality:
+
+- `network_latency` -- Triggers when average latency exceeds a threshold
+- `network_packet_loss` -- Triggers when packet loss exceeds a threshold
+
+<Cards>
+  <Card title="Alerts & Notifications" href="/en/docs/alerts" />
+  <Card title="Architecture" href="/en/docs/architecture" />
+  <Card title="Configuration" href="/en/docs/configuration" />
+</Cards>

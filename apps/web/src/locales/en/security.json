@@ -1,0 +1,108 @@
+{
+  "page_title": "Security Events",
+  "toast": {
+    "attack_detected": "Security event detected from {{ip}}"
+  },
+  "placeholder_overview": "Loading security overview…",
+  "per_server_title": "Server Security Events",
+  "per_server": {
+    "back": "← Back to Security",
+    "subtitle": "Security events"
+  },
+  "range": {
+    "24h": "24h",
+    "7d": "7d",
+    "30d": "30d"
+  },
+  "filter": {
+    "server": "Server",
+    "server_all": "All servers",
+    "event_type": "Event type",
+    "event_type_all": "All types",
+    "severity": "Severity",
+    "severity_all": "All severities",
+    "source_ip": "Source IP",
+    "first_seen_only": "First-seen logins only"
+  },
+  "event_type": {
+    "ssh_brute_force": "SSH Brute Force",
+    "port_scan": "Port Scan",
+    "ssh_login": "SSH Login"
+  },
+  "severity": {
+    "critical": "Critical",
+    "high": "High",
+    "medium": "Medium",
+    "low": "Low",
+    "info": "Info"
+  },
+  "kpi": {
+    "brute_force": "Brute force",
+    "port_scans": "Port scans",
+    "new_ip_logins": "New IP logins",
+    "top_attacker": "Top attacker IP",
+    "no_data": "—"
+  },
+  "table": {
+    "created_at": "Time",
+    "event_type": "Event",
+    "severity": "Severity",
+    "source_ip": "Source IP",
+    "username": "User",
+    "detector": "Detector",
+    "empty": "No security events in this range.",
+    "load_more": "Load more",
+    "loading_more": "Loading…",
+    "row_actions": "Row actions",
+    "action_block_source_ip": "Block source IP"
+  },
+  "detail": {
+    "title": "Security Event Detail",
+    "first_seen": "First seen from this source",
+    "source_ip": "Source IP",
+    "source_port": "Source Port",
+    "username": "Username",
+    "detector": "Detector",
+    "started_at": "Started",
+    "ended_at": "Ended",
+    "virustotal_link": "Look up on VirusTotal",
+    "evidence": "Evidence"
+  },
+  "tab": {
+    "recent_label": "Most recent 50 security events on this server",
+    "view_all": "View all"
+  },
+  "timeline": {
+    "title": "Events over time",
+    "date_label": "Date",
+    "empty": "No data to display"
+  },
+  "preset": {
+    "section_title": "Security presets",
+    "section_hint": "Quick-create rules driven by SecurityEvent reports from agents.",
+    "brute_force_title": "SSH Brute Force",
+    "brute_force_description": "Notify when the agent detects an SSH brute-force burst on a server.",
+    "new_ip_login_title": "New SSH Source",
+    "new_ip_login_description": "Notify when a successful SSH login arrives from a previously unseen (user, IP) pair.",
+    "port_scan_title": "Port Scan",
+    "port_scan_description": "Notify when the agent detects a port scan against this server.",
+    "capability_grant_title": "Capability Temporarily Granted",
+    "capability_grant_description": "Notify when a high-risk capability (terminal/exec/file/docker) is temporarily granted on a server.",
+    "configure": "Configure",
+    "field_name": "Rule name",
+    "field_group": "Notification group",
+    "field_group_none": "None",
+    "field_min_failed": "Minimum failed attempts",
+    "field_min_ports": "Minimum distinct ports",
+    "field_exclude_users": "Exclude users (comma-separated)",
+    "field_exclude_cidrs": "Exclude CIDRs (comma-separated)",
+    "field_dedupe": "Dedupe window (seconds)",
+    "field_auto_block": "Auto-block source IP on every match",
+    "cancel": "Cancel",
+    "create": "Create rule",
+    "creating": "Creating…",
+    "created": "Alert rule created",
+    "create_failed": "Failed to create rule",
+    "name_required": "Name required"
+  }
+}

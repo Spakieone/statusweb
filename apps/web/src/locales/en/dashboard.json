@@ -1,0 +1,334 @@
+{
+  "title": "Dashboard",
+  "servers_online": "{{online}} of {{total}} servers online",
+  "stat_servers": "Servers",
+  "stat_status": "Status",
+  "offline_count": "{{count}} offline",
+  "avg_cpu": "Avg CPU",
+  "avg_memory": "Avg Memory",
+  "total_bandwidth": "Total Bandwidth",
+  "per_second": "/s",
+  "online": "Online",
+  "healthy": "Healthy",
+  "no_data": "No data",
+  "chart_time": "Time",
+  "chart_date": "Date",
+  "no_servers_title": "No servers connected yet",
+  "no_servers_description": "Servers will appear here once they connect via the agent",
+  "ungrouped": "Ungrouped",
+  "unknown": "Unknown",
+  "edit": "Edit",
+  "save": "Save",
+  "cancel": "Cancel",
+  "create": "Create",
+  "delete": "Delete",
+  "add_widget": "Add Widget",
+  "edit_widget": "Edit Widget",
+  "configure_widget": "Configure Widget",
+  "widget_title": "Title (optional)",
+  "delete_widget": "Delete Widget",
+  "lock_widget_position": "Lock widget position",
+  "unlock_widget_position": "Unlock widget position",
+  "new_dashboard": "New Dashboard",
+  "manage_dashboard": "Manage dashboard",
+  "delete_dashboard": "Delete Dashboard",
+  "delete_dashboard_confirm": "Are you sure you want to delete \"{{name}}\"? This action cannot be undone.",
+  "select_dashboard": "Select dashboard",
+  "set_default": "Set as default",
+  "dashboard_name_placeholder": "Dashboard name",
+  "no_widgets_title": "No widgets yet",
+  "no_widgets_description": "Click Edit to start adding widgets to your dashboard",
+  "picker_custom_widgets": "Custom Widgets",
+  "picker_no_custom_widgets": "No custom widgets installed yet.",
+  "module_not_installed": "Widget module not installed",
+  "module_not_installed_id": "Widget module \"{{id}}\" not installed",
+  "module_config_invalid": "Widget config invalid: {{message}}",
+  "module_config_no_fields": "This module exposes no configurable fields.",
+  "toast_created": "Dashboard created",
+  "toast_create_failed": "Failed to create dashboard",
+  "toast_updated": "Dashboard updated",
+  "toast_update_failed": "Failed to update dashboard",
+  "toast_deleted": "Dashboard deleted",
+  "toast_delete_failed": "Failed to delete dashboard",
+  "widgetPicker": {
+    "categories": {
+      "Real-time": "Real-time",
+      "Charts": "Charts",
+      "Status": "Status"
+    },
+    "types": {
+      "stat-number": {
+        "label": "Stat Number",
+        "description": "Single metric value with icon"
+      },
+      "metric-card": {
+        "label": "Metric Card",
+        "description": "Current value + 1h delta + 24h sparkline & stats"
+      },
+      "server-cards": {
+        "label": "Server Cards",
+        "description": "Server overview cards grid"
+      },
+      "gauge": {
+        "label": "Gauge",
+        "description": "Circular gauge for a metric"
+      },
+      "line-chart": {
+        "label": "Line Chart",
+        "description": "Time series line chart"
+      },
+      "multi-line": {
+        "label": "Multi Line",
+        "description": "Compare metrics across servers"
+      },
+      "top-n": {
+        "label": "Top N",
+        "description": "Ranked list of servers"
+      },
+      "alert-list": {
+        "label": "Alert List",
+        "description": "Recent alert events"
+      },
+      "service-status": {
+        "label": "Service Status",
+        "description": "Service monitor status dots"
+      },
+      "traffic-bar": {
+        "label": "Traffic Bar",
+        "description": "Daily traffic bar chart"
+      },
+      "disk-io": {
+        "label": "Disk I/O",
+        "description": "Disk I/O read/write chart"
+      },
+      "server-map": {
+        "label": "Server Map",
+        "description": "World map with server locations"
+      },
+      "markdown": {
+        "label": "Markdown",
+        "description": "Custom markdown content"
+      },
+      "uptime-timeline": {
+        "label": "Uptime Timeline",
+        "description": "90-day uptime timeline bar"
+      },
+      "network-latency": {
+        "label": "Network Latency",
+        "description": "Latency over time to network probe targets"
+      },
+      "network-quality": {
+        "label": "Network Quality",
+        "description": "Current latency and packet loss per target"
+      },
+      "network-overview": {
+        "label": "Network Overview",
+        "description": "Network quality across servers"
+      }
+    }
+  },
+  "widgets": {
+    "trafficBar": {
+      "title": "Traffic",
+      "empty": {
+        "noData": "No traffic data available"
+      },
+      "legend": {
+        "inbound": "Inbound",
+        "outbound": "Outbound"
+      }
+    },
+    "alertList": {
+      "title": "Alerts",
+      "empty": {
+        "noEvents": "No alert events"
+      }
+    },
+    "serviceStatus": {
+      "title": "Service Status",
+      "empty": {
+        "noMonitors": "No service monitors"
+      },
+      "status": {
+        "pending": "Pending",
+        "degraded": "Degraded",
+        "healthy": "Healthy",
+        "down": "Down"
+      },
+      "summary": {
+        "healthy": "{{count}} healthy",
+        "degraded": "{{count}} degraded",
+        "down": "{{count}} down",
+        "pending": "{{count}} pending"
+      },
+      "neverChecked": "never"
+    },
+    "serverMap": {
+      "title": "Server Map",
+      "total": "Total",
+      "serverCount_one": "{{count}} server",
+      "serverCount_other": "{{count}} servers",
+      "empty": {
+        "noGeoIP": "GeoIP database not installed",
+        "noLocationData": "No server location data available",
+        "mapUnavailable": "Map data unavailable"
+      },
+      "actions": {
+        "downloadGeoIP": "Download GeoIP Database"
+      }
+    },
+    "uptimeTimeline": {
+      "title": "Uptime Timeline"
+    },
+    "diskIo": {
+      "title": "Disk I/O",
+      "legend": {
+        "read": "Read",
+        "write": "Write"
+      },
+      "empty": {
+        "noData": "No disk I/O data available"
+      }
+    },
+    "topN": {
+      "title": "Top {{metric}}",
+      "empty": {
+        "noServers": "No online servers"
+      }
+    },
+    "multiLine": {
+      "title": "{{metric}} Comparison"
+    },
+    "common": {
+      "labels": {
+        "metric": "Metric",
+        "server": "Server",
+        "servers": "Servers",
+        "monitors": "Monitors",
+        "timeRange": "Time Range",
+        "count": "Count",
+        "maxItems": "Max Items",
+        "maxOptional": "Max value (optional)",
+        "sortOrder": "Sort",
+        "markdownContent": "Markdown Content",
+        "days": "Days",
+        "titleOptional": "Title (optional)",
+        "labelOptional": "Label (optional)",
+        "layout": "Layout",
+        "layoutGrid": "Grid",
+        "layoutList": "List",
+        "color": "Chart color",
+        "colorPrimary": "Primary color",
+        "colorSecondary": "Secondary color"
+      },
+      "placeholders": {
+        "selectServer": "Select server",
+        "selectMetric": "Select metric",
+        "selectRange": "Select range",
+        "widgetTitle": "Widget title",
+        "allServers": "All Servers",
+        "writeMarkdown": "Write markdown here...",
+        "optionalLabel": "Override label"
+      },
+      "empty": {
+        "noServers": "No servers available",
+        "serverNotFound": "Server not found"
+      },
+      "sort": {
+        "desc": "Highest first",
+        "asc": "Lowest first"
+      },
+      "hints": {
+        "allServersWhenEmpty": "Leave empty to include all servers",
+        "allMonitorsWhenEmpty": "Leave empty to include all monitors"
+      },
+      "errors": {
+        "numberRange": "Enter a number between {{min}} and {{max}}"
+      }
+    },
+    "networkLatency": {
+      "title": "Network Latency",
+      "empty": {
+        "noData": "No network probe data available"
+      }
+    },
+    "networkQuality": {
+      "title": "Network Quality",
+      "empty": {
+        "noData": "No network probe data available"
+      }
+    },
+    "networkOverview": {
+      "title": "Network Overview",
+      "empty": {
+        "noData": "No network probe data available"
+      }
+    }
+  },
+  "common": {
+    "metrics": {
+      "cpu": "CPU",
+      "memory": "Memory",
+      "disk": "Disk",
+      "swap": "Swap",
+      "load1m": "Load (1m)",
+      "load5m": "Load (5m)",
+      "load15m": "Load (15m)",
+      "networkIn": "Network In",
+      "networkOut": "Network Out",
+      "network": "Network",
+      "diskIo": "Disk I/O",
+      "bandwidth": "Bandwidth",
+      "serverCount": "Server Count",
+      "avgCpu": "Average CPU",
+      "avgMemory": "Average Memory",
+      "totalBandwidth": "Total Bandwidth",
+      "health": "Health"
+    },
+    "timeRange": {
+      "1hour": "1 hour",
+      "6hours": "6 hours",
+      "12hours": "12 hours",
+      "24hours": "24 hours",
+      "3days": "3 days",
+      "7days": "7 days",
+      "30days": "30 days",
+      "60days": "60 days",
+      "90days": "90 days",
+      "realtime": "Realtime"
+    }
+  },
+  "dialogs": {
+    "widgetConfig": {
+      "editTitle": "Edit Widget",
+      "configureTitle": "Configure Widget",
+      "labels": {
+        "titleOptional": "Title (optional)",
+        "preview": "Preview"
+      },
+      "placeholders": {
+        "widgetTitle": "Widget title"
+      }
+    }
+  },
+  "states": {
+    "loading": "Loading...",
+    "downloading": "Downloading...",
+    "download_failed": "Download failed"
+  },
+  "metricCard": {
+    "metric": {
+      "cpu": "CPU",
+      "memory": "Memory",
+      "network": "Network",
+      "diskIo": "Disk I/O"
+    },
+    "past1h": "past 1h",
+    "peak": "24H PEAK",
+    "avg": "24H AVG",
+    "unknownServer": "Unknown server",
+    "unknownMetric": "Metric not configured"
+  },
+  "rename_dashboard": "Rename Dashboard",
+  "rename": "Rename"
+}

@@ -1,0 +1,87 @@
+---
+title: Testing & Quality
+description: How ServerBee verifies Rust, WebSocket, and frontend behavior with layered automated tests and path-aware CI gates.
+icon: FlaskConical
+---
+
+ServerBee treats reliability as a feature. The codebase ships with a large, fast automated test suite that exercises the full stack — from pure Rust logic to the live WebSocket control plane and the React UI. CI applies the relevant quality gates based on the event and changed paths.
+
+## Test layers at a glance
+
+| Area | What it covers |
+|------|----------------|
+| `common` crate | Protocol messages, capability bitmask, SSRF guard, shared types |
+| `agent` crate | Collectors, reporter WebSocket loop, pinger, file manager, security detectors, firewall, IP quality |
+| `server` crate | REST handlers, WebSocket handlers, services, background tasks, migrations |
+| Frontend (`apps/web`) | Hooks, components, stores, and utilities (Vitest) |
+
+Together, these layers contain **more than 3,800 automated tests**. The exact total changes as coverage grows, so this page documents the testing layers and enforced commands instead of a point-in-time count for each area.
+
+## How we test
+
+ServerBee follows a layered strategy that matches each layer to the right kind of test.
+
+### Unit tests
+
+Pure logic is tested next to the code in inline `#[cfg(test)]` modules: protocol (de)serialization, the capability bitmask, the SSRF guard, alert evaluation, cost math, parsers, and the collectors. These run in milliseconds and make up the bulk of the agent and `common` suites.
+
+### Integration tests
+
+The server integration suites drive the **real Axum router over HTTP and WebSocket** against a freshly migrated, isolated SQLite database. A purpose-built **mock-agent harness** (`crates/server/tests/common/mod.rs`) stands up a simulated agent on a real WebSocket connection, so the control plane is exercised end-to-end without a live host:
+
+- terminal relay, Docker log streaming, file operations, and scheduled-task dispatch
+- real-time browser fan-out (initial full sync plus incremental updates)
+- security events, alerts, capability gating, and Admin/Member RBAC
+
+On the agent side, the reporter's connect → handshake → dispatch → reconnect loop is driven against an **in-process fake WebSocket server**, so the networking core is tested without a real backend.
+
+### Frontend tests
+
+The React app is covered by [Vitest](https://vitest.dev) across hooks, components, state stores, and utilities. Run the frontend suite with `make web-test`.
+
+<Callout type="info">
+The integration harness lets contributors verify real request/response and WebSocket flows on a laptop, with no agent, Docker daemon, or external service required.
+</Callout>
+
+## Coverage
+
+Coverage is measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
+
+| Crate | Region | Line |
+|-------|--------|------|
+| `common` | 98% | 97% |
+| `agent` | 90% | 90% |
+| `server` | 92% | 93% |
+
+Overall Rust region coverage is above 91%. The largest remaining gaps are concentrated in process startup and I/O paths that need a live Docker daemon, Linux kernel facilities (nftables / conntrack / journald), raw ICMP sockets, a PTY, or external services (OAuth, SMTP, APNs). Those environment-dependent paths are exercised through the integration harness and the manual end-to-end checklists in `tests/` where practical.
+
+## Running tests locally
+
+```bash
+make cargo-test     # Rust: unit + integration across the workspace
+make web-test       # Frontend: Vitest
+make cargo-clippy   # Rust lint (0 warnings enforced)
+```
+
+Measure coverage for a single crate:
+
+```bash
+cargo llvm-cov -p serverbee-server --summary-only
+```
+
+## CI gates
+
+The main CI workflow runs for pushes and pull requests to `main`. Markdown, MDX, `docs/`, and iOS-only changes do not start it. For everything else, a first job compares the changed files with the base commit and runs only the gates for the areas they touch:
+
+| Area | Changed paths | Gates |
+|---|---|---|
+| Rust | `crates/`, Cargo manifests, `.cargo/`, the toolchain file, built-in widget sources and the web build config | `cargo check`, zero-warning Clippy, the Rust test jobs |
+| Web | `apps/web/`, `packages/`, root `package.json`, `bun.lock`, `tsconfig`, `turbo.json` | frontend build, type checking, Vitest |
+| Lint | any file Biome handles (JS/TS, JSON, CSS) or `biome.json` | Ultracite lint |
+| Installer | `deploy/install.sh`, `scripts/extract-changelog.sh`, and their tests | installer transaction tests plus POSIX, BusyBox, and ShellCheck validation |
+
+The server integration tests exercise the embedded SPA and built-in widgets, so widget and web build config changes also run the Rust gates. A change to any workflow file, a new branch, or a push without a usable base commit runs every gate. The iOS workflow runs for `apps/ios/` changes other than Markdown, and the documentation workflow for `apps/docs/` and the files its contracts check.
+
+Every pull request also runs **Check commit attribution**, which rejects `Co-authored-by` trailers, "Generated by/with" agent text, and email addresses in its commits, title, and description. The same rules run locally as a Lefthook `commit-msg` hook.
+
+Release builds cross-compile the binary for five targets (Linux x86_64/aarch64 musl, macOS x86_64/aarch64, Windows x86_64) and publish multi-arch Docker images.

@@ -1,0 +1,312 @@
+mod capability_grants;
+mod capability_policy;
+mod collector;
+mod config;
+mod docker;
+mod file_manager;
+mod firewall;
+mod ip_quality;
+mod network_prober;
+mod pinger;
+mod probe_utils;
+mod register;
+mod reporter;
+mod run_token_store;
+mod security;
+mod terminal;
+mod traceroute;
+mod upgrade;
+
+use std::io::IsTerminal;
+use std::sync::OnceLock;
+
+use tracing_subscriber::EnvFilter;
+
+use crate::capability_policy::{compute_local_capabilities, parse_capability_args};
+use crate::config::AgentConfig;
+use crate::reporter::Reporter;
+use crate::security::SecurityManager;
+
+static RUSTLS_PROVIDER_INSTALLED: OnceLock<()> = OnceLock::new();
+
+fn install_rustls_crypto_provider() -> anyhow::Result<()> {
+    if RUSTLS_PROVIDER_INSTALLED.get().is_some() {
+        return Ok(());
+    }
+
+    if let Err(_e) = rustls::crypto::ring::default_provider().install_default() {
+        // install_default() returns Err if a process-global provider is already installed
+        // by another code path (e.g. reqwest building a ClientConfig in a parallel test).
+        // If a provider is now present, treat that as success — we just didn't win the race.
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            return Err(anyhow::anyhow!("Failed to install rustls ring CryptoProvider"));
+        }
+    }
+
+    let _ = RUSTLS_PROVIDER_INSTALLED.set(());
+    Ok(())
+}
+
+/// Return the token following `flag` in `argv`, if present (`--reason foo` → `foo`).
+fn flag_value(argv: &[String], flag: &str) -> Option<String> {
+    argv.iter().position(|a| a == flag).and_then(|i| argv.get(i + 1).cloned())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let argv: Vec<String> = std::env::args().collect();
+    if crate::upgrade::is_upgrade_probe(&argv) {
+        println!("{}", serverbee_common::constants::VERSION);
+        return Ok(());
+    }
+
+    let is_capability_command = argv
+        .get(1)
+        .is_some_and(|subcommand| matches!(subcommand.as_str(), "grant" | "revoke" | "grants"));
+    if !is_capability_command {
+        match crate::upgrade::prepare_startup()? {
+            crate::upgrade::StartupDisposition::Trial => {
+                if !crate::upgrade::has_parent_watchdog() {
+                    crate::upgrade::start_trial_watchdog();
+                }
+            }
+            crate::upgrade::StartupDisposition::RestartAfterRollback(restored_exe) => {
+                crate::upgrade::restart_restored_binary(&restored_exe)?;
+                return Ok(());
+            }
+            crate::upgrade::StartupDisposition::Normal
+            | crate::upgrade::StartupDisposition::Recovered => {}
+        }
+    }
+
+    let mut config = AgentConfig::load().unwrap_or_else(|e| {
+        eprintln!("Failed to load config: {e}");
+        eprintln!("Please create agent.toml or /etc/serverbee/agent.toml");
+        std::process::exit(1);
+    });
+
+    // Host-local capability grant subcommands. One-shot: write the grants file
+    // and exit; the running daemon picks the change up within a few seconds.
+    if let Some(sub) = argv.get(1).map(String::as_str)
+        && matches!(sub, "grant" | "revoke" | "grants")
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let base = compute_local_capabilities(
+            &config.capabilities,
+            &crate::capability_policy::CapabilityCliOverrides {
+                allow_caps: vec![],
+                deny_caps: vec![],
+            },
+        )?;
+        let granted_by = std::env::var("SUDO_USER")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        let result = match sub {
+            "grant" => match (argv.get(2).cloned(), flag_value(&argv, "--for")) {
+                (Some(cap), Some(for_duration)) => crate::capability_grants::cli::run_grant(
+                    &config,
+                    base,
+                    &crate::capability_grants::cli::GrantArgs {
+                        cap,
+                        for_duration,
+                        reason: flag_value(&argv, "--reason"),
+                    },
+                    now,
+                    granted_by,
+                ),
+                _ => Err(anyhow::anyhow!(
+                    "usage: serverbee-agent grant <cap> --for <30m|2h|1d> [--reason \"...\"]"
+                )),
+            },
+            "revoke" => match argv.get(2) {
+                Some(cap) => crate::capability_grants::cli::run_revoke(&config, cap, now),
+                None => Err(anyhow::anyhow!("usage: serverbee-agent revoke <cap>")),
+            },
+            "grants" => crate::capability_grants::cli::run_list(&config, now),
+            _ => unreachable!(),
+        };
+
+        match result {
+            Ok(msg) => {
+                println!("{msg}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let capability_overrides = parse_capability_args(std::env::args())?;
+    if let Some(repo) = crate::upgrade::parse_release_repo_arg(std::env::args()) {
+        tracing::info!("release_repo_url overridden by --release-repo CLI flag");
+        config.upgrade.release_repo_url = repo;
+    }
+    // Capabilities are owned by the agent host: the config file's
+    // `[capabilities]` block (allow/deny over CAP_DEFAULT) is the source of
+    // truth, with CLI flags layered on top. The server cannot change these.
+    let mut agent_local_capabilities =
+        compute_local_capabilities(&config.capabilities, &capability_overrides)?;
+    // File management needs both the capability bit and an operational `[file]`
+    // subsystem (enabled + non-empty root_paths). Drop CAP_FILE when the
+    // subsystem is not actually usable so the server/UI never advertises a file
+    // feature that would fail with "File capability disabled" at request time.
+    agent_local_capabilities =
+        crate::capability_policy::reconcile_file_capability(agent_local_capabilities, &config.file);
+
+    // Only emit ANSI color codes when stdout is an interactive terminal.
+    // Under Docker, systemd/journald, or a redirected log file stdout is a
+    // pipe, and unconditional ANSI litters those sinks (and the web Docker log
+    // viewer) with raw escape sequences like `\x1b[2m`.
+    tracing_subscriber::fmt()
+        .with_ansi(std::io::stdout().is_terminal())
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| config.log.level.parse().unwrap_or_else(|_| "info".into())),
+        )
+        .init();
+
+    install_rustls_crypto_provider()?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in ["agent.toml", "/etc/serverbee/agent.toml"] {
+            if let Ok(meta) = std::fs::metadata(path) {
+                let mode = meta.permissions().mode();
+                if crate::upgrade::is_group_or_world_writable(mode) {
+                    tracing::warn!(
+                        "SECURITY: {path} is group/world-writable (mode {:o}); \
+                         another local user could tamper release_repo_url. \
+                         Run: chmod 600 {path}",
+                        mode & 0o777
+                    );
+                }
+            }
+        }
+    }
+
+    // Fail-fast on malformed SPKI pin (§3.1): non-empty but invalid pin is a
+    // misconfiguration the operator must fix before the agent starts, not something
+    // that should be discovered only at upgrade time.
+    if let Err(e) = crate::upgrade::normalize_spki_pin(&config.upgrade.release_cert_spki_sha256) {
+        eprintln!("Invalid release_cert_spki_sha256: {e}");
+        eprintln!("Fix the value in agent.toml (must be 64 lowercase hex chars) or leave it empty to disable pinning.");
+        std::process::exit(1);
+    }
+
+    tracing::info!(
+        "ServerBee Agent v{} starting...",
+        serverbee_common::constants::VERSION
+    );
+
+    // Probe local firewall capability once at startup. If `nft` is missing or
+    // the agent lacks CAP_NET_ADMIN, the firewall block bit stays off so the
+    // server never tries to push blocklist messages at this agent.
+    let firewall_local = crate::firewall::probe_local_capability().await;
+    agent_local_capabilities = crate::capability_policy::reconcile_firewall_capability(
+        agent_local_capabilities,
+        firewall_local,
+    );
+    if firewall_local {
+        tracing::info!("Local firewall capability probed: nft available");
+    } else {
+        tracing::info!(
+            "Local firewall capability probed: nft unavailable (binary, kernel, or privileges missing); firewall block bit stays off"
+        );
+    }
+
+    if config.token.is_empty() {
+        if config.enrollment_code.is_empty() {
+            anyhow::bail!(
+                "No token and no enrollment_code. Add a Server in the server UI and set \
+                 its one-time code as `enrollment_code` in agent.toml or the \
+                 SERVERBEE_ENROLLMENT_CODE environment variable."
+            );
+        }
+        tracing::info!("No run token found, staging one before claiming Agent authority...");
+        match register::register_agent_with_backoff(&mut config).await {
+            Ok(register::RegistrationOutcome::Confirmed { server_id }) => {
+                tracing::info!("Registration successful (server_id={server_id})");
+            }
+            Ok(register::RegistrationOutcome::Ambiguous) => {
+                tracing::warn!(
+                    "Registration response was ambiguous; trying WebSocket authentication with \
+                     the staged run token before retrying the same claim"
+                );
+            }
+            Err(register::RegisterError::PermanentAuth(msg)) => {
+                // Stable installer acceptance contract. Keep this prefix in sync
+                // with deploy/install.sh::wait_for_agent_install.
+                eprintln!(
+                    "Permanent registration failure: {msg}\n\
+                     The enrollment code is invalid, expired, or already used. \
+                     Generate a fresh one in the server UI and update \
+                     `enrollment_code` in agent.toml (or SERVERBEE_ENROLLMENT_CODE), \
+                     then restart the agent."
+                );
+                std::process::exit(register::EXIT_CODE_PERMANENT_AUTH_FAILURE);
+            }
+            Err(e) => anyhow::bail!("Registration failed after retries: {e}"),
+        }
+    }
+
+    // Process-wide capability authority: owns the effective bitmask (base +
+    // temporary grants) and drives every transition. Consumers gate on it;
+    // its transition loop runs for the agent's lifetime.
+    let capabilities = crate::capability_grants::CapabilityAuthority::new(
+        agent_local_capabilities,
+        config.capabilities.grants_path(),
+    );
+    tokio::spawn(std::sync::Arc::clone(&capabilities).run(std::time::Duration::from_secs(3)));
+
+    // Security pipeline, supervised against the authority so a temporary
+    // security-events grant can start it and its expiry stops it. It owns a
+    // long-lived mpsc::Sender that the reporter forwards over the WebSocket.
+    let (security_tx, security_rx) = tokio::sync::mpsc::channel::<
+        serverbee_common::protocol::AgentMessage,
+    >(128);
+    let _security_supervisor = SecurityManager::spawn_supervised(
+        config.security.clone(),
+        std::sync::Arc::clone(&capabilities),
+        security_tx,
+    );
+
+    let mut reporter = Reporter::new(config, capabilities);
+    reporter.run_with_external(Some(security_rx)).await;
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn config_path() {
+    crate::config::assert_config_path();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_rustls_crypto_provider;
+
+    #[test]
+    fn install_rustls_crypto_provider_is_idempotent() {
+        install_rustls_crypto_provider().expect("first install should succeed");
+        install_rustls_crypto_provider().expect("second install should be a no-op");
+    }
+
+    #[test]
+    fn install_is_ok_when_provider_preinstalled() {
+        // Simulate another code path (e.g. reqwest) installing the global provider first.
+        // The result is intentionally ignored — it may fail if a provider is already set.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Our function must succeed even though install_default() would now return Err.
+        install_rustls_crypto_provider()
+            .expect("should succeed even when a provider was already installed");
+        install_rustls_crypto_provider()
+            .expect("second call should also succeed (OnceLock fast-path)");
+    }
+}

@@ -1,0 +1,140 @@
+---
+title: Dashboards & Widgets
+description: Build custom monitoring dashboards with draggable widgets and reusable layouts.
+icon: LayoutDashboard
+---
+
+ServerBee dashboards are configurable pages made of widgets. You can keep the default overview dashboard, create separate dashboards for regions or teams, and choose one dashboard as the default for all users.
+
+## Managing Dashboards
+
+Use the dashboard switcher in the top bar of the home page to:
+
+- Switch between dashboards
+- Create a new dashboard
+- Rename a dashboard
+- Delete dashboards you no longer need
+- Set a dashboard as the default
+
+The first dashboard is created automatically if none exists. A dashboard marked as default cannot be unset directly; set another dashboard as default instead.
+
+## Editing Layouts
+
+1. Open a dashboard.
+2. Click **Edit**.
+3. Add widgets from the widget picker.
+4. Drag widgets to rearrange them.
+5. Resize widgets within their min/max size constraints.
+6. Configure each widget's data source and title.
+7. Click **Save**.
+
+The layout is stored as grid coordinates (`grid_x`, `grid_y`, `grid_w`, `grid_h`) and widget configuration JSON. Saving a dashboard performs a diff: existing widgets are updated, new widgets are inserted, and widgets removed from the layout are deleted.
+
+## Widget Types
+
+| Widget | Category | Typical use |
+|--------|----------|-------------|
+| `stat-number` | Real-time | Show one fleet-wide summary metric (server count, average CPU/memory, total bandwidth, or health) |
+| `metric-card` | Real-time | Show several key metrics for one server as a colored card |
+| `server-cards` | Real-time | Show compact server cards for selected servers |
+| `gauge` | Real-time | Gauge visualization for one metric and server |
+| `line-chart` | Charts | Historical chart for one metric on one server |
+| `multi-line` | Charts | Compare one metric across multiple servers |
+| `top-n` | Real-time | Rank servers by a selected metric |
+| `alert-list` | Status | Show active or recent alert state |
+| `service-status` | Status | Show Service Monitor status |
+| `traffic-bar` | Charts | Show traffic usage for one server |
+| `disk-io` | Charts | Show disk read/write throughput history |
+| `server-map` | Status | Show server locations on a map when GeoIP is installed |
+| `markdown` | Status | Add notes, runbooks, or links using Markdown |
+| `uptime-timeline` | Status | Show uptime bars for selected servers |
+| `network-latency` | Charts | Show network latency probe history for a server |
+| `network-quality` | Real-time | Show network quality score and live metrics |
+| `network-overview` | Status | Show aggregate network quality across servers |
+
+## Common Widget Configuration
+
+Most widgets store their settings in `config_json`. Common fields include:
+
+| Field | Used by | Meaning |
+|-------|---------|---------|
+| `server_id` | Single-server widgets | Server ID to query |
+| `server_ids` | Multi-server widgets | List of server IDs to include |
+| `metric` | Metric widgets | Metric key such as CPU, memory, disk, traffic, or load |
+| `hours` | Historical widgets | Lookback window for chart data |
+| `interval` | Historical widgets | Data granularity (`raw`, `hourly`, or `auto`) |
+| `monitor_ids` | Service Status | Service Monitor IDs to display |
+| `content` | Markdown | Markdown content |
+
+## GeoIP and Server Map
+
+The Server Map widget requires GeoIP data. You can either:
+
+- Configure a custom MaxMind-compatible MMDB file with `geoip.mmdb_path`, or
+- Download the DB-IP Lite database from **Settings → GeoIP Database**.
+
+The widget shows an installation prompt when GeoIP data is missing.
+
+## Performance & Widget Capacity
+
+The dashboard uses viewport-gated lazy mounting (IntersectionObserver): off-screen widgets do not mount their charts at first paint, so cold-load cost barely grows with widget count. **While scrolling**, however, charts measure their container and SVG text synchronously. When many widgets enter the viewport at once, those forced reflows accumulate and the scroll noticeably stutters.
+
+Measured (desktop Chrome, no CPU/network throttling, **local backend**, widgets mixed across line-chart / gauge / multi-line / disk-io):
+
+| Widget count | Cold-load LCP | Scrolling |
+|--------------|---------------|-----------|
+| ≤ 30         | ~360 ms       | Smooth    |
+| 30 – 60      | ~360 ms       | Usable, mild jank during fast scroll |
+| > 60         | ~360 ms       | Visible stutter while scrolling, main thread saturated by chart layout measurement |
+
+Against a remote server over the public internet, cold-load LCP grows with the number of **in-viewport** charts, because each one waits on its own history query before painting — a 40-widget dashboard measured over WAN loads in seconds, not ~360 ms. The scrolling characteristics above still apply.
+
+**Recommended sizing**:
+
+- **Comfortable**: ≤ **30 widgets** per dashboard.
+- **Acceptable**: 30 – 60 widgets. If you must exceed 30, favour static/non-chart widgets (`markdown`, `alert-list`, `service-status`, `stat-number`) and keep the chart-heavy ones (`line-chart`, `multi-line`, `disk-io`, `traffic-bar`, `gauge`) under 30.
+- **Not recommended**: > 60 widgets per dashboard — split by team, region, or use case across multiple dashboards instead.
+
+If you genuinely need dozens of charts in one dashboard, **group them in the same vertical region** rather than spreading them across a long page. Fewer charts enter the viewport in any given scroll, lowering peak main-thread pressure.
+
+## API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/dashboards` | List dashboards |
+| GET | `/api/dashboards/default` | Get the default dashboard, creating one if needed |
+| GET | `/api/dashboards/{id}` | Get a dashboard with widgets |
+| POST | `/api/dashboards` | Create a dashboard |
+| PUT | `/api/dashboards/{id}` | Update metadata and/or widgets |
+| DELETE | `/api/dashboards/{id}` | Delete a dashboard |
+
+Update request example:
+
+```json
+{
+  "name": "Production",
+  "is_default": true,
+  "widgets": [
+    {
+      "widget_type": "stat-number",
+      "title": "Web CPU",
+      "config_json": {
+        "server_id": "server-id",
+        "metric": "cpu",
+        "unit": "%"
+      },
+      "grid_x": 0,
+      "grid_y": 0,
+      "grid_w": 2,
+      "grid_h": 1,
+      "sort_order": 0
+    }
+  ]
+}
+```
+
+<Cards>
+  <Card title="Monitoring" href="/en/docs/monitoring" />
+  <Card title="Service Monitors" href="/en/docs/service-monitors" />
+  <Card title="Storage & Sizing" href="/en/docs/storage-sizing" />
+</Cards>

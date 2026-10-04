@@ -1,0 +1,240 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "vcs": {
+    "enabled": false,
+    "clientKind": "git",
+    "useIgnoreFile": false
+  },
+  "files": {
+    "ignoreUnknown": false,
+    "includes": [
+      "!**/.superpowers",
+      "!**/.next",
+      "!**/dist",
+      "!**/.turbo",
+      "!**/.nx",
+      "!**/dev-dist",
+      "!**/.zed",
+      "!**/.vscode",
+      "!**/routeTree.gen.ts",
+      "!**/src-tauri",
+      "!**/.nuxt",
+      "!bts.jsonc",
+      "!**/.expo",
+      "!**/.wrangler",
+      "!**/.alchemy",
+      "!**/.svelte-kit",
+      "!**/wrangler.jsonc",
+      "!**/.source",
+      "!**/convex/_generated",
+      "!**/target",
+      "!apps/ios",
+      "!apps/web/openapi.json",
+      "!apps/web/public/world-countries.json",
+      "!apps/web/src/bones",
+      "!apps/web/src/lib/api-types.ts",
+      "!apps/web/src/components/ui/color-picker.tsx",
+      "!apps/web/src/components/ui/fluid",
+      "!apps/web/src/lib/fluid",
+      "!apps/web/src/hooks/use-proximity-hover.ts",
+      "!templates"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 120
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "correctness": {
+        "useExhaustiveDependencies": "info"
+      },
+      "nursery": {
+        "useSortedClasses": {
+          "level": "warn",
+          "fix": "safe",
+          "options": {
+            "functions": ["clsx", "cva", "cn"]
+          }
+        }
+      },
+      "style": {
+        "noParameterAssign": "error",
+        "useAsConstAssertion": "error",
+        "useDefaultParameterLast": "error",
+        "useEnumInitializers": "error",
+        "useSelfClosingElements": "error",
+        "useSingleVarDeclarator": "error",
+        "noUnusedTemplateLiteral": "error",
+        "useNumberNamespace": "error",
+        "noInferrableTypes": "error",
+        "noUselessElse": "error"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "semicolons": "asNeeded",
+      "quoteStyle": "single",
+      "jsxQuoteStyle": "double",
+      "trailingCommas": "none"
+    }
+  },
+  "css": {
+    "parser": {
+      "tailwindDirectives": true
+    }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "apps/docs/src/routes/$lang.tsx",
+        "apps/docs/src/routes/$lang/docs/$.tsx",
+        "apps/docs/src/routes/llms*",
+        "apps/docs/src/routes/$lang/docs*mdx.ts",
+        "apps/docs/src/routes/$lang/llms*",
+        "apps/docs/src/routes/$lang/docs/*mdx.ts",
+        "apps/docs/src/routes/sitemap*",
+        "apps/web/src/routes/_authed/terminal.$serverId.tsx",
+        "apps/web/src/routes/_authed/terminal.$serverId-page.tsx",
+        "apps/web/src/routes/_authed/network/$serverId.tsx",
+        "apps/web/src/routes/_authed/security/$serverId.tsx",
+        "apps/web/src/routes/_authed/files.$serverId.tsx",
+        "apps/web/src/routes/_authed/servers/$id-page.tsx",
+        "apps/web/src/routes/status.$slug.tsx",
+        "apps/web/src/routes/status.server.$serverId.tsx",
+        "apps/web/src/routes/status.network.$serverId.tsx"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "useFilenamingConvention": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "packages/widget-sdk/src/index.ts",
+        "packages/widget-sdk/src/hooks/index.ts",
+        "packages/widget-sdk/src/z/index.ts"
+      ],
+      "linter": {
+        "rules": {
+          "performance": {
+            "noBarrelFile": "off"
+          },
+          "style": {
+            "noExportedImports": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "packages/widget-sdk/src/z/primitives.ts",
+        "packages/widget-sdk/src/manifest.ts"
+      ],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noExplicitAny": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["packages/widget-sdk/tests/**"],
+      "linter": {
+        "rules": {
+          "performance": {
+            "useTopLevelRegex": "off"
+          },
+          "suspicious": {
+            "noEmptyBlockStatements": "off",
+            "noBitwiseOperators": "off"
+          },
+          "complexity": {
+            "noUselessFragments": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["apps/web/src/components/ui/chart.tsx"],
+      "linter": {
+        "rules": {
+          "security": {
+            "noDangerouslySetInnerHtml": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "apps/web/src/components/data-table/**",
+        "apps/web/src/components/ui/calendar.tsx",
+        "apps/web/src/components/ui/command.tsx",
+        "apps/web/src/components/ui/input-group.tsx",
+        "apps/web/src/components/ui/popover.tsx",
+        "apps/web/src/components/ui/slider.tsx",
+        "apps/web/src/components/ui/textarea.tsx",
+        "apps/web/src/config/data-table.ts",
+        "apps/web/src/hooks/use-callback-ref.ts",
+        "apps/web/src/hooks/use-data-table.ts",
+        "apps/web/src/hooks/use-debounced-callback.ts",
+        "apps/web/src/lib/data-table.ts",
+        "apps/web/src/lib/format.ts",
+        "apps/web/src/lib/parsers.ts",
+        "apps/web/src/types/data-table.ts"
+      ],
+      "linter": {
+        "rules": {
+          "performance": {
+            "noNamespaceImport": "off",
+            "useTopLevelRegex": "off"
+          },
+          "style": {
+            "noNestedTernary": "off"
+          },
+          "suspicious": {
+            "noArrayIndexKey": "off"
+          },
+          "complexity": {
+            "noVoid": "off"
+          },
+          "correctness": {
+            "noNestedComponentDefinitions": "off"
+          },
+          "a11y": {
+            "useSemanticElements": "off",
+            "useKeyWithClickEvents": "off",
+            "noNoninteractiveElementInteractions": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["apps/web/src/routes/_authed/servers/$id-page.tsx"],
+      "linter": {
+        "rules": {
+          "complexity": {
+            "noExcessiveCognitiveComplexity": "off"
+          }
+        }
+      }
+    }
+  ],
+  "extends": ["ultracite/biome/core", "ultracite/biome/react"]
+}

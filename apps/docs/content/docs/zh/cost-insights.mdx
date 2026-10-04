@@ -1,0 +1,77 @@
+---
+title: 成本洞察
+description: ServerBee 如何把账单字段与 agent 指标转换为消耗速率、单位资源成本，以及客观的成本提醒。
+icon: CircleDollarSign
+---
+
+ServerBee 把管理员录入的账单字段（`price`、`billing_cycle`、`currency`、`expired_at` 等）与每个 agent 上报的资源容量、利用率、在线率结合起来，推导出一组客观的成本信号：消耗速率、单位资源成本，以及每台服务器的**成本提醒（advisories）**。这些信息出现在服务器列表、仪表盘服务器卡片，以及服务器详情页的成本面板上。
+
+如何在界面里录入账单数据，见[管理员指南的计费信息一节](/zh/docs/admin#计费信息)。
+
+## 派生输出
+
+每台账单配置合法的服务器都会产出下列字段（通过 `GET /api/cost/overview` 和 `GET /api/servers/{id}/cost-insights` 暴露）：
+
+| 字段 | 含义 |
+|------|------|
+| `cost_per_second / per_hour / per_day` | 在当前计费周期内按单位时间摊销的成本 |
+| `cost_per_month_equivalent` | 归一化到「每 30 天」的成本，便于比较不同长度的周期 |
+| `cycle_cost_elapsed / cycle_cost_remaining` | 本周期已消耗 vs. 剩余的金额 |
+| `cycle_burn_percent` | 当前周期已过部分的百分比 |
+| `days_remaining` | 当前计费周期剩余天数 |
+| `resource_value.cost_per_cpu_core` | 每 CPU 核的月度等价单位成本 |
+| `resource_value.cost_per_gb_memory` | 每 GB 内存的月度等价单位成本 |
+| `resource_value.cost_per_gb_disk` | 每 GB 磁盘的月度等价单位成本 |
+| `resource_value.cost_per_tb_traffic_limit` | 配置了 `traffic_limit` 时，每 TB 流量限额的月度等价成本 |
+| `advisories` | 客观的每台服务器提醒（见下文）；无任何提醒时为空数组 |
+| `invalid_reason` | 账单字段校验失败时，替代上述成本字段填充 |
+
+<Callout type="info">
+ServerBee 有意**不再**计算单一的合成「价值分」。判断一台服务器是否划算，最好依据上面这些客观单价（无需机群对比）加上下面这些可行动的提醒，而不是一个把多个不相关维度压成一团的 0–100 黑盒数字。
+</Callout>
+
+## 输入校验
+
+出现以下任一情况时跳过成本明细。原因会通过 `invalid_reason` 暴露，让界面标记该条目，而不是把它当成已配置静默处理：
+
+| `invalid_reason` | 触发条件 |
+|------------------|----------|
+| `missing_price` | `price` 为 NULL |
+| `missing_billing_cycle` | `billing_cycle` 为 NULL 或空 |
+| `invalid_billing_cycle` | `billing_cycle` 不在识别集合内（`monthly`、`quarterly`、`yearly`） |
+| `invalid_price` | `price < 0` 或 NaN |
+
+`price == 0` 视为合法的「免费服务器」：它会得到完整成本明细（全为 0），但永远不会触发 `idle_burn` / `sleeping_money` 提醒——这两条只有在确实花钱时才有意义。
+
+## 成本提醒
+
+每条提醒都是关于单台服务器的客观事实，无需任何机群对比，因此即使只部署了一台服务器也有意义。它们按下列优先级顺序产出，并以警告标签的形式渲染在成本数字旁边。
+
+| 提醒 | 触发条件 | 含义 |
+|------|----------|------|
+| `expired_billing` | `expired_at` 已是过去时间 | 续费，以免丢失主机 |
+| `sleeping_money` | 离线、无近期采样，且仍在支付非零账单 | 排查为何付费主机宕机 |
+| `idle_burn` | 资源空闲（近 24h 平均 CPU &lt; 5%、平均内存 &lt; 20%、无真实网络/磁盘 I/O），且仍在支付非零账单 | 考虑降配或合并 |
+| `low_uptime` | 近 30 天在线率低于 90% | 排查可用性 |
+
+`sleeping_money` 与 `idle_burn` 互斥：「sleeping」要求没有近期采样，而「idle」要求存在能证明主机近期还活着的低利用率采样。
+
+## 数据来源与刷新频率
+
+- 提醒和成本数字由服务端按需计算，不做持久化缓存
+- 利用率均值取自 `record` 表（与监控图表同一张表），回看 24 小时（`RECORD_LOOKBACK_HOURS`）。网络活跃度依据每窗口的吞吐速率判断，而非累计字节计数器
+- 在线率从 `uptime_daily` 按 30 天回看聚合（`UPTIME_RECENT_DAYS`）
+- 资源容量（CPU 核数 / 总内存 / 总磁盘）来自每个 agent 最近一次 `SystemInfo`；agent 断开时沿用最后一次已知值
+
+## 已知限制
+
+- 单位资源成本是绝对值（成本 ÷ 容量），不会与其他服务器排名，因此「便宜还是贵」由你自行判断
+- `idle_burn` 检查的是 CPU + 内存 + I/O 活跃度，而非应用层是否有用。一台开着却没干有用事、CPU/内存又空闲的主机会被判为空闲
+- 缺少 `traffic_limit` 时，`cost_per_tb_traffic_limit` 会省略
+- 月度等价换算使用固定 30 天基准。季度 / 年度周期会先换算到这个统一基准
+
+<Cards>
+  <Card title="账单字段" href="/zh/docs/admin#计费信息" />
+  <Card title="API 参考" href="/zh/docs/api-reference#已认证读取端点" />
+  <Card title="告警" href="/zh/docs/alerts" />
+</Cards>

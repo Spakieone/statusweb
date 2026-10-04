@@ -1,0 +1,408 @@
+---
+title: Agent Setup
+description: Install and configure the ServerBee agent on your monitored servers.
+icon: Cpu
+---
+
+The ServerBee agent is a lightweight Rust binary that runs on each server you want to monitor. It collects system metrics (CPU, memory, disk, network, load, temperature, GPU, disk I/O) and reports them to the central ServerBee server over a persistent WebSocket connection. It also executes probe tasks and remote commands dispatched by the server.
+
+## What the Agent Does
+
+- Collects system metrics every 3 seconds, including disk I/O throughput on all platforms
+- Reports metrics to the server over WebSocket
+- Executes ping probes (ICMP, TCP, HTTP) assigned by the server
+- Provides a PTY shell for web terminal access
+- Runs remote commands dispatched from the server
+- Manages remote file operations (browse, read, write, upload, download) with path sandbox security
+- Monitors Docker containers when Docker daemon is available (stats, logs, events, networks, volumes)
+- Supports automatic self-upgrade when the server pushes new versions
+- Reconnects automatically with exponential backoff if the connection drops
+
+## Installation
+
+### Install Script (recommended)
+
+The install script detects the architecture, downloads the binary, generates the config, and registers a systemd service automatically:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ZingerLittleBee/ServerBee/main/deploy/install.sh | sudo sh -s -- agent \
+  --server-url http://your-server-ip:9527 \
+  --enrollment-code YOUR_ONE_TIME_CODE
+```
+
+Layout: binary in `/opt/serverbee/bin/`, config in `/opt/serverbee/etc/agent.toml`, and the management CLI symlinked to `/usr/local/bin/serverbee`.
+
+After installation, manage the agent with the `serverbee` CLI (automatically installed):
+
+```bash
+sudo serverbee status
+sudo serverbee upgrade agent -y
+sudo serverbee restart agent
+sudo serverbee config agent
+sudo serverbee uninstall agent -y
+```
+
+<Callout type="info">
+If the agent is already installed, re-running `install agent` errors out and tells you to use `upgrade` instead — it will not reinstall. To move to a newer version, run `sudo serverbee upgrade agent -y`.
+</Callout>
+
+### Pre-built Binary (manual)
+
+Download the agent binary for your platform from the [releases page](https://github.com/ZingerLittleBee/ServerBee/releases):
+
+| Platform | File name |
+|----------|-----------|
+| Linux amd64 | `serverbee-agent-linux-amd64` |
+| Linux arm64 | `serverbee-agent-linux-arm64` |
+| macOS amd64 | `serverbee-agent-darwin-amd64` |
+| macOS arm64 | `serverbee-agent-darwin-arm64` |
+| Windows amd64 | `serverbee-agent-windows-amd64.exe` |
+
+```bash
+wget https://github.com/ZingerLittleBee/ServerBee/releases/download/v1.0.0-beta.4/serverbee-agent-linux-amd64
+chmod +x serverbee-agent-linux-amd64
+sudo mv serverbee-agent-linux-amd64 /usr/local/bin/serverbee-agent
+```
+
+### Build from Source
+
+```bash
+git clone https://github.com/ZingerLittleBee/ServerBee.git
+cd ServerBee
+cargo build --release -p serverbee-agent
+
+# With NVIDIA GPU monitoring (optional)
+cargo build --release -p serverbee-agent --features gpu
+```
+
+The binary is located at `target/release/serverbee-agent`.
+
+### Docker (Not Recommended)
+
+<Callout type="info">
+The Agent executable is a single binary, but a managed installation also persists its configuration/run token under `/opt/serverbee/etc`, service metadata, capability grants under the configured `state_dir` (default `/var/lib/serverbee`), and security state. Use `serverbee uninstall agent`; add `--purge` only when you intend to delete retained credentials and state.
+</Callout>
+
+If you still prefer Docker, create a persistent config first. Replace both placeholders with the URL and one-time offer shown by **Add Server**:
+
+```bash
+sudo install -d -m 0700 /opt/serverbee-agent
+sudo tee /opt/serverbee-agent/agent.toml >/dev/null <<'EOF'
+server_url = "https://monitor.example.com"
+enrollment_code = "YOUR_ONE_TIME_CODE"
+token = ""
+EOF
+sudo chmod 0600 /opt/serverbee-agent/agent.toml
+```
+
+Then run the privileged container required for host metrics:
+
+```bash
+docker run -d \
+  --name serverbee-agent \
+  --privileged \
+  --net=host \
+  --pid=host \
+  -v /proc:/host/proc:ro \
+  -v /sys:/host/sys:ro \
+  -v /etc/os-release:/host/etc/os-release:ro \
+  -v /opt/serverbee-agent:/etc/serverbee \
+  --restart unless-stopped \
+  ghcr.io/zingerlittlebee/serverbee-agent:1.0.0-beta.4
+```
+
+<Callout type="warn">
+The persistent `/etc/serverbee` mount is mandatory. Before claiming an Enrollment offer, the Agent generates and atomically stores its run token in `agent.toml`. Without it, a recreated container loses the credential that the Server accepted.
+</Callout>
+
+**Limitations of Docker deployment:**
+
+- Requires `--privileged` for full metrics collection
+- Temperature and GPU monitoring may not work inside containers
+- Web terminal accesses the container environment, not the host
+
+## Registration Flow
+
+Agents authenticate with the Server using an Agent-owned **run token**. The Agent generates and persists this secret locally before it claims a one-time Enrollment offer. The Server stores only its hash and never returns the plaintext token.
+
+### Enrollment Code Registration (Recommended)
+
+1. Sign in as an admin and choose **Add Server**. Server onboarding atomically creates the Server identity and a one-time **Enrollment offer**. Its code is single-use, short-lived (10 minutes by default), and shown only once.
+2. Configure the agent with the code, either via environment variables:
+
+```bash
+SERVERBEE_SERVER_URL=http://your-server-ip:9527 \
+SERVERBEE_ENROLLMENT_CODE=YOUR_ONE_TIME_CODE \
+serverbee-agent
+```
+
+or in the config file:
+
+```toml title="/etc/serverbee/agent.toml"
+server_url = "http://your-server-ip:9527"
+enrollment_code = "<one-time code from Add Server>"
+# Leave empty on first run; the Agent generates and persists it before claim
+token = ""
+```
+
+3. Start the agent. On first run (no token), it will:
+   - Generate a high-entropy run token and atomically save it before any claim request
+   - Send `POST /api/agent/register` with the one-time code and `proposed_run_token`
+   - Receive only `server_id`; the Server hashes the proposed token while consuming the offer
+   - Connect via WebSocket using the token for all future sessions -- the enrollment code is no longer needed
+
+On subsequent runs (token present), the agent connects directly over WebSocket, sends its static system info, and reports metrics on the interval assigned by the server.
+
+If the HTTP result is ambiguous, the Agent first tries WebSocket authentication with the already-staged token. Success proves the claim committed; rejection permits retrying the same code and token. If a code was lost, use the exact Outstanding offer shown on the existing Server to replace it. Replacement is compare-and-swap by offer ID; it never silently replaces an unknown newer offer.
+
+### Correcting a Wrong Enrollment Code
+
+If the Agent was installed with a mistyped enrollment code (or wrong `server_url`) and has not claimed the Server, fix it without reinstalling. Replace the exact Outstanding offer from the Server page when a new code is required, then:
+
+```bash
+serverbee config set enrollment_code <new-code> -y
+# if the server URL was also wrong:
+serverbee config set server_url http://your-server-ip:9527 -y
+```
+
+The `-y` flag restarts the agent so it retries registration immediately. Without `-y` the value is written but the service is not restarted; run `serverbee restart agent` afterwards.
+
+Verify the correction with `sudo serverbee status` and `sudo journalctl -u serverbee-agent -n 80 --no-pager`. Do not rerun `serverbee install agent`: the installer intentionally rejects an already managed component.
+
+Once the Agent has claimed the Server, the enrollment code is no longer used. Use **Agent re-enrollment** for replacement or reinstall scenarios: Graceful mode preserves current authority until the new claim, while Emergency mode revokes authority and fences the current connection immediately.
+
+## Configuration
+
+The agent reads configuration from TOML files in the following order:
+
+1. `/etc/serverbee/agent.toml` (system-wide, preferred)
+2. `agent.toml` (working directory)
+3. Environment variables with `SERVERBEE_` prefix
+
+<Callout type="info">
+When deployed via the install script, the config lives at `/opt/serverbee/etc/agent.toml` (`/etc/serverbee` is the legacy layout; the script migrates it automatically).
+</Callout>
+
+Here is a minimal `agent.toml` for first connection. The [Configuration Reference](/en/docs/configuration) is the canonical list for `file`, `capabilities`, `security`, `ip_change`, `upgrade`, and other groups:
+
+```toml
+# Required: URL of your ServerBee server
+server_url = "http://your-server-ip:9527"
+
+# Agent-owned run token (generated and staged locally before registration)
+token = ""
+
+# One-time enrollment code for first-time registration (used only if token is empty)
+enrollment_code = ""
+
+[collector]
+enable_gpu = false             # Enable NVIDIA GPU monitoring (requires a GPU-enabled build and NVIDIA NVML)
+enable_temperature = true      # Enable temperature sensor monitoring
+
+[log]
+level = "info"                 # Log level: trace, debug, info, warn, error
+file = ""                      # Log file path (empty = stdout only)
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `server_url` | string | required | URL of your ServerBee server |
+| `enrollment_code` | string | `""` | One-time enrollment code, needed only for first registration; consumed on success and unused once a token is present |
+| `token` | string | Agent-generated | Agent run token, atomically written before the claim request; the Server stores only its hash |
+| `collector.enable_gpu` | bool | `false` | Enable GPU metric collection |
+| `collector.enable_temperature` | bool | `true` | Enable temperature collection |
+| `log.level` | string | `"info"` | Log level |
+| `log.file` | string | `""` | Log file path (empty = stdout only) |
+
+### Environment Variables
+
+Like the server, all options support `SERVERBEE_` prefixed environment variables. Use `__` (double underscore) as the nested-field separator:
+
+```bash
+export SERVERBEE_SERVER_URL="http://your-server-ip:9527"
+export SERVERBEE_TOKEN="your-agent-token"
+export SERVERBEE_COLLECTOR__ENABLE_GPU=true
+```
+
+<Callout type="info">
+The server currently sends a 3-second `report_interval` in its `Welcome` message, and the Agent uses that value for its reporting loop. `collector.interval` and `SERVERBEE_COLLECTOR__INTERVAL` are still accepted for backward compatibility but do not change the active cadence.
+</Callout>
+
+## Local Capability Locks
+
+Capability policy is owned entirely by the Agent host and can be changed with local configuration or CLI flags:
+
+```bash
+serverbee-agent --allow-cap terminal --allow-cap exec
+serverbee-agent --deny-cap ping_http
+```
+
+- The default set is `upgrade`, `ping_icmp`, `ping_tcp`, `ping_http`, `security_events`, `firewall_block`, and `ip_quality`
+- High-risk capabilities (`terminal`, `exec`, `file`, `docker`) are disabled by default
+- `--deny-cap` always wins over `--allow-cap`
+
+The Server only mirrors the reported set and rejects requests outside it. It has no capability toggle and cannot enable or further configure the Agent's set. See [Capabilities](/en/docs/capabilities).
+
+## GPU Monitoring
+
+NVIDIA GPU monitoring is disabled by default and requires all three of the following:
+
+1. **Build time** -- compile the agent with the `gpu` feature flag (the prebuilt release binaries do not include it):
+   ```bash
+   cargo build --release -p serverbee-agent --features gpu
+   ```
+2. **Runtime** -- an NVIDIA driver that provides the NVML shared library on the host
+3. **Config** -- set `enable_gpu = true`:
+   ```toml
+   [collector]
+   enable_gpu = true
+   ```
+
+When enabled, the agent collects per-GPU metrics for every device:
+
+| Metric | Description |
+|--------|-------------|
+| Device name | GPU model |
+| Memory total | Total VRAM |
+| Memory used | VRAM currently in use |
+| GPU utilization | Compute utilization percentage |
+| GPU temperature | Current temperature |
+
+These metrics appear in the server dashboard and can be used in alert rules.
+
+<Callout type="info">
+Only NVIDIA GPUs are supported (via the `nvml-wrapper` library). AMD and Intel GPU support is planned for a future release.
+</Callout>
+
+The Agent calls NVML through `nvml-wrapper`; it does not run `nvidia-smi`.
+
+## Running as a Systemd Service
+
+For production deployments, run the agent as a systemd service so it starts automatically on boot. The install script creates this service automatically; to configure it manually, create `/etc/systemd/system/serverbee-agent.service`:
+
+```ini title="/etc/systemd/system/serverbee-agent.service"
+[Unit]
+Description=ServerBee Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/serverbee-agent
+Restart=always
+RestartSec=5
+User=root
+WorkingDirectory=/etc/serverbee
+AmbientCapabilities=CAP_NET_RAW
+
+# Optional: limit resource usage
+MemoryMax=128M
+CPUQuota=10%
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`AmbientCapabilities=CAP_NET_RAW` grants the privilege required for ICMP ping probes; remove the line if you do not need ICMP probing.
+
+Then enable and start the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable serverbee-agent
+sudo systemctl start serverbee-agent
+```
+
+Check the status and logs:
+
+```bash
+sudo systemctl status serverbee-agent
+journalctl -u serverbee-agent -f
+```
+
+<Callout type="info">
+The agent needs to run as root to access all system metrics (temperature sensors, process lists, etc.) and to open PTY sessions for the web terminal. If you do not need terminal access, you can run it as a non-root user, though some metrics may be unavailable.
+</Callout>
+
+## Platform Support
+
+| Platform | Support level | Notes |
+|----------|---------------|-------|
+| Linux (amd64/arm64) | Full | Primary target; all features available |
+| macOS (amd64/arm64) | Full | Suitable for development and testing |
+| Windows (amd64) | Basic | TCP/UDP connection counts use a different code path |
+| FreeBSD | Basic | `sysinfo` support for FreeBSD is limited |
+
+## Auto-Update
+
+The server can push upgrade commands to connected agents. When an upgrade is triggered:
+
+1. The server sends an `Upgrade` message with the target version and job ID
+2. The agent derives the binary and checksum URLs from its pinned `[upgrade] release_repo_url`
+3. The agent verifies the downloaded binary against `sha256sums.txt`
+4. A preflight probe executes the candidate and requires it to report the requested embedded version
+5. The agent persists an upgrade transaction, copies the current binary to `.bak`, and atomically installs the candidate
+6. systemd/OpenRC restarts the service; for a manually launched Agent, the old process launches and supervises the candidate until it becomes healthy
+7. The candidate has 90 seconds to reconnect and send `SystemInfo`, then must remain alive through a five-second stability window. If it exits or misses either check, it restores `.bak`, restarts the previous version, and reports the failed upgrade after reconnecting
+
+Trigger an upgrade from the server detail page in the dashboard, or via the API:
+
+```bash
+curl -X POST https://your-server/api/servers/{id}/upgrade \
+  -H "Cookie: session_token=..." \
+  -H "Content-Type: application/json" \
+  -d '{"version": "1.2.0"}'
+```
+
+<Callout type="warn">
+Auto-update requires the agent to have the `upgrade` capability (`CAP_UPGRADE`), which is enabled by default. Capabilities are agent-owned — to turn it off, add `upgrade` to the agent's `[capabilities]` deny list (or pass `--deny-cap upgrade`) on the agent host. See [Capabilities](/en/docs/capabilities).
+</Callout>
+
+<Callout type="info">
+Automatic rollback is enforced by the Agent version that initiates the upgrade. An upgrade started by an older alpha Agent still uses that older Agent's updater; install a rollback-capable version once before relying on this protection for later remote upgrades.
+</Callout>
+
+## Connection Behavior
+
+The agent maintains a persistent WebSocket connection to the server. If the connection drops:
+
+- It reconnects using **exponential backoff** starting at 1 second (1s → 2s → 4s → 8s → 16s → 30s cap)
+- A random jitter of +/-20% is applied to avoid thundering-herd reconnections
+- Upon successful reconnection, the backoff resets to 1 second and the agent re-sends its `SystemInfo`
+- **Heartbeat**: the server pings every 30 seconds and the agent replies with a pong; an agent that stops reporting for more than 30 seconds is marked offline
+
+During the initial connection:
+
+1. The server sends a `Welcome` message with the assigned `server_id` and `report_interval`
+2. The agent sends its `SystemInfo` (CPU name, cores, arch, OS, kernel, memory, disk, IP addresses, virtualization type, agent version)
+3. The server acknowledges with an `Ack`
+4. The server syncs any assigned ping tasks
+5. The agent begins its periodic metric reporting loop
+
+## Collected Metrics
+
+The agent collects the following metrics (sourced from the `sysinfo` library, `/proc` on Linux, and `nvml-wrapper` for GPU) and reports them to the server:
+
+| Category | Reported fields | Source |
+|----------|-----------------|--------|
+| CPU | `cpu` (usage %), name, cores, arch | `sysinfo::System` |
+| Memory | `mem_used`, `swap_used` (bytes) | `sysinfo::System` |
+| Disk | `disk_used` (bytes) | `sysinfo::Disks` |
+| Network | `net_in_speed` / `net_out_speed`, `net_in_transfer` / `net_out_transfer` (bytes) | `sysinfo::Networks` + delta calc |
+| Load | `load1` / `load5` / `load15` | `sysinfo::System::load_average()` |
+| Connections | `tcp_conn` / `udp_conn` | `/proc/net/tcp` (Linux) |
+| Process | `process_count` | `sysinfo::System::processes()` |
+| Uptime | `uptime` (seconds) | `sysinfo::System` |
+| Temperature | `temperature` (°C, optional) | `sysinfo::Components` |
+| GPU | `gpu` (utilization, VRAM, temperature, optional) | `nvml-wrapper` |
+| Virtualization | virtualization type | `systemd-detect-virt` / DMI |
+
+## Resource Footprint
+
+The Agent has negligible CPU cost (&lt;1%) and a steady-state memory footprint in the tens of MB. For the full measured Agent and Server CPU/memory/disk/network data, see [Resource Usage](/en/docs/resource-usage).
+
+<Cards>
+  <Card title="Server Setup" href="/en/docs/server" />
+  <Card title="Configuration Reference" href="/en/docs/configuration" />
+  <Card title="Monitoring" href="/en/docs/monitoring" />
+</Cards>

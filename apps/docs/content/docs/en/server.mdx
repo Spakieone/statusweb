@@ -1,0 +1,351 @@
+---
+title: Server Setup
+description: Install, configure, and run the ServerBee server.
+icon: Server
+---
+
+The ServerBee server is the central component that hosts the web dashboard, manages agent connections, stores monitoring data, and evaluates alert rules. It is a single Rust binary with the React frontend embedded via `rust-embed`.
+
+## Installation
+
+### Install script (recommended)
+
+The easiest path is the one-line install script. In binary mode it detects the architecture, downloads the binary, generates the config, registers and starts a systemd or OpenRC service, and symlinks the `serverbee` management CLI. The server supports two quick installs:
+
+```bash
+# Option A: install with an IP (plain HTTP), reachable at http://<server-ip>:9527
+curl -fsSL https://raw.githubusercontent.com/ZingerLittleBee/ServerBee/main/deploy/install.sh | sudo sh -s -- server --method binary -y
+
+# Option B: install with a domain (automatic Caddy + HTTPS), reachable at https://your-domain
+curl -fsSL https://raw.githubusercontent.com/ZingerLittleBee/ServerBee/main/deploy/install.sh | sudo sh -s -- server \
+  --method binary \
+  --domain monitor.example.com --email admin@example.com -y
+```
+
+Script layout: binary in `/opt/serverbee/bin/`, config in `/opt/serverbee/etc/server.toml`, data in `/opt/serverbee/data/`, and the management CLI symlinked to `/usr/local/bin/serverbee`. See [Quick Install](/en/docs/quick-start) for the full walkthrough.
+
+### Pre-built Binary (manual)
+
+Download the latest release for your platform from the [releases page](https://github.com/ZingerLittleBee/ServerBee/releases), then run it:
+
+```bash
+chmod +x serverbee-server
+./serverbee-server
+```
+
+### Docker
+
+```bash
+docker run -d \
+  --name serverbee-server \
+  -p 9527:9527 \
+  -v serverbee-data:/data \
+  -e MALLOC_ARENA_MAX=2 \
+  ghcr.io/zingerlittlebee/serverbee-server:1.0.0-beta.4
+```
+
+### Build from Source
+
+```bash
+# Build the frontend first
+cd apps/web && bun install && bun run build && cd ../..
+
+# Build the server binary
+cargo build --release -p serverbee-server
+```
+
+## Configuration File
+
+The server reads configuration from TOML files in the following order, with later sources overriding earlier ones:
+
+1. `/etc/serverbee/server.toml` (system-wide)
+2. `server.toml` (working directory)
+3. Environment variables with `SERVERBEE_` prefix
+
+<Callout type="info">
+When deployed via the install script, the config lives at `/opt/serverbee/etc/server.toml` and data at `/opt/serverbee/data/` (the script writes these paths explicitly, overriding the built-in defaults below). `/etc/serverbee` and `/var/lib/serverbee` are the legacy layout, only seen on older installs; the script migrates them automatically.
+</Callout>
+
+Here is a `server.toml` showing the most common options and their defaults. See the [Configuration Reference](/en/docs/configuration) for all available options.
+
+```toml
+[server]
+listen = "0.0.0.0:9527"       # Address and port to listen on
+data_dir = "./data"            # Directory for database and other data files
+trusted_proxies = []           # Defaults to private/loopback CIDRs; set to [] to disable
+
+[database]
+path = "serverbee.db"          # Database filename (relative to data_dir)
+max_connections = 10           # Maximum SQLite connection pool size
+
+[auth]
+session_ttl = 86400            # Session lifetime in seconds (default: 24 hours)
+max_servers = 0                # Soft limit for newly enrolled servers (0 = unlimited)
+secure_cookie = true           # Set Secure flag on session cookies (disable for HTTP-only dev)
+
+[retention]
+records_days = 7               # Raw metric records retention (days)
+records_hourly_days = 90       # Hourly aggregated records retention (days)
+gpu_records_days = 7           # GPU metric records retention (days)
+ping_records_days = 7          # Ping probe records retention (days)
+audit_logs_days = 180          # Audit log retention (days)
+network_probe_days = 7         # Network probe records retention (days)
+network_probe_hourly_days = 90 # Hourly network probe aggregates retention (days)
+traffic_hourly_days = 7        # Traffic hourly records retention (days)
+traffic_daily_days = 400       # Traffic daily records retention (days)
+task_results_days = 7          # Task results retention (days)
+docker_events_days = 7         # Docker event records retention (days)
+service_monitor_days = 30      # Service monitor records retention (days)
+
+[rate_limit]
+login_max = 5                  # Max login attempts per window
+register_max = 10              # Max agent registration attempts per window (Railway overrides to 3)
+
+[scheduler]
+timezone = "UTC"               # Timezone for daily traffic aggregation (e.g. Asia/Shanghai)
+
+[log]
+level = "info"                 # Log level: trace, debug, info, warn, error
+file = ""                      # Log file path (empty = stdout only)
+
+[upgrade]
+release_base_url = "https://github.com/ZingerLittleBee/ServerBee/releases"  # Base URL for agent upgrades
+
+[geoip]
+mmdb_path = ""                 # Path to MaxMind GeoLite2-City.mmdb (non-empty enables GeoIP)
+
+[oauth]
+base_url = ""                  # Public URL of your ServerBee instance
+allow_registration = false     # Allow new user creation on first OAuth login
+
+[oauth.github]
+client_id = ""
+client_secret = ""
+
+[oauth.google]
+client_id = ""
+client_secret = ""
+
+[oauth.oidc]
+issuer_url = ""
+client_id = ""
+client_secret = ""
+scopes = ["openid", "email", "profile"]
+```
+
+## Environment Variables
+
+Every configuration option can be set via environment variables using the `SERVERBEE_` prefix and `__` (double underscore) as a nested key separator. Environment variables take precedence over TOML file values.
+
+Examples:
+
+```bash
+# server.listen
+export SERVERBEE_SERVER__LISTEN="0.0.0.0:9527"
+
+# retention.records_days
+export SERVERBEE_RETENTION__RECORDS_DAYS=14
+
+# oauth.github.client_id
+export SERVERBEE_OAUTH__GITHUB__CLIENT_ID="your-github-client-id"
+
+# geoip.mmdb_path (non-empty path enables GeoIP)
+export SERVERBEE_GEOIP__MMDB_PATH="/path/to/GeoLite2-City.mmdb"
+```
+
+## Database
+
+ServerBee uses SQLite for all persistent storage. The database file is created automatically in the configured `data_dir` when the server starts for the first time.
+
+Key SQLite pragmas are set automatically:
+
+| Pragma | Value | Purpose |
+|--------|-------|---------|
+| `journal_mode` | WAL | Better concurrent read performance |
+| `synchronous` | NORMAL | Good balance of safety and speed |
+| `busy_timeout` | 5000ms | Wait up to 5 seconds for locked database |
+| `foreign_keys` | ON | Enforce referential integrity |
+
+Database migrations run automatically on startup. No manual schema management is required.
+
+## Initial Admin Account
+
+On first startup, if no users exist in the database, the server automatically creates an admin account. There is no username/password environment variable: the password is always randomly generated and printed once to the server/container logs as a highlighted credentials banner.
+
+```
+========================================
+  ServerBee initial admin credentials
+  Username: admin
+  Password: aB3xK9mP2qR5
+========================================
+```
+
+Capture this password from the logs. On first login you are required to change it, and you may optionally choose a different username at that time.
+
+<Callout type="warn">
+The generated password is shown only once in the logs. Record it before the logs rotate, and complete the forced password change on first login before exposing the server to the internet.
+</Callout>
+
+## Agent Enrollment
+
+Adding a Server is one idempotent onboarding operation. `POST /api/servers` requires an `onboarding_request_id` and atomically creates the Server profile, tags, default probes, Agent Authority event, and one bound enrollment offer. Retrying the same request ID and input returns the existing Server. A replay never returns the plaintext code again, but it may identify the current outstanding offer so an administrator can replace that exact offer.
+
+Enrollment offers are server-bound, single-use, and short-lived (10 minutes by default). Their terminal outcomes are `consumed`, `revoked`, `replaced`, or `expired`; a terminal offer can never become outstanding again. The plaintext code is returned only when an offer is created or replaced.
+
+Before claiming an offer, the Agent generates and persists its own run token. It sends that proposed token with `POST /api/agent/register`; the Server stores only its hash and returns only the `server_id`. If the HTTP result is ambiguous, the Agent tries the WebSocket with its staged token before attempting another claim.
+
+The Server's `agent_authority.status` is either `claimed` or `unclaimed` and is independent of whether the Agent is currently online. The Agent Authority state and its outstanding offer are available from the Server detail APIs and UI. You can set `auth.max_servers` to cap new Server onboarding, and use **Clean up unconnected** to remove never-initialized offline placeholders.
+
+## Re-enrollment and Revocation
+
+Use the Server detail page's **Agent re-enrollment** action when a claimed Agent must receive a new run token:
+
+1. **Graceful** keeps the current authority valid while issuing an enrollment offer. The currently connected Agent continues running until the new claim succeeds.
+2. **Emergency** revokes the current authority immediately, fences the old connection, and issues an enrollment offer in the same transition.
+
+Only one offer may be outstanding for a Server. Replacing or revoking it always targets the exact visible offer ID, so a stale browser cannot overwrite a newer offer. Revoking Agent Authority is a separate destructive action: it invalidates the current run token and disconnects the Agent, but deliberately does not issue a new offer.
+
+Agent Authority transitions are recorded as secret-free events. Their history remains available after the Server record is deleted.
+
+## GeoIP Setup
+
+To enable geographic location detection for your agents:
+
+1. Download the free [MaxMind GeoLite2-City](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data) MMDB database (requires a free MaxMind account)
+2. Place the `GeoLite2-City.mmdb` file in an accessible location
+3. Enable GeoIP in your configuration:
+
+```toml
+[geoip]
+mmdb_path = "/path/to/GeoLite2-City.mmdb"
+```
+
+The server will resolve each agent's IP address to a region and country code when it connects.
+
+## OAuth Setup
+
+ServerBee supports third-party authentication through GitHub, Google, and any OpenID Connect provider.
+
+### Prerequisites
+
+Set `oauth.base_url` to the public URL of your ServerBee instance. This is used to construct callback URLs:
+
+```toml
+[oauth]
+base_url = "https://serverbee.example.com"
+allow_registration = true  # Set to true to create accounts on first OAuth login
+```
+
+### GitHub
+
+1. Go to [GitHub Developer Settings](https://github.com/settings/developers) and create a new OAuth App
+2. Set the callback URL to `https://serverbee.example.com/api/auth/oauth/github/callback`
+3. Add credentials to the config:
+
+```toml
+[oauth.github]
+client_id = "your-client-id"
+client_secret = "your-client-secret"
+```
+
+### Google
+
+1. Create OAuth credentials in the [Google Cloud Console](https://console.cloud.google.com/apis/credentials)
+2. Set the callback URL to `https://serverbee.example.com/api/auth/oauth/google/callback`
+3. Add credentials to the config:
+
+```toml
+[oauth.google]
+client_id = "your-client-id"
+client_secret = "your-client-secret"
+```
+
+### Generic OIDC
+
+For any OpenID Connect provider (e.g., Keycloak, Authentik, Authelia):
+
+```toml
+[oauth.oidc]
+issuer_url = "https://auth.example.com/realms/main"
+client_id = "serverbee"
+client_secret = "your-client-secret"
+scopes = ["openid", "email", "profile"]
+```
+
+## Reverse Proxy
+
+<Callout type="info">
+If you don't want to configure a reverse proxy by hand, the install script can do it for you: add `--domain monitor.example.com --email admin@example.com` at install time, or run `sudo serverbee domain setup --domain monitor.example.com --email admin@example.com` on an already-installed server. The script verifies DNS, installs Caddy, writes the Caddyfile, issues an HTTPS certificate, and sets `auth.secure_cookie` to `true`. The manual configuration below is only needed if you want to manage the reverse proxy yourself.
+</Callout>
+
+When running behind a reverse proxy, you must forward WebSocket connections correctly.
+
+### Nginx
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name serverbee.example.com;
+
+    ssl_certificate     /etc/ssl/certs/serverbee.pem;
+    ssl_certificate_key /etc/ssl/private/serverbee.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:9527;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket support
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+}
+```
+
+<Callout type="info">
+The long `proxy_read_timeout` and `proxy_send_timeout` values are important for WebSocket connections. Without them, nginx may close idle connections prematurely, causing agents and terminal sessions to disconnect.
+</Callout>
+
+### Caddy
+
+Caddy handles HTTPS certificates and WebSocket proxying automatically, so the config is minimal:
+
+```txt title="Caddyfile"
+monitor.example.com {
+    reverse_proxy 127.0.0.1:9527
+}
+```
+
+Behind a reverse proxy, point agents at the `https://` address:
+
+```toml title="agent.toml"
+server_url = "https://monitor.example.com"
+```
+
+For more reverse proxy configurations including Traefik, see the [Deployment Guide](/en/docs/deployment).
+
+## Background Tasks
+
+The server runs several background tasks automatically:
+
+| Task | Interval | Purpose |
+|------|----------|---------|
+| RecordWriter | 60s | Writes cached agent reports to the database |
+| OfflineChecker | 10s | Detects agents that stopped reporting (30s threshold) |
+| Aggregator | Hourly | Aggregates raw records into hourly summaries |
+| Cleanup | Hourly | Removes expired records based on retention settings |
+| SessionCleaner | Periodic | Removes expired user sessions |
+| AlertEvaluator | 60s | Evaluates all enabled alert rules |
+
+All tasks start automatically and require no manual configuration.
+
+<Cards>
+  <Card title="Agent Setup" href="/en/docs/agent" />
+  <Card title="Configuration Reference" href="/en/docs/configuration" />
+  <Card title="Deployment Guide" href="/en/docs/deployment" />
+</Cards>

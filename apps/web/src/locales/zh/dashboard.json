@@ -1,0 +1,334 @@
+{
+  "title": "仪表盘",
+  "servers_online": "{{total}} 台服务器中 {{online}} 台在线",
+  "stat_servers": "服务器",
+  "stat_status": "健康状态",
+  "offline_count": "{{count}} 台离线",
+  "avg_cpu": "平均 CPU",
+  "avg_memory": "平均内存",
+  "total_bandwidth": "总带宽",
+  "per_second": "/s",
+  "online": "在线",
+  "healthy": "健康",
+  "no_data": "暂无数据",
+  "chart_time": "时间",
+  "chart_date": "日期",
+  "no_servers_title": "暂无服务器连接",
+  "no_servers_description": "服务器通过 Agent 连接后将显示在此处",
+  "ungrouped": "未分组",
+  "unknown": "未知",
+  "edit": "编辑",
+  "save": "保存",
+  "cancel": "取消",
+  "create": "创建",
+  "delete": "删除",
+  "add_widget": "添加小组件",
+  "edit_widget": "编辑小组件",
+  "configure_widget": "配置小组件",
+  "widget_title": "标题（可选）",
+  "delete_widget": "删除小组件",
+  "lock_widget_position": "锁定组件位置",
+  "unlock_widget_position": "解锁组件位置",
+  "new_dashboard": "新建仪表盘",
+  "manage_dashboard": "管理仪表盘",
+  "delete_dashboard": "删除仪表盘",
+  "delete_dashboard_confirm": "确定要删除 \"{{name}}\" 吗？此操作不可撤销。",
+  "select_dashboard": "选择仪表盘",
+  "set_default": "设为默认",
+  "dashboard_name_placeholder": "仪表盘名称",
+  "no_widgets_title": "暂无小组件",
+  "no_widgets_description": "点击编辑开始向仪表盘添加小组件",
+  "picker_custom_widgets": "自定义组件",
+  "picker_no_custom_widgets": "尚未安装自定义组件。",
+  "module_not_installed": "组件模块未安装",
+  "module_not_installed_id": "组件模块 \"{{id}}\" 未安装",
+  "module_config_invalid": "组件配置无效：{{message}}",
+  "module_config_no_fields": "该模块没有可配置字段。",
+  "toast_created": "仪表盘已创建",
+  "toast_create_failed": "创建仪表盘失败",
+  "toast_updated": "仪表盘已更新",
+  "toast_update_failed": "更新仪表盘失败",
+  "toast_deleted": "仪表盘已删除",
+  "toast_delete_failed": "删除仪表盘失败",
+  "widgetPicker": {
+    "categories": {
+      "Real-time": "实时",
+      "Charts": "图表",
+      "Status": "状态"
+    },
+    "types": {
+      "stat-number": {
+        "label": "数值统计",
+        "description": "带图标的单一指标值"
+      },
+      "metric-card": {
+        "label": "指标卡片",
+        "description": "当前值 + 1h 变化 + 24h sparkline 与峰值/均值"
+      },
+      "server-cards": {
+        "label": "服务器卡片",
+        "description": "服务器概览卡片网格"
+      },
+      "gauge": {
+        "label": "仪表",
+        "description": "单指标环形仪表"
+      },
+      "line-chart": {
+        "label": "折线图",
+        "description": "时间序列折线图"
+      },
+      "multi-line": {
+        "label": "多线图",
+        "description": "跨服务器指标对比"
+      },
+      "top-n": {
+        "label": "Top N",
+        "description": "服务器排名列表"
+      },
+      "alert-list": {
+        "label": "告警列表",
+        "description": "最近告警事件"
+      },
+      "service-status": {
+        "label": "服务状态",
+        "description": "服务监控状态点"
+      },
+      "traffic-bar": {
+        "label": "流量柱状图",
+        "description": "每日流量柱状图"
+      },
+      "disk-io": {
+        "label": "磁盘 I/O",
+        "description": "磁盘读写图表"
+      },
+      "server-map": {
+        "label": "服务器地图",
+        "description": "标注服务器位置的世界地图"
+      },
+      "markdown": {
+        "label": "Markdown",
+        "description": "自定义 Markdown 内容"
+      },
+      "uptime-timeline": {
+        "label": "可用时间线",
+        "description": "90 天可用性时间线"
+      },
+      "network-latency": {
+        "label": "网络延迟",
+        "description": "对探测目标的延迟随时间变化"
+      },
+      "network-quality": {
+        "label": "网络质量",
+        "description": "各目标的当前延迟与丢包"
+      },
+      "network-overview": {
+        "label": "网络总览",
+        "description": "跨服务器的网络质量"
+      }
+    }
+  },
+  "widgets": {
+    "trafficBar": {
+      "title": "流量",
+      "empty": {
+        "noData": "暂无流量数据"
+      },
+      "legend": {
+        "inbound": "入站",
+        "outbound": "出站"
+      }
+    },
+    "alertList": {
+      "title": "告警",
+      "empty": {
+        "noEvents": "暂无告警事件"
+      }
+    },
+    "serviceStatus": {
+      "title": "服务状态",
+      "empty": {
+        "noMonitors": "暂无服务监控"
+      },
+      "status": {
+        "pending": "待检查",
+        "degraded": "降级",
+        "healthy": "健康",
+        "down": "故障"
+      },
+      "summary": {
+        "healthy": "{{count}} 健康",
+        "degraded": "{{count}} 降级",
+        "down": "{{count}} 故障",
+        "pending": "{{count}} 待检查"
+      },
+      "neverChecked": "未检查"
+    },
+    "serverMap": {
+      "title": "服务器地图",
+      "total": "总计",
+      "serverCount_one": "{{count}} 台服务器",
+      "serverCount_other": "{{count}} 台服务器",
+      "empty": {
+        "noGeoIP": "GeoIP 数据库未安装",
+        "noLocationData": "暂无服务器位置数据",
+        "mapUnavailable": "地图数据不可用"
+      },
+      "actions": {
+        "downloadGeoIP": "下载 GeoIP 数据库"
+      }
+    },
+    "uptimeTimeline": {
+      "title": "可用时间线"
+    },
+    "diskIo": {
+      "title": "磁盘 I/O",
+      "legend": {
+        "read": "读取",
+        "write": "写入"
+      },
+      "empty": {
+        "noData": "暂无磁盘 I/O 数据"
+      }
+    },
+    "topN": {
+      "title": "{{metric}} 排行",
+      "empty": {
+        "noServers": "暂无在线服务器"
+      }
+    },
+    "multiLine": {
+      "title": "{{metric}} 对比"
+    },
+    "common": {
+      "labels": {
+        "metric": "指标",
+        "server": "服务器",
+        "servers": "服务器",
+        "monitors": "监控项",
+        "timeRange": "时间范围",
+        "count": "数量",
+        "maxItems": "最大条目数",
+        "maxOptional": "最大值（可选）",
+        "sortOrder": "排序",
+        "markdownContent": "Markdown 内容",
+        "days": "天数",
+        "titleOptional": "标题（可选）",
+        "labelOptional": "标签（可选）",
+        "layout": "布局",
+        "layoutGrid": "网格",
+        "layoutList": "列表",
+        "color": "图表颜色",
+        "colorPrimary": "主色",
+        "colorSecondary": "辅色"
+      },
+      "placeholders": {
+        "selectServer": "选择服务器",
+        "selectMetric": "选择指标",
+        "selectRange": "选择范围",
+        "widgetTitle": "小组件标题",
+        "allServers": "所有服务器",
+        "writeMarkdown": "在此编写 Markdown...",
+        "optionalLabel": "覆盖默认标签"
+      },
+      "empty": {
+        "noServers": "暂无可用服务器",
+        "serverNotFound": "未找到服务器"
+      },
+      "sort": {
+        "desc": "从高到低",
+        "asc": "从低到高"
+      },
+      "hints": {
+        "allServersWhenEmpty": "留空表示包含所有服务器",
+        "allMonitorsWhenEmpty": "留空表示包含所有监控项"
+      },
+      "errors": {
+        "numberRange": "请输入 {{min}} 到 {{max}} 之间的数字"
+      }
+    },
+    "networkLatency": {
+      "title": "网络延迟",
+      "empty": {
+        "noData": "暂无网络探测数据"
+      }
+    },
+    "networkQuality": {
+      "title": "网络质量",
+      "empty": {
+        "noData": "暂无网络探测数据"
+      }
+    },
+    "networkOverview": {
+      "title": "网络总览",
+      "empty": {
+        "noData": "暂无网络探测数据"
+      }
+    }
+  },
+  "common": {
+    "metrics": {
+      "cpu": "CPU",
+      "memory": "内存",
+      "disk": "磁盘",
+      "swap": "交换分区",
+      "load1m": "负载（1分钟）",
+      "load5m": "负载（5分钟）",
+      "load15m": "负载（15分钟）",
+      "networkIn": "网络入站",
+      "networkOut": "网络出站",
+      "network": "网络",
+      "diskIo": "磁盘 I/O",
+      "bandwidth": "带宽",
+      "serverCount": "服务器数量",
+      "avgCpu": "平均 CPU",
+      "avgMemory": "平均内存",
+      "totalBandwidth": "总带宽",
+      "health": "健康度"
+    },
+    "timeRange": {
+      "1hour": "1 小时",
+      "6hours": "6 小时",
+      "12hours": "12 小时",
+      "24hours": "24 小时",
+      "3days": "3 天",
+      "7days": "7 天",
+      "30days": "30 天",
+      "60days": "60 天",
+      "90days": "90 天",
+      "realtime": "实时"
+    }
+  },
+  "dialogs": {
+    "widgetConfig": {
+      "editTitle": "编辑小组件",
+      "configureTitle": "配置小组件",
+      "labels": {
+        "titleOptional": "标题（可选）",
+        "preview": "预览"
+      },
+      "placeholders": {
+        "widgetTitle": "小组件标题"
+      }
+    }
+  },
+  "states": {
+    "loading": "加载中...",
+    "downloading": "下载中...",
+    "download_failed": "下载失败"
+  },
+  "metricCard": {
+    "metric": {
+      "cpu": "CPU",
+      "memory": "内存",
+      "network": "网络",
+      "diskIo": "磁盘 I/O"
+    },
+    "past1h": "过去 1 小时",
+    "peak": "24H 峰值",
+    "avg": "24H 均值",
+    "unknownServer": "未知服务器",
+    "unknownMetric": "未配置指标"
+  },
+  "rename_dashboard": "重命名仪表盘",
+  "rename": "重命名"
+}

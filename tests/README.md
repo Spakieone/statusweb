@@ -1,0 +1,101 @@
+# E2E 手动验证测试
+
+## 启动本地环境
+
+```bash
+# 1. 构建前端（server 通过 rust-embed 嵌入 dist/）
+cd apps/web && bun install && bun run build && cd ../..
+
+# 2. 构建 Rust
+cargo build --workspace
+
+# 3. 启动 Server（设置管理员密码，开发环境关闭 secure cookie）
+SERVERBEE_ADMIN__PASSWORD=admin123 SERVERBEE_AUTH__SECURE_COOKIE=false cargo run -p serverbee-server &
+
+# 4. 原子创建 Server 和绑定的 enrollment offer
+curl -s -c /tmp/sb-cookies.txt -X POST http://localhost:9527/api/auth/login \
+  -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}'
+curl -s -b /tmp/sb-cookies.txt -X POST http://localhost:9527/api/servers \
+  -H 'Content-Type: application/json' \
+  -d "{\"onboarding_request_id\":\"$(uuidgen)\",\"name\":\"Local Agent\"}"
+# 返回 data.server_id 和 data.enrollment（明文 code 仅本次返回，默认 10 分钟过期）
+
+# 5. 启动 Agent（server_url 是 HTTP 基础地址，不是 WS 路径）
+SERVERBEE_SERVER_URL="http://127.0.0.1:9527" SERVERBEE_ENROLLMENT_CODE="<enrollment_code>" cargo run -p serverbee-agent &
+
+# Docker 方式
+docker compose up -d
+```
+
+默认地址：`http://localhost:9527`，管理员用户名：`admin`
+
+> **Connection contract:** set `SERVERBEE_SERVER_URL` to the HTTP base URL (for example, `http://127.0.0.1:9527`). The Agent uses `/api/agent/register` for enrollment and `/api/agent/ws` with its run token in `Authorization: Bearer` for WebSocket admission. Query tokens are a deprecated server compatibility fallback, not the current Agent connection format.
+
+## 测试文件索引
+
+| 文件 | 功能 | 路由 |
+|------|------|------|
+| [auth-users.md](auth-users.md) | 认证、用户与安全 | `/login`, `/settings/users`, `/settings/api-keys` |
+| [dashboard.md](dashboard.md) | 自定义仪表盘 | `/` |
+| [server-detail.md](server-detail.md) | 服务器列表与详情 | `/servers`, `/servers/:id` |
+| [registration-hardening.md](registration-hardening.md) | Onboarding 幂等、claim 竞态、offer CAS、WS fencing 与 cleanup | `/servers`, `/api/servers/*/agent-authority` |
+| [agent-enrollment-smoke.md](agent-enrollment-smoke.md) | Agent Authority 生命周期冒烟测试 | `/api/servers`, `/api/agent/register`, `/api/servers/*/agent-authority` |
+| [manual/agent-reenrollment-e2e.md](manual/agent-reenrollment-e2e.md) | 真实 Linux VPS 的 graceful/emergency 重新接入 | Server 详情、Agent 进程、WebSocket |
+| [ping-tasks.md](ping-tasks.md) | Ping 探测任务管理 | `/settings/ping-tasks` |
+| [network-quality.md](network-quality.md) | 网络质量监控 | `/network`, `/servers/:id?tab=network`, `/settings/network-probes`; legacy `/network/:id` redirects |
+| [docker.md](docker.md) | Docker 容器监控 | `/servers/:id/docker` |
+| [disk-io.md](disk-io.md) | 磁盘 I/O 监控 | `/servers/:id` (历史模式) |
+| [traffic.md](traffic.md) | 月度流量统计 | `/traffic`, `/servers/:id` (Traffic tab) |
+| [file-manager.md](file-manager.md) | 文件管理 | `/servers/:id` (Files) |
+| [service-monitor.md](service-monitor.md) | 服务监控 | `/settings/service-monitors`, `/service-monitors/:id` |
+| [scheduled-tasks.md](scheduled-tasks.md) | 定时任务 | `/settings/tasks` (Scheduled tab) |
+| [security.md](security.md) | 安全设置（密码、2FA、OAuth） | `/settings/security` |
+| [security-events.md](security-events.md) | 安全事件检测（SSH 登录/爆破、端口扫描） | `/security`, `/security/$serverId`, `/settings/alerts` |
+| [firewall-block.md](firewall-block.md) | 防火墙黑名单（手动 + 自动） | `/settings/firewall`, `/security`, `/settings/alerts` |
+| [alerts-notifications.md](alerts-notifications.md) | 告警 & 通知 + IP 变更 | `/settings/alerts`, `/settings/notifications` |
+| [uptime.md](uptime.md) | Uptime 90 天时间线 | `/status/:slug`, `/servers/:id`, Dashboard widget |
+| [general-settings.md](general-settings.md) | 通用设置（Key、备份） | `/settings` |
+| [geoip.md](geoip.md) | GeoIP 数据库管理 | `/settings/geoip` |
+| [status-page.md](status-page.md) | 状态页增强 | `/status/:slug`, `/settings/status-pages` |
+| [appearance.md](appearance.md) | 主题、品牌、响应式 | `/settings/appearance` |
+| [appearance/custom-theme.md](appearance/custom-theme.md) | 自定义主题 | `/settings/appearance`, `/status/:slug` |
+| [spa-themes.md](spa-themes.md) | 自定义前端主题（SPA 替换） | `/settings/appearance`, `/__system/admin/spa-themes`, `/?theme=default` |
+| [audit-logs.md](audit-logs.md) | 审计日志 | `/settings/audit-logs` |
+| [i18n.md](i18n.md) | 国际化 | 全站 |
+| [terminal.md](terminal.md) | Web 终端 | `/terminal/:serverId` |
+| [performance.md](performance.md) | 前端性能测试 | `/servers/:id` (realtime) |
+| [mobile-ios.md](mobile-ios.md) | iOS 移动端 & Mobile API | `/api/mobile/*`, `/settings/mobile-devices`, iOS App |
+| [agent-upgrade.md](agent-upgrade.md) | Agent 自动升级 | `/servers/:id` (Upgrade button) |
+| [agent-upgrade-pinned-source.md](agent-upgrade-pinned-source.md) | Pinned-source 升级：来源配置、防降级、SPKI pin、向后兼容 | Agent 进程 + `/servers/:id` (Upgrade button) |
+| [ip-quality/ipapi-is.md](./ip-quality/ipapi-is.md) | IP Quality ipapi.is provider + fallback verification (2026-05-25) | `/ip-quality`, `crates/server/src/service/ip_risk.rs` |
+| [manual/server-memory-soak.md](manual/server-memory-soak.md) | Server memory soak for release builds (allocator regression) | `scripts/memory-soak.sh` |
+| [manual/docs-scroll-restoration.md](manual/docs-scroll-restoration.md) | Docs site scroll restoration: scrolling before hydration, Back/Forward to fragment entries | `apps/docs` (`/en`, `/en/docs/*`) |
+
+## 页面渲染快速验证
+
+Existing checked statuses below record prior manual runs without a pinned candidate or date. Re-run the relevant cases and record that evidence before treating them as verification of a current change.
+
+| 功能 | 路由 | 状态 |
+|------|------|------|
+| 登录 | `/login` | ✅ |
+| Dashboard | `/` | ✅ |
+| Servers 列表 | `/servers` | ✅ |
+| 服务器详情 | `/servers/:id` | ✅ |
+| 网络质量总览 | `/network` | ✅ |
+| Network detail tab | `/servers/:id?tab=network` | — |
+| Docker 监控 | `/servers/:id/docker` | — |
+| 流量总览 | `/traffic` | ✅ |
+| 流量 Traffic Tab | `/servers/:id` (Traffic tab) | ✅ |
+| 服务监控列表 | `/settings/service-monitors` | ✅ |
+| 服务监控详情 | `/service-monitors/:id` | ✅ |
+| 用户管理 | `/settings/users` | ✅ |
+| 通知 | `/settings/notifications` | ✅ |
+| 告警 | `/settings/alerts` | ✅ |
+| API Keys | `/settings/api-keys` | ✅ |
+| Security | `/settings/security` | ✅ |
+| 审计日志 | `/settings/audit-logs` | ✅ |
+| 远程命令 | `/settings/tasks` | ✅ |
+| 公共状态页 | `/status` | ✅ |
+| Swagger UI | `/swagger-ui/` | ✅ |
+| 终端 | `/terminal/:id` | ✅ |
+| 移动设备管理 | `/settings/mobile-devices` | — |

@@ -1,0 +1,801 @@
+use chrono::Utc;
+use sea_orm::prelude::Expr;
+use sea_orm::*;
+use serde::{Deserialize, Deserializer};
+
+use crate::entity::server;
+use crate::error::AppError;
+use serverbee_common::types::SystemInfo;
+
+/// Deserialize a field that distinguishes between absent (None), explicit null (Some(None)),
+/// and a present value (Some(Some(v))).
+fn deserialize_optional_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    // If the field is present in JSON (even as null), this function is called.
+    // JSON null → Ok(Some(None)), JSON value → Ok(Some(Some(v)))
+    Ok(Some(Option::deserialize(deserializer)?))
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct UpdateServerInput {
+    pub name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub group_id: Option<Option<String>>,
+    pub weight: Option<i32>,
+    pub hidden: Option<bool>,
+    pub remark: Option<String>,
+    pub public_remark: Option<String>,
+    /// Manual override for the GeoIP country flag. `Some(Some("us"))` pins the
+    /// 2-letter ISO code and freezes it against auto-detection; `Some(None)`
+    /// (explicit JSON null) clears the override and resumes GeoIP on the next
+    /// agent report. Absent = unchanged.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub country_code: Option<Option<String>>,
+    // Billing fields
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub price: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub billing_cycle: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub currency: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub expired_at: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub traffic_limit: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub traffic_limit_type: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub billing_start_day: Option<Option<i32>>,
+}
+
+pub struct ServerService;
+
+impl ServerService {
+    /// List all servers ordered by weight DESC, then created_at DESC.
+    pub async fn list_servers(db: &DatabaseConnection) -> Result<Vec<server::Model>, AppError> {
+        let servers = server::Entity::find()
+            .order_by_desc(server::Column::Weight)
+            .order_by_desc(server::Column::CreatedAt)
+            .all(db)
+            .await?;
+        Ok(servers)
+    }
+
+    /// Get a server by ID. Returns 404 if not found.
+    pub async fn get_server(db: &DatabaseConnection, id: &str) -> Result<server::Model, AppError> {
+        server::Entity::find_by_id(id)
+            .one(db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Server not found".to_string()))
+    }
+
+    /// Update a server's fields.
+    pub async fn update_server(
+        db: &DatabaseConnection,
+        id: &str,
+        input: UpdateServerInput,
+    ) -> Result<server::Model, AppError> {
+        let model = Self::get_server(db, id).await?;
+        Self::validate_update_input(&input)?;
+
+        let mut active: server::ActiveModel = model.into();
+
+        if let Some(name) = input.name {
+            active.name = Set(name);
+        }
+        if let Some(group_id) = input.group_id {
+            active.group_id = Set(group_id);
+        }
+        if let Some(weight) = input.weight {
+            active.weight = Set(weight);
+        }
+        if let Some(hidden) = input.hidden {
+            active.hidden = Set(hidden);
+        }
+        if let Some(remark) = input.remark {
+            active.remark = Set(Some(remark));
+        }
+        if let Some(public_remark) = input.public_remark {
+            active.public_remark = Set(Some(public_remark));
+        }
+        // Manual geo override. Setting a code pins it and freezes GeoIP; clearing
+        // it (explicit null) wipes region/country_code so the next agent report
+        // re-derives them automatically.
+        match input.country_code {
+            Some(Some(code)) => {
+                active.country_code = Set(Some(code.to_uppercase()));
+                active.geo_manual = Set(true);
+            }
+            Some(None) => {
+                active.country_code = Set(None);
+                active.region = Set(None);
+                active.geo_manual = Set(false);
+            }
+            None => {}
+        }
+        if let Some(price) = input.price {
+            active.price = Set(price);
+        }
+        if let Some(billing_cycle) = input.billing_cycle {
+            active.billing_cycle = Set(billing_cycle);
+        }
+        if let Some(currency) = input.currency {
+            active.currency = Set(currency);
+        }
+        if let Some(expired_at) = input.expired_at {
+            active.expired_at = Set(expired_at);
+        }
+        if let Some(traffic_limit) = input.traffic_limit {
+            active.traffic_limit = Set(traffic_limit);
+        }
+        if let Some(traffic_limit_type) = input.traffic_limit_type {
+            active.traffic_limit_type = Set(traffic_limit_type);
+        }
+        if let Some(billing_start_day) = input.billing_start_day {
+            active.billing_start_day = Set(billing_start_day);
+        }
+        // NOTE: capabilities are intentionally NOT writable here. They are
+        // owned by the agent host (its config file) and the server only
+        // mirrors what the agent reports — see `update_capabilities_mirror`.
+
+        active.updated_at = Set(Utc::now());
+        let updated = active.update(db).await?;
+        Ok(updated)
+    }
+
+    fn validate_update_input(input: &UpdateServerInput) -> Result<(), AppError> {
+        if matches!(input.price, Some(Some(price)) if !price.is_finite() || price < 0.0) {
+            return Err(AppError::Validation(
+                "price must be finite and greater than or equal to 0".into(),
+            ));
+        }
+
+        if matches!(
+            input.billing_cycle.as_ref(),
+            Some(Some(billing_cycle))
+                if !matches!(billing_cycle.as_str(), "monthly" | "quarterly" | "yearly")
+        ) {
+            return Err(AppError::Validation(
+                "billing_cycle must be monthly, quarterly, or yearly".into(),
+            ));
+        }
+
+        if matches!(
+            input.traffic_limit_type.as_ref(),
+            Some(Some(traffic_limit_type))
+                if !matches!(traffic_limit_type.as_str(), "sum" | "up" | "down")
+        ) {
+            return Err(AppError::Validation(
+                "traffic_limit_type must be sum, up, or down".into(),
+            ));
+        }
+
+        if matches!(input.billing_start_day, Some(Some(day)) if !(1..=28).contains(&day)) {
+            return Err(AppError::Validation(
+                "billing_start_day must be between 1 and 28".into(),
+            ));
+        }
+
+        if matches!(
+            input.country_code.as_ref(),
+            Some(Some(code))
+                if code.len() != 2 || !code.chars().all(|c| c.is_ascii_alphabetic())
+        ) {
+            return Err(AppError::Validation(
+                "country_code must be a 2-letter ISO 3166-1 alpha-2 code".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Delete every server-scoped row (raw/aggregated metrics, per-server
+    /// config, traffic, uptime, etc.) for the given server ids.
+    ///
+    /// These tables intentionally have no foreign key to `servers`, so a
+    /// server delete does not cascade and would otherwise leave orphaned
+    /// rows that only age out via the time-based cleanup task.
+    /// Multi-server association tables (alert_rules, incident, maintenance,
+    /// ping_tasks, service_monitor, status_page, tasks) are deliberately
+    /// excluded: their rows stay valid for the other servers they reference
+    /// and are not orphans of this delete.
+    pub(crate) async fn delete_server_scoped_rows<C: ConnectionTrait>(
+        conn: &C,
+        ids: &[String],
+    ) -> Result<(), AppError> {
+        use crate::entity::{
+            alert_state, docker_event, gpu_record, network_probe_config, network_probe_record,
+            network_probe_record_hourly, ping_record, record, record_hourly, task_result,
+            traffic_daily, traffic_hourly, traffic_state, uptime_daily,
+        };
+
+        macro_rules! purge {
+            ($ent:ident) => {
+                $ent::Entity::delete_many()
+                    .filter($ent::Column::ServerId.is_in(ids.iter().cloned()))
+                    .exec(conn)
+                    .await?;
+            };
+        }
+
+        purge!(alert_state);
+        purge!(docker_event);
+        purge!(gpu_record);
+        purge!(network_probe_config);
+        purge!(network_probe_record);
+        purge!(network_probe_record_hourly);
+        purge!(ping_record);
+        purge!(record);
+        purge!(record_hourly);
+        purge!(task_result);
+        purge!(traffic_daily);
+        purge!(traffic_hourly);
+        purge!(traffic_state);
+        purge!(uptime_daily);
+
+        Ok(())
+    }
+
+    /// Delete a server by ID, along with all of its server-scoped data.
+    pub async fn delete_server(db: &DatabaseConnection, id: &str) -> Result<(), AppError> {
+        let ids = [id.to_string()];
+        let txn = db.begin().await?;
+        let result = server::Entity::delete_by_id(id).exec(&txn).await?;
+        if result.rows_affected == 0 {
+            txn.rollback().await?;
+            return Err(AppError::NotFound("Server not found".to_string()));
+        }
+        Self::delete_server_scoped_rows(&txn, &ids).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Batch delete servers by IDs, along with all of their server-scoped data.
+    pub async fn batch_delete(db: &DatabaseConnection, ids: &[String]) -> Result<u64, AppError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let txn = db.begin().await?;
+        let result = server::Entity::delete_many()
+            .filter(server::Column::Id.is_in(ids.iter().cloned()))
+            .exec(&txn)
+            .await?;
+        Self::delete_server_scoped_rows(&txn, ids).await?;
+        txn.commit().await?;
+        Ok(result.rows_affected)
+    }
+
+    /// Update the features list for a server.
+    pub async fn update_features(
+        db: &DatabaseConnection,
+        server_id: &str,
+        features: &[String],
+    ) -> Result<(), DbErr> {
+        let features_json = serde_json::to_string(features).unwrap_or_else(|_| "[]".into());
+        server::Entity::update_many()
+            .filter(server::Column::Id.eq(server_id))
+            .col_expr(server::Column::Features, Expr::value(features_json))
+            .exec(db)
+            .await?;
+        Ok(())
+    }
+
+    /// Persist the agent-reported capability bitmask into `servers.capabilities`.
+    ///
+    /// This column is a read-only MIRROR of what the agent declares in its
+    /// `SystemInfo` — it is never an independently-settable server value. It
+    /// exists so the dashboard can display an agent's capabilities while the
+    /// agent is offline (and so the in-memory cache can be re-seeded on
+    /// server restart via `preload_capabilities`). Capabilities themselves are
+    /// owned exclusively by the agent host's config file.
+    pub async fn update_capabilities_mirror(
+        db: &DatabaseConnection,
+        server_id: &str,
+        capabilities: u32,
+    ) -> Result<(), DbErr> {
+        server::Entity::update_many()
+            .filter(server::Column::Id.eq(server_id))
+            .col_expr(
+                server::Column::Capabilities,
+                Expr::value(capabilities as i32),
+            )
+            .exec(db)
+            .await?;
+        Ok(())
+    }
+
+    /// Update system info for a server from an agent report.
+    pub async fn update_system_info(
+        db: &DatabaseConnection,
+        server_id: &str,
+        info: &SystemInfo,
+        region: Option<String>,
+        country_code: Option<String>,
+    ) -> Result<(), AppError> {
+        let model = Self::get_server(db, server_id).await?;
+        // A manual geo override freezes region/country_code against auto-detection.
+        let geo_manual = model.geo_manual;
+        let mut active: server::ActiveModel = model.into();
+
+        active.cpu_name = Set(Some(info.cpu_name.clone()));
+        active.cpu_cores = Set(Some(info.cpu_cores));
+        active.cpu_arch = Set(Some(info.cpu_arch.clone()));
+        active.os = Set(Some(info.os.clone()));
+        active.kernel_version = Set(Some(info.kernel_version.clone()));
+        active.mem_total = Set(Some(info.mem_total));
+        active.swap_total = Set(Some(info.swap_total));
+        active.disk_total = Set(Some(info.disk_total));
+        active.ipv4 = Set(info.ipv4.clone());
+        active.ipv6 = Set(info.ipv6.clone());
+        active.virtualization = Set(info.virtualization.clone());
+        active.agent_version = Set(Some(info.agent_version.clone()));
+        if !geo_manual {
+            active.region = Set(region);
+            active.country_code = Set(country_code);
+        }
+        active.protocol_version = Set(info.protocol_version as i32);
+        active.updated_at = Set(Utc::now());
+
+        active.update(db).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::auth::AuthService;
+    use crate::test_utils::setup_test_db;
+    use chrono::Utc;
+    use sea_orm::ActiveModelTrait;
+    use sea_orm::Set;
+    use serverbee_common::constants::CAP_DEFAULT;
+
+    async fn insert_test_server(db: &DatabaseConnection, id: &str, name: &str) {
+        let token_hash = AuthService::hash_password("test").expect("hash_password should succeed");
+        let now = Utc::now();
+        server::ActiveModel {
+            id: Set(id.to_string()),
+            token_hash: Set(Some(token_hash)),
+            token_prefix: Set(Some("serverbee_test".to_string())),
+            name: Set(name.to_string()),
+            weight: Set(0),
+            hidden: Set(false),
+            capabilities: Set(CAP_DEFAULT as i32),
+            protocol_version: Set(1),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert test server should succeed");
+    }
+
+    fn update_input() -> UpdateServerInput {
+        UpdateServerInput {
+            name: None,
+            group_id: None,
+            weight: None,
+            hidden: None,
+            remark: None,
+            public_remark: None,
+            price: None,
+            billing_cycle: None,
+            currency: None,
+            expired_at: None,
+            traffic_limit: None,
+            traffic_limit_type: None,
+            billing_start_day: None,
+            country_code: None,
+        }
+    }
+
+    fn system_info(country_hint: &str) -> SystemInfo {
+        SystemInfo {
+            cpu_name: "test-cpu".to_string(),
+            cpu_cores: 2,
+            cpu_arch: "x86_64".to_string(),
+            os: format!("Debian ({country_hint})"),
+            kernel_version: "6.0.0".to_string(),
+            mem_total: 1,
+            swap_total: 0,
+            disk_total: 1,
+            ipv4: None,
+            ipv6: None,
+            virtualization: None,
+            agent_version: "test".to_string(),
+            protocol_version: 1,
+            features: Vec::new(),
+        }
+    }
+
+    fn validation_message(result: Result<server::Model, AppError>) -> String {
+        match result {
+            Err(AppError::Validation(message)) => message,
+            Err(error) => panic!("expected validation error, got {error:?}"),
+            Ok(_) => panic!("expected validation error, got success"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_servers() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-list-1", "Test Server List").await;
+
+        let servers = ServerService::list_servers(&db)
+            .await
+            .expect("list_servers should succeed");
+        assert!(!servers.is_empty(), "Should return at least one server");
+        assert!(
+            servers.iter().any(|s| s.id == "srv-list-1"),
+            "Inserted server should be in list"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_server_found() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-get-1", "Test Server Get").await;
+
+        let server = ServerService::get_server(&db, "srv-get-1")
+            .await
+            .expect("get_server should succeed");
+        assert_eq!(server.id, "srv-get-1");
+        assert_eq!(server.name, "Test Server Get");
+    }
+
+    #[tokio::test]
+    async fn test_get_server_not_found() {
+        let (db, _tmp) = setup_test_db().await;
+
+        let result = ServerService::get_server(&db, "nonexistent-id").await;
+        assert!(
+            result.is_err(),
+            "get_server for nonexistent ID should return error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_server() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-del-1", "Test Server Delete").await;
+
+        ServerService::delete_server(&db, "srv-del-1")
+            .await
+            .expect("delete_server should succeed");
+
+        let result = ServerService::get_server(&db, "srv-del-1").await;
+        assert!(
+            result.is_err(),
+            "get_server after deletion should return error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_delete() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-batch-1", "Test Server Batch 1").await;
+        insert_test_server(&db, "srv-batch-2", "Test Server Batch 2").await;
+
+        let ids = vec!["srv-batch-1".to_string(), "srv-batch-2".to_string()];
+        let rows = ServerService::batch_delete(&db, &ids)
+            .await
+            .expect("batch_delete should succeed");
+        assert_eq!(rows, 2, "Should have deleted 2 rows");
+
+        let result1 = ServerService::get_server(&db, "srv-batch-1").await;
+        let result2 = ServerService::get_server(&db, "srv-batch-2").await;
+        assert!(result1.is_err(), "First server should be gone");
+        assert!(result2.is_err(), "Second server should be gone");
+    }
+
+    async fn insert_traffic_state(db: &DatabaseConnection, server_id: &str) {
+        crate::entity::traffic_state::ActiveModel {
+            server_id: Set(server_id.to_string()),
+            last_in: Set(1),
+            last_out: Set(1),
+            updated_at: Set(Utc::now()),
+        }
+        .insert(db)
+        .await
+        .expect("insert traffic_state");
+    }
+
+    #[tokio::test]
+    async fn delete_server_purges_scoped_rows() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-purge", "Purge").await;
+        insert_traffic_state(&db, "srv-purge").await;
+
+        ServerService::delete_server(&db, "srv-purge")
+            .await
+            .expect("delete_server should succeed");
+
+        let traffic_left = crate::entity::traffic_state::Entity::find()
+            .filter(crate::entity::traffic_state::Column::ServerId.eq("srv-purge"))
+            .count(&db)
+            .await
+            .unwrap();
+        assert_eq!(traffic_left, 0, "scoped traffic_state row must be purged");
+    }
+
+    #[tokio::test]
+    async fn update_server_rejects_negative_price() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-price-negative", "Price Negative").await;
+
+        let result = ServerService::update_server(
+            &db,
+            "srv-price-negative",
+            UpdateServerInput {
+                price: Some(Some(-0.01)),
+                ..update_input()
+            },
+        )
+        .await;
+
+        let message = validation_message(result);
+        assert!(
+            message.contains("price"),
+            "validation message should mention price, got {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_server_rejects_non_finite_price() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-price-non-finite", "Price Non Finite").await;
+
+        for price in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = ServerService::update_server(
+                &db,
+                "srv-price-non-finite",
+                UpdateServerInput {
+                    price: Some(Some(price)),
+                    ..update_input()
+                },
+            )
+            .await;
+
+            let message = validation_message(result);
+            assert!(
+                message.contains("price"),
+                "validation message should mention price, got {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_server_rejects_invalid_billing_cycle() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-billing-cycle-invalid", "Billing Cycle Invalid").await;
+
+        for billing_cycle in ["weekly", ""] {
+            let result = ServerService::update_server(
+                &db,
+                "srv-billing-cycle-invalid",
+                UpdateServerInput {
+                    billing_cycle: Some(Some(billing_cycle.to_string())),
+                    ..update_input()
+                },
+            )
+            .await;
+
+            let message = validation_message(result);
+            assert!(
+                message.contains("billing_cycle"),
+                "validation message should mention billing_cycle, got {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_server_rejects_invalid_traffic_limit_type() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(
+            &db,
+            "srv-traffic-limit-type-invalid",
+            "Traffic Limit Type Invalid",
+        )
+        .await;
+
+        let result = ServerService::update_server(
+            &db,
+            "srv-traffic-limit-type-invalid",
+            UpdateServerInput {
+                traffic_limit_type: Some(Some("total".to_string())),
+                ..update_input()
+            },
+        )
+        .await;
+
+        let message = validation_message(result);
+        assert!(
+            message.contains("traffic_limit_type"),
+            "validation message should mention traffic_limit_type, got {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_server_rejects_invalid_billing_start_day() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(
+            &db,
+            "srv-billing-start-day-invalid",
+            "Billing Start Day Invalid",
+        )
+        .await;
+
+        for billing_start_day in [0, 29] {
+            let result = ServerService::update_server(
+                &db,
+                "srv-billing-start-day-invalid",
+                UpdateServerInput {
+                    billing_start_day: Some(Some(billing_start_day)),
+                    ..update_input()
+                },
+            )
+            .await;
+
+            let message = validation_message(result);
+            assert!(
+                message.contains("billing_start_day"),
+                "validation message should mention billing_start_day, got {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_server_allows_valid_and_cleared_billing_fields() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-billing-valid", "Billing Valid").await;
+
+        for (billing_cycle, traffic_limit_type) in
+            [("monthly", "sum"), ("quarterly", "up"), ("yearly", "down")]
+        {
+            let updated = ServerService::update_server(
+                &db,
+                "srv-billing-valid",
+                UpdateServerInput {
+                    price: Some(Some(0.0)),
+                    billing_cycle: Some(Some(billing_cycle.to_string())),
+                    traffic_limit_type: Some(Some(traffic_limit_type.to_string())),
+                    billing_start_day: Some(Some(28)),
+                    ..update_input()
+                },
+            )
+            .await
+            .expect("valid billing fields should update");
+
+            assert_eq!(updated.price, Some(0.0));
+            assert_eq!(updated.billing_cycle.as_deref(), Some(billing_cycle));
+            assert_eq!(
+                updated.traffic_limit_type.as_deref(),
+                Some(traffic_limit_type)
+            );
+            assert_eq!(updated.billing_start_day, Some(28));
+        }
+
+        let updated = ServerService::update_server(
+            &db,
+            "srv-billing-valid",
+            UpdateServerInput {
+                price: Some(None),
+                billing_cycle: Some(None),
+                traffic_limit_type: Some(None),
+                billing_start_day: Some(None),
+                ..update_input()
+            },
+        )
+        .await
+        .expect("explicit null billing fields should clear");
+
+        assert_eq!(updated.price, None);
+        assert_eq!(updated.billing_cycle, None);
+        assert_eq!(updated.traffic_limit_type, None);
+        assert_eq!(updated.billing_start_day, None);
+    }
+
+    #[tokio::test]
+    async fn update_server_rejects_invalid_country_code() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-cc-invalid", "CC Invalid").await;
+
+        for bad in ["USA", "U", "U1", "12"] {
+            let result = ServerService::update_server(
+                &db,
+                "srv-cc-invalid",
+                UpdateServerInput {
+                    country_code: Some(Some(bad.to_string())),
+                    ..update_input()
+                },
+            )
+            .await;
+            let message = validation_message(result);
+            assert!(
+                message.contains("country_code"),
+                "validation message should mention country_code for {bad:?}, got {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_server_country_override_pins_and_clears() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-cc", "CC").await;
+
+        // Setting a (lowercase) code uppercases it and flips on the manual flag.
+        let pinned = ServerService::update_server(
+            &db,
+            "srv-cc",
+            UpdateServerInput {
+                country_code: Some(Some("us".to_string())),
+                ..update_input()
+            },
+        )
+        .await
+        .expect("override should update");
+        assert_eq!(pinned.country_code.as_deref(), Some("US"));
+        assert!(pinned.geo_manual, "manual override flag should be set");
+
+        // Clearing it (explicit null) wipes geo and resumes auto-detection.
+        let cleared = ServerService::update_server(
+            &db,
+            "srv-cc",
+            UpdateServerInput {
+                country_code: Some(None),
+                ..update_input()
+            },
+        )
+        .await
+        .expect("clear should update");
+        assert_eq!(cleared.country_code, None);
+        assert_eq!(cleared.region, None);
+        assert!(!cleared.geo_manual, "manual override flag should be cleared");
+    }
+
+    #[tokio::test]
+    async fn update_system_info_respects_manual_geo_override() {
+        let (db, _tmp) = setup_test_db().await;
+        insert_test_server(&db, "srv-geo", "Geo").await;
+
+        // Operator pins the flag to JP.
+        ServerService::update_server(
+            &db,
+            "srv-geo",
+            UpdateServerInput {
+                country_code: Some(Some("JP".to_string())),
+                ..update_input()
+            },
+        )
+        .await
+        .expect("pin should succeed");
+
+        // A later agent report carrying a different GeoIP guess must not clobber it.
+        ServerService::update_system_info(
+            &db,
+            "srv-geo",
+            &system_info("auto"),
+            Some("California".to_string()),
+            Some("US".to_string()),
+        )
+        .await
+        .expect("update_system_info should succeed");
+
+        let after = ServerService::get_server(&db, "srv-geo")
+            .await
+            .expect("server should exist");
+        assert_eq!(
+            after.country_code.as_deref(),
+            Some("JP"),
+            "manual country_code must survive an agent report"
+        );
+        assert!(after.geo_manual, "manual flag must remain set");
+        // Non-geo fields from the report still apply.
+        assert_eq!(after.os.as_deref(), Some("Debian (auto)"));
+    }
+}

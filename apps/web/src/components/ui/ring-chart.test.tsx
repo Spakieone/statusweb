@@ -1,0 +1,101 @@
+import { render, screen } from '@testing-library/react'
+import { describe, expect, it } from 'vitest'
+import { RingChart } from './ring-chart'
+
+describe('RingChart', () => {
+  it('renders value text without percent sign', () => {
+    render(<RingChart color="#3b82f6" label="CPU" value={72.3} />)
+    expect(screen.getByText('72')).toBeDefined()
+  })
+
+  it('renders label', () => {
+    render(<RingChart color="#3b82f6" label="CPU" value={50} />)
+    expect(screen.getByText('CPU')).toBeDefined()
+  })
+
+  it('renders SVG with accessible role and label', () => {
+    render(<RingChart color="#3b82f6" label="MEM" value={85} />)
+    const svg = screen.getByRole('img')
+    expect(svg.getAttribute('aria-label')).toBe('MEM 85.0%')
+  })
+
+  it('clamps value to 0-100 range', () => {
+    const { rerender } = render(<RingChart color="#3b82f6" label="CPU" value={150} />)
+    expect(screen.getByText('100')).toBeDefined()
+
+    rerender(<RingChart color="#3b82f6" label="CPU" value={-10} />)
+    expect(screen.getByText('0')).toBeDefined()
+  })
+
+  it('accepts custom size', () => {
+    const { container } = render(<RingChart color="#3b82f6" label="CPU" size={40} value={50} />)
+    const wrapper = container.firstElementChild as HTMLElement
+    expect(wrapper.style.width).toBe('40px')
+  })
+
+  it('renders SVG with explicit width and height attributes', () => {
+    const { container } = render(<RingChart color="#3b82f6" label="CPU" size={48} value={50} />)
+    const svg = container.querySelector('svg')
+    expect(svg?.getAttribute('width')).toBe('48')
+    expect(svg?.getAttribute('height')).toBe('48')
+  })
+
+  it('renders two circles (background track + foreground arc)', () => {
+    const { container } = render(<RingChart color="#3b82f6" label="CPU" value={50} />)
+    const circles = container.querySelectorAll('circle')
+    expect(circles.length).toBe(2)
+  })
+
+  it('uses the shared metric track color for the background circle', () => {
+    const { container } = render(<RingChart color="#3b82f6" label="CPU" value={50} />)
+    const background = container.querySelector('circle')
+
+    expect(background).toHaveAttribute('stroke', 'var(--metric-ring-track)')
+  })
+
+  it('renders the center percentage with tabular figures so it does not jitter', () => {
+    render(<RingChart color="#3b82f6" label="CPU" value={72.3} />)
+    expect(screen.getByText('72')).toHaveClass('tabular-nums')
+  })
+
+  it('sizes the center percentage from the shared type scale, never below 10px', () => {
+    const { rerender } = render(<RingChart color="#3b82f6" label="CPU" value={72.3} />)
+    expect(screen.getByText('72')).toHaveClass('text-xs')
+
+    rerender(<RingChart color="#3b82f6" compact label="CPU" value={72.3} />)
+    expect(screen.getByText('72')).toHaveClass('text-[10px]')
+  })
+
+  it('applies color to foreground circle stroke', () => {
+    const { container } = render(<RingChart color="var(--color-chart-1)" label="CPU" value={50} />)
+    const circles = container.querySelectorAll('circle')
+    const foreground = circles[1] as SVGCircleElement
+    expect(foreground.style.stroke).toBe('var(--color-chart-1)')
+  })
+
+  it('maps value to stroke-dashoffset on a unit pathLength scale', () => {
+    const { container, rerender } = render(<RingChart color="#3b82f6" label="CPU" value={0} />)
+    const foreground = () => container.querySelectorAll('circle')[1] as SVGCircleElement
+
+    expect(foreground().getAttribute('pathLength')).toBe('100')
+    expect(foreground().style.strokeDasharray).toBe('100')
+    expect(foreground().style.strokeDashoffset).toBe('100')
+
+    rerender(<RingChart color="#3b82f6" label="CPU" value={50} />)
+    expect(foreground().style.strokeDashoffset).toBe('50')
+
+    rerender(<RingChart color="#3b82f6" label="CPU" value={100} />)
+    expect(foreground().style.strokeDashoffset).toBe('0')
+  })
+
+  it('enables CSS transitions for arc length and stroke color', () => {
+    const { container } = render(<RingChart color="var(--status-healthy)" label="CPU" value={40} />)
+    const foreground = container.querySelectorAll('circle')[1] as SVGCircleElement
+
+    expect(foreground.style.transition).toContain('stroke-dashoffset')
+    expect(foreground.style.transition).toContain('stroke')
+    expect(foreground.className.baseVal || foreground.getAttribute('class') || '').toContain(
+      'motion-reduce:[transition:none]'
+    )
+  })
+})

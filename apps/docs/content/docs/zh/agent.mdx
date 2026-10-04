@@ -1,0 +1,408 @@
+---
+title: Agent 安装配置
+description: ServerBee Agent 的安装、注册和配置指南。
+icon: Cpu
+---
+
+Agent 是部署在被监控服务器上的轻量级 Rust 二进制程序，运行在每一台你希望监控的服务器上。它采集系统指标（CPU、内存、磁盘、网络、负载、温度、GPU、磁盘 I/O），通过持久 WebSocket 连接实时上报至中心 Server，同时执行 Server 下发的探测任务和远程命令。
+
+## Agent 的职责
+
+- 每 3 秒采集一次系统指标并上报至 Server，全平台支持磁盘 I/O 吞吐量采集
+- 通过 WebSocket 将指标上报至 Server
+- 执行 Server 下发的 Ping 探测任务（ICMP、TCP、HTTP）
+- 提供 PTY Shell 终端会话供 Web 终端远程操作
+- 执行 Server 下发的远程命令
+- 管理远程文件操作（浏览、读取、写入、上传、下载），内置路径沙箱安全机制
+- 当 Docker daemon 可用时监控 Docker 容器（统计、日志、事件、网络、卷）
+- 支持在 Server 推送新版本时自动自升级
+- 连接断开后以指数退避自动重连
+
+## 安装方式
+
+### 安装脚本（推荐）
+
+安装脚本会自动检测架构、下载二进制、生成配置并注册 systemd 服务：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ZingerLittleBee/ServerBee/main/deploy/install.sh | sudo sh -s -- agent \
+  --server-url http://your-server-ip:9527 \
+  --enrollment-code YOUR_ONE_TIME_CODE
+```
+
+安装布局：二进制在 `/opt/serverbee/bin/`，配置在 `/opt/serverbee/etc/agent.toml`，管理 CLI 软链为 `/usr/local/bin/serverbee`。
+
+安装完成后，使用 `serverbee` CLI 管理 Agent（安装时自动部署）：
+
+```bash
+sudo serverbee status
+sudo serverbee upgrade agent -y
+sudo serverbee restart agent
+sudo serverbee config agent
+sudo serverbee uninstall agent -y
+```
+
+<Callout type="info">
+如果 Agent 已安装，再次执行 `install agent` 会直接报错并提示改用 `upgrade`，不会重复安装。要更新到新版本请用 `sudo serverbee upgrade agent -y`。
+</Callout>
+
+### 二进制下载
+
+从 [GitHub Releases](https://github.com/ZingerLittleBee/ServerBee/releases) 下载对应平台的二进制文件：
+
+| 平台 | 文件名 |
+|------|--------|
+| Linux amd64 | `serverbee-agent-linux-amd64` |
+| Linux arm64 | `serverbee-agent-linux-arm64` |
+| macOS amd64 | `serverbee-agent-darwin-amd64` |
+| macOS arm64 | `serverbee-agent-darwin-arm64` |
+| Windows amd64 | `serverbee-agent-windows-amd64.exe` |
+
+```bash
+wget https://github.com/ZingerLittleBee/ServerBee/releases/download/v1.0.0-beta.4/serverbee-agent-linux-amd64
+chmod +x serverbee-agent-linux-amd64
+sudo mv serverbee-agent-linux-amd64 /usr/local/bin/serverbee-agent
+```
+
+### 源码编译
+
+```bash
+git clone https://github.com/ZingerLittleBee/ServerBee.git
+cd ServerBee
+cargo build --release -p serverbee-agent
+
+# 启用 NVIDIA GPU 监控（可选）
+cargo build --release -p serverbee-agent --features gpu
+```
+
+二进制文件位于 `target/release/serverbee-agent`。
+
+### Docker（不推荐）
+
+<Callout type="info">
+Agent 可执行文件本身是单一二进制，但受管理安装还会持久化 `/opt/serverbee/etc` 下的配置/run token、服务元数据、配置的 `state_dir`（默认 `/var/lib/serverbee`）下的临时能力授予和安全状态。请使用 `serverbee uninstall agent`；只有确定要删除保留的凭据与状态时才加 `--purge`。
+</Callout>
+
+如果仍要使用 Docker，先创建持久化配置。把两个占位符替换为「添加服务器」显示的地址和一次性 Offer：
+
+```bash
+sudo install -d -m 0700 /opt/serverbee-agent
+sudo tee /opt/serverbee-agent/agent.toml >/dev/null <<'EOF'
+server_url = "https://monitor.example.com"
+enrollment_code = "YOUR_ONE_TIME_CODE"
+token = ""
+EOF
+sudo chmod 0600 /opt/serverbee-agent/agent.toml
+```
+
+然后运行采集宿主机指标所需的特权容器：
+
+```bash
+docker run -d \
+  --name serverbee-agent \
+  --privileged \
+  --net=host \
+  --pid=host \
+  -v /proc:/host/proc:ro \
+  -v /sys:/host/sys:ro \
+  -v /etc/os-release:/host/etc/os-release:ro \
+  -v /opt/serverbee-agent:/etc/serverbee \
+  --restart unless-stopped \
+  ghcr.io/zingerlittlebee/serverbee-agent:1.0.0-beta.4
+```
+
+<Callout type="warn">
+持久化 `/etc/serverbee` 挂载是必须的。Agent 在领取 Enrollment Offer 前会生成 run token，并原子写入 `agent.toml`。若没有它，容器重建后会丢失 Server 已接受的凭据。
+</Callout>
+
+**Docker 部署的限制：**
+
+- 需要 `--privileged` 权限才能采集完整指标
+- 温度和 GPU 监控在容器内可能无法工作
+- Web 终端功能访问的是容器内环境，而非宿主机
+
+## 注册流程
+
+Agent 使用自己持有的 **run token** 向 Server 认证。Agent 会在领取一次性 Enrollment Offer 前本地生成并持久化该 secret；Server 只保存哈希，永远不会返回明文 token。
+
+### 通过注册码注册（推荐）
+
+1. 以管理员身份登录后选择「添加服务器」。Server onboarding 会在同一事务中创建 Server 身份和一次性 **Enrollment Offer**。注册码单次使用、默认 10 分钟有效，且明文只显示一次。
+2. 用注册码配置 Agent，可通过环境变量：
+
+```bash
+SERVERBEE_SERVER_URL=http://your-server-ip:9527 \
+SERVERBEE_ENROLLMENT_CODE=YOUR_ONE_TIME_CODE \
+serverbee-agent
+```
+
+也可写入配置文件：
+
+```toml title="/etc/serverbee/agent.toml"
+server_url = "http://your-server-ip:9527"
+enrollment_code = "<添加服务器时显示的一次性注册码>"
+# 首次运行时留空，Agent 会在 claim 前生成并持久化
+token = ""
+```
+
+3. 启动 Agent。首次运行（无 token）时，它会：
+   - 生成高熵 run token，并在发出 claim 前原子写入配置
+   - 调用 `POST /api/agent/register`，同时提交一次性注册码和 `proposed_run_token`
+   - 只接收 `server_id`；Server 在消费 Offer 的同一事务中保存 token 哈希
+   - 后续所有会话都使用 token 通过 WebSocket 连接——注册码不再需要
+
+后续运行（已有 token）时，Agent 直接通过 WebSocket 连接，发送静态系统信息，并按 Server 指定的间隔上报指标。
+
+若 HTTP 结果不明确，Agent 会先用已落盘的 token 尝试 WebSocket。成功即可证明 claim 已提交；被拒绝时仍可用同一 code/token 重试。若注册码丢失，应在既有 Server 上按可见的精确 Offer ID 替换 Outstanding Offer，不会发生无条件覆盖。
+
+### 更正错误的注册码
+
+如果安装时把注册码（或 `server_url`）填错了，且 Agent 尚未完成 claim，无需重装即可更正。需要新码时，先在 Server 页面按精确 ID 替换当前 Outstanding Offer，再执行：
+
+```bash
+serverbee config set enrollment_code <新注册码> -y
+# 如果 server_url 也填错了：
+serverbee config set server_url http://your-server-ip:9527 -y
+```
+
+`-y` 会顺带重启 Agent，使其立即用新码重新尝试注册。不加 `-y` 时只写入配置但不重启服务，需再执行 `serverbee restart agent`。
+
+用 `sudo serverbee status` 和 `sudo journalctl -u serverbee-agent -n 80 --no-pager` 验证修正结果。不要重跑 `serverbee install agent`，安装器会有意拒绝已纳管的组件。
+
+Agent 完成 claim 后便不再使用注册码。替换或重装时使用「Agent 重新接入」：平滑模式会保留当前 Authority，直到新 Agent claim；紧急模式会立即吊销 Authority 并封锁当前连接。
+
+## 配置文件
+
+Agent 按以下顺序读取 TOML 配置文件：
+
+1. `/etc/serverbee/agent.toml`（系统级，优先）
+2. `agent.toml`（工作目录）
+3. 带 `SERVERBEE_` 前缀的环境变量
+
+<Callout type="info">
+通过安装脚本部署时，配置文件位于 `/opt/serverbee/etc/agent.toml`（`/etc/serverbee` 为旧版布局，脚本会自动迁移）。
+</Callout>
+
+下面是首次连接所需的最小 `agent.toml`。[配置参考](/zh/docs/configuration)才是 `file`、`capabilities`、`security`、`ip_change`、`upgrade` 等分组的权威完整列表：
+
+```toml
+# 必填：ServerBee Server 的地址
+server_url = "http://your-server-ip:9527"
+
+# Agent 自有 run token（注册前由 Agent 生成并落盘）
+token = ""
+
+# 首次注册用的一次性注册码（仅在 token 为空时使用）
+enrollment_code = ""
+
+[collector]
+enable_gpu = false             # 启用 NVIDIA GPU 监控（需要启用 GPU 特性的构建和 NVIDIA NVML）
+enable_temperature = true      # 启用温度传感器监控
+
+[log]
+level = "info"                 # 日志级别：trace、debug、info、warn、error
+file = ""                      # 日志文件路径（留空仅输出到 stdout）
+```
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `server_url` | string | 必填 | ServerBee Server 的地址 |
+| `enrollment_code` | string | `""` | 一次性注册码，仅首次注册时需要；注册成功后即被消费，拥有 token 后无需再填 |
+| `token` | string | Agent 生成 | Agent 在 claim 前原子写入的 run token；Server 仅保存哈希 |
+| `collector.enable_gpu` | bool | `false` | 是否启用 GPU 指标采集 |
+| `collector.enable_temperature` | bool | `true` | 是否启用温度采集 |
+| `log.level` | string | `"info"` | 日志级别 |
+| `log.file` | string | `""` | 日志文件路径（留空仅输出到 stdout） |
+
+### 环境变量
+
+与 Server 一样，所有选项都支持 `SERVERBEE_` 前缀的环境变量，嵌套字段用 `__`（双下划线）分隔：
+
+```bash
+export SERVERBEE_SERVER_URL="http://your-server-ip:9527"
+export SERVERBEE_TOKEN="your-agent-token"
+export SERVERBEE_COLLECTOR__ENABLE_GPU=true
+```
+
+<Callout type="info">
+Server 当前在 `Welcome` 消息中下发 3 秒的 `report_interval`，Agent 使用该值启动上报循环。`collector.interval` 和 `SERVERBEE_COLLECTOR__INTERVAL` 仍为向后兼容而保留，但不会改变实际的上报周期。
+</Callout>
+
+## Agent 本地功能锁定
+
+能力策略完全由 Agent 主机拥有，可通过本地配置或 CLI 参数调整：
+
+```bash
+serverbee-agent --allow-cap terminal --allow-cap exec
+serverbee-agent --deny-cap ping_http
+```
+
+- 默认集合为 `upgrade`、`ping_icmp`、`ping_tcp`、`ping_http`、`security_events`、`firewall_block`、`ip_quality`
+- 高风险能力（`terminal`、`exec`、`file`、`docker`）默认关闭
+- `--deny-cap` 优先级高于 `--allow-cap`
+
+Server 只镜像上报结果，并拒绝集合之外的请求。Server 没有能力开关，不能开启或进一步配置 Agent 的集合。详见[功能开关](/zh/docs/capabilities)。
+
+## GPU 监控
+
+NVIDIA GPU 指标采集默认关闭，需同时满足以下三个条件：
+
+1. **编译时**：用 `gpu` feature flag 编译 Agent（预编译的 Release 二进制不含该特性）
+   ```bash
+   cargo build --release -p serverbee-agent --features gpu
+   ```
+2. **运行时**：宿主机安装了可提供 NVML 共享库的 NVIDIA 驱动
+3. **配置中**：设置 `enable_gpu = true`
+   ```toml
+   [collector]
+   enable_gpu = true
+   ```
+
+启用后，Agent 会为每块设备采集 GPU 指标：
+
+| 指标 | 说明 |
+|------|------|
+| 设备名称 | GPU 型号 |
+| 显存总量 | 总显存大小 |
+| 显存使用量 | 当前使用的显存 |
+| GPU 利用率 | GPU 计算核心利用率百分比 |
+| GPU 温度 | 当前温度 |
+
+这些指标会显示在 Server 管理面板中，并可用于告警规则。
+
+<Callout type="info">
+目前仅支持 NVIDIA GPU（通过 `nvml-wrapper` 库）。AMD 和 Intel GPU 的支持计划在后续版本中加入。
+</Callout>
+
+Agent 通过 `nvml-wrapper` 直接调用 NVML，不会执行 `nvidia-smi`。
+
+## 作为 systemd 服务运行
+
+生产环境建议将 Agent 作为 systemd 服务运行，以便开机自启。安装脚本会自动创建该服务；如需手动配置，创建 `/etc/systemd/system/serverbee-agent.service`：
+
+```ini title="/etc/systemd/system/serverbee-agent.service"
+[Unit]
+Description=ServerBee Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/serverbee-agent
+Restart=always
+RestartSec=5
+User=root
+WorkingDirectory=/etc/serverbee
+AmbientCapabilities=CAP_NET_RAW
+
+# 可选：限制资源占用
+MemoryMax=128M
+CPUQuota=10%
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`AmbientCapabilities=CAP_NET_RAW` 是 ICMP Ping 探测所需的权限；不需要 ICMP 探测可移除此行。
+
+然后启用并启动服务：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable serverbee-agent
+sudo systemctl start serverbee-agent
+```
+
+查看运行状态和日志：
+
+```bash
+sudo systemctl status serverbee-agent
+journalctl -u serverbee-agent -f
+```
+
+<Callout type="info">
+Agent 需以 root 运行才能访问全部系统指标（温度传感器、进程列表等）并为 Web 终端打开 PTY 会话。如果不需要终端访问，也可以用非 root 用户运行，但部分指标可能采集不到。
+</Callout>
+
+## 平台支持
+
+| 平台 | 支持级别 | 说明 |
+|------|----------|------|
+| Linux (amd64/arm64) | 完整支持 | 主要目标平台，所有功能可用 |
+| macOS (amd64/arm64) | 完整支持 | 适用于开发和测试 |
+| Windows (amd64) | 基本支持 | TCP/UDP 连接数采集走不同代码路径 |
+| FreeBSD | 基本支持 | `sysinfo` 对 FreeBSD 的支持有限 |
+
+## 自动更新
+
+Server 可以向在线 Agent 推送升级命令。触发升级时：
+
+1. Server 发送 `Upgrade` 消息，包含目标版本和任务 ID
+2. Agent 根据本地 `[upgrade] release_repo_url` 固定源推导二进制及 checksum URL
+3. Agent 使用 `sha256sums.txt` 校验下载的二进制
+4. 预检探针会执行候选二进制，并要求其报告的内置版本与目标版本一致
+5. Agent 持久化升级事务，将当前二进制复制为 `.bak`，再原子替换候选版本
+6. systemd/OpenRC 负责重启服务；若 Agent 由手动启动，旧进程会启动并监控候选进程，直到其通过健康检查
+7. 候选版本必须在 90 秒内重新连接并发送 `SystemInfo`，随后继续通过五秒稳定窗口。若进程退出或未通过任一检查，Agent 会恢复 `.bak`、重启旧版本，并在重新连接后上报升级失败
+
+管理员可以在 Dashboard 的服务器详情页触发升级，也可以通过 API：
+
+```bash
+curl -X POST https://your-server/api/servers/{id}/upgrade \
+  -H "Cookie: session_token=..." \
+  -H "Content-Type: application/json" \
+  -d '{"version": "1.2.0"}'
+```
+
+<Callout type="warn">
+自动更新需要 Agent 具有 `upgrade` 能力（`CAP_UPGRADE`），默认启用。能力由 Agent 拥有 —— 如需关闭，在 Agent 主机的 `[capabilities]` deny 列表中加入 `upgrade`（或传 `--deny-cap upgrade`）。见 [功能开关](/zh/docs/capabilities)。
+</Callout>
+
+<Callout type="info">
+自动回滚由“发起升级的 Agent 版本”执行。从旧 Alpha Agent 发起的第一次升级仍会使用旧版升级器；至少安装一次带有回滚机制的版本后，后续远程升级才能获得此保护。
+</Callout>
+
+## 断线重连
+
+Agent 与 Server 之间维持一条持久 WebSocket 连接。连接断开后会自动重连：
+
+- **指数退避**：从 1 秒起步（1s → 2s → 4s → 8s → 16s → 30s 上限）
+- **随机抖动**：每次退避增加 +/-20% 的随机偏移，避免大量 Agent 同时重连造成雷群效应
+- **重连恢复**：重连成功后退避重置为 1 秒，并自动重新上报 `SystemInfo`
+- **心跳检测**：Server 每 30 秒发送一次 Ping，Agent 回复 Pong；超过 30 秒无上报即判定为离线
+
+首次连接过程：
+
+1. Server 发送 `Welcome` 消息，包含分配的 `server_id` 和 `report_interval`
+2. Agent 发送 `SystemInfo`（CPU 型号、核心数、架构、操作系统、内核、内存、磁盘、IP 地址、虚拟化类型、Agent 版本）
+3. Server 以 `Ack` 确认
+4. Server 同步所有已分配的 Ping 任务
+5. Agent 开始周期性指标上报循环
+
+## 采集指标详情
+
+Agent 采集以下指标（来源于 `sysinfo` 库、Linux 下的 `/proc`，以及用于 GPU 的 `nvml-wrapper`）并上报至 Server：
+
+| 类别 | 上报字段 | 采集来源 |
+|------|----------|----------|
+| CPU | `cpu`（使用率 %）、型号、核心数、架构 | `sysinfo::System` |
+| 内存 | `mem_used`、`swap_used`（字节） | `sysinfo::System` |
+| 磁盘 | `disk_used`（字节） | `sysinfo::Disks` |
+| 网络 | `net_in_speed` / `net_out_speed`、`net_in_transfer` / `net_out_transfer`（字节） | `sysinfo::Networks` + 差值计算 |
+| 负载 | `load1` / `load5` / `load15` | `sysinfo::System::load_average()` |
+| 连接数 | `tcp_conn` / `udp_conn` | `/proc/net/tcp`（Linux） |
+| 进程 | `process_count` | `sysinfo::System::processes()` |
+| 运行时间 | `uptime`（秒） | `sysinfo::System` |
+| 温度 | `temperature`（°C，可选） | `sysinfo::Components` |
+| GPU | `gpu`（利用率、显存、温度，可选） | `nvml-wrapper` |
+| 虚拟化 | 虚拟化类型 | `systemd-detect-virt` / DMI |
+
+## 资源开销
+
+Agent CPU 开销可忽略（&lt;1%），内存稳态在数十 MB 级别。完整的 Agent 与 Server CPU/内存/磁盘/网络实测数据见[资源开销](/zh/docs/resource-usage)。
+
+<Cards>
+  <Card title="Server 安装配置" href="/zh/docs/server" />
+  <Card title="完整配置参考" href="/zh/docs/configuration" />
+  <Card title="监控功能" href="/zh/docs/monitoring" />
+</Cards>

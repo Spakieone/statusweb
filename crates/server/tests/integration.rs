@@ -1,0 +1,4813 @@
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use sea_orm::{ConnectOptions, ConnectionTrait, Database};
+use sea_orm_migration::MigratorTrait;
+use serde_json::json;
+use serverbee_common::constants::{CAP_DEFAULT, CAP_EXEC, CAP_FILE, CAP_PING_TCP, CAP_TERMINAL};
+use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+use serverbee_common::types::{DiskIo, SystemReport};
+use serverbee_server::config::{AppConfig, AuthConfig, DatabaseConfig, ServerConfig};
+use serverbee_server::migration::Migrator;
+use serverbee_server::router::create_router;
+use serverbee_server::service::auth::AuthService;
+use serverbee_server::service::record::RecordService;
+use serverbee_server::state::AppState;
+
+/// Start a test server in a temporary directory with a random port.
+/// Returns `(base_url, temp_dir)` where `temp_dir` is kept alive for the
+/// duration of the test (dropping it removes the temporary directory).
+async fn start_test_server() -> (String, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    let config = AppConfig {
+        server: ServerConfig {
+            listen: "127.0.0.1:0".to_string(),
+            data_dir: data_dir.clone(),
+            trusted_proxies: Vec::new(),
+        },
+        database: DatabaseConfig {
+            path: "test.db".to_string(),
+            max_connections: 5,
+        },
+        auth: AuthConfig {
+            session_ttl: 86400,
+            secure_cookie: false,
+            max_servers: 0,
+        },
+        ..AppConfig::default()
+    };
+
+    // Connect to SQLite
+    let db_path = format!("{}/test.db", data_dir);
+    let db_url = format!("sqlite://{}?mode=rwc", db_path);
+    let mut opt = ConnectOptions::new(&db_url);
+    opt.max_connections(5);
+    opt.sqlx_logging(false);
+
+    let db = Database::connect(opt)
+        .await
+        .expect("Failed to connect to test database");
+
+    // SQLite pragmas
+    db.execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+    db.execute_unprepared("PRAGMA foreign_keys=ON")
+        .await
+        .unwrap();
+
+    // Run migrations
+    Migrator::up(&db, None)
+        .await
+        .expect("Failed to run migrations");
+
+    // Seed a ready-to-use admin (password known, onboarding already done)
+    // so existing tests can log in without the forced-change flow.
+    AuthService::create_user(&db, "admin", "testpass", "admin")
+        .await
+        .expect("Failed to seed admin");
+
+    // Build state and router
+    let state = AppState::new(db, config)
+        .await
+        .expect("Failed to create AppState");
+    let app = create_router(state);
+
+    // Bind to a random port
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind listener");
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+
+    // Spawn the server
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    // Give the server a moment to start accepting connections
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (base_url, tmp)
+}
+
+/// Build a reqwest client that stores cookies automatically.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .cookie_store(true)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to build HTTP client")
+}
+
+/// Login as admin and return the authenticated client (with session cookie).
+async fn login_admin(client: &reqwest::Client, base_url: &str) -> serde_json::Value {
+    let resp = client
+        .post(format!("{}/api/auth/login", base_url))
+        .json(&json!({
+            "username": "admin",
+            "password": "testpass"
+        }))
+        .send()
+        .await
+        .expect("Login request failed");
+
+    assert_eq!(resp.status(), 200, "Login should succeed");
+    resp.json::<serde_json::Value>()
+        .await
+        .expect("Failed to parse login response")
+}
+
+async fn create_api_key(client: &reqwest::Client, base_url: &str) -> String {
+    let resp = client
+        .post(format!("{}/api/auth/api-keys", base_url))
+        .json(&json!({ "name": "integration-key" }))
+        .send()
+        .await
+        .expect("POST /api/auth/api-keys failed");
+
+    assert_eq!(resp.status(), 200, "API key creation should succeed");
+    let body: serde_json::Value = resp.json().await.expect("Failed to parse API key response");
+    body["data"]["key"]
+        .as_str()
+        .expect("API key missing")
+        .to_string()
+}
+
+async fn list_audit_entries(client: &reqwest::Client, base_url: &str) -> Vec<serde_json::Value> {
+    let audit_resp = client
+        .get(format!("{}/api/audit-logs", base_url))
+        .send()
+        .await
+        .expect("GET /api/audit-logs failed");
+
+    assert_eq!(audit_resp.status(), 200, "audit log listing should succeed");
+    let audit_body: serde_json::Value = audit_resp.json().await.unwrap();
+    audit_body["data"]["entries"]
+        .as_array()
+        .expect("entries should be an array")
+        .clone()
+}
+
+async fn mint_enrollment_code(client: &reqwest::Client, base_url: &str) -> String {
+    create_pending_server_named(client, base_url, "integration-test-server").await
+}
+
+async fn create_pending_server_named(
+    client: &reqwest::Client,
+    base_url: &str,
+    name: &str,
+) -> String {
+    login_admin(client, base_url).await;
+    let resp = client
+        .post(format!("{}/api/servers", base_url))
+        .json(&json!({
+            "onboarding_request_id": uuid::Uuid::new_v4().to_string(),
+            "name": name
+        }))
+        .send()
+        .await
+        .expect("Create-server request failed");
+    assert_eq!(resp.status(), 200, "Create server should succeed");
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("Failed to parse create-server response");
+    body["data"]["enrollment"]["code"]
+        .as_str()
+        .expect("enrollment code missing")
+        .to_string()
+}
+
+async fn register_agent(client: &reqwest::Client, base_url: &str) -> (String, String) {
+    let code = mint_enrollment_code(client, base_url).await;
+    let token = format!("integration-token-{}", uuid::Uuid::new_v4());
+    let register_resp = client
+        .post(format!("{}/api/agent/register", base_url))
+        .header("Authorization", format!("Bearer {code}"))
+        .json(&json!({ "proposed_run_token": token }))
+        .send()
+        .await
+        .expect("Register request failed");
+
+    assert_eq!(
+        register_resp.status(),
+        200,
+        "Agent registration should succeed"
+    );
+    let register_body: serde_json::Value = register_resp
+        .json()
+        .await
+        .expect("Failed to parse register response");
+
+    let server_id = register_body["data"]["server_id"]
+        .as_str()
+        .expect("server_id missing")
+        .to_string();
+    (server_id, token)
+}
+
+async fn connect_agent(
+    base_url: &str,
+    token: &str,
+) -> (
+    futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tungstenite::Message,
+    >,
+    futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+) {
+    let ws_url = format!(
+        "{}/api/agent/ws?token={}",
+        base_url.replace("http://", "ws://"),
+        token
+    );
+    let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WebSocket connection failed");
+
+    ws_stream.split()
+}
+
+async fn recv_agent_text(
+    reader: &mut futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+) -> serde_json::Value {
+    let message = tokio::time::timeout(Duration::from_secs(5), reader.next())
+        .await
+        .expect("Timed out waiting for agent message")
+        .expect("Agent WebSocket stream ended")
+        .expect("Agent WebSocket read error");
+
+    let text = match message {
+        tungstenite::Message::Text(text) => text.to_string(),
+        other => panic!("Expected Text message, got: {:?}", other),
+    };
+
+    serde_json::from_str(&text).expect("Failed to parse agent message")
+}
+
+async fn send_system_info(
+    sink: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tungstenite::Message,
+    >,
+    reader: &mut futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+    msg_id: &str,
+    agent_local_capabilities: Option<u32>,
+) {
+    let system_info = json!({
+        "type": "system_info",
+        "msg_id": msg_id,
+        "cpu_name": "Intel Xeon E5-2680 v4",
+        "cpu_cores": 8,
+        "cpu_arch": "x86_64",
+        "os": "Ubuntu 22.04",
+        "kernel_version": "5.15.0-100-generic",
+        "mem_total": 16_000_000_000_i64,
+        "swap_total": 4_000_000_000_i64,
+        "disk_total": 100_000_000_000_i64,
+        "ipv4": "1.2.3.4",
+        "ipv6": null,
+        "virtualization": "kvm",
+        "agent_version": "0.1.0",
+        "protocol_version": serverbee_common::constants::PROTOCOL_VERSION,
+        "features": [],
+        "agent_local_capabilities": agent_local_capabilities
+    });
+
+    sink.send(tungstenite::Message::Text(system_info.to_string().into()))
+        .await
+        .expect("Failed to send SystemInfo");
+
+    loop {
+        let msg = recv_agent_text(reader).await;
+        if msg["type"] == "ack" {
+            assert_eq!(msg["msg_id"], msg_id);
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_agent_register_connect_report() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    // ── Step 1: Register agent ──
+    let enrollment_code = mint_enrollment_code(&client, &base_url).await;
+    let token = format!("integration-token-{}", uuid::Uuid::new_v4());
+    let register_resp = client
+        .post(format!("{}/api/agent/register", base_url))
+        .header("Authorization", format!("Bearer {enrollment_code}"))
+        .json(&json!({ "proposed_run_token": token }))
+        .send()
+        .await
+        .expect("Register request failed");
+
+    assert_eq!(
+        register_resp.status(),
+        200,
+        "Agent registration should succeed"
+    );
+    let register_body: serde_json::Value = register_resp
+        .json()
+        .await
+        .expect("Failed to parse register response");
+
+    let server_id = register_body["data"]["server_id"]
+        .as_str()
+        .expect("server_id missing");
+    assert!(!server_id.is_empty(), "server_id should not be empty");
+    assert!(!token.is_empty(), "token should not be empty");
+
+    // ── Step 2: Connect via WebSocket ──
+    let ws_url = format!(
+        "{}/api/agent/ws?token={}",
+        base_url.replace("http://", "ws://"),
+        token
+    );
+    let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WebSocket connection failed");
+
+    let (mut ws_sink, mut ws_reader) = ws_stream.split();
+
+    // Read Welcome message
+    let welcome_msg = tokio::time::timeout(Duration::from_secs(5), ws_reader.next())
+        .await
+        .expect("Timeout waiting for Welcome")
+        .expect("WebSocket stream ended")
+        .expect("WebSocket read error");
+
+    let welcome_text = match welcome_msg {
+        tungstenite::Message::Text(t) => t.to_string(),
+        other => panic!("Expected Text message, got: {:?}", other),
+    };
+
+    let welcome: serde_json::Value =
+        serde_json::from_str(&welcome_text).expect("Failed to parse Welcome");
+    assert_eq!(welcome["type"], "welcome");
+    assert_eq!(welcome["server_id"], server_id);
+    assert_eq!(
+        welcome["protocol_version"],
+        serverbee_common::constants::PROTOCOL_VERSION
+    );
+
+    // ── Step 3: Send SystemInfo ──
+    let system_info = json!({
+        "type": "system_info",
+        "msg_id": "test-msg-1",
+        "cpu_name": "Intel Xeon E5-2680 v4",
+        "cpu_cores": 8,
+        "cpu_arch": "x86_64",
+        "os": "Ubuntu 22.04",
+        "kernel_version": "5.15.0-100-generic",
+        "mem_total": 16_000_000_000_i64,
+        "swap_total": 4_000_000_000_i64,
+        "disk_total": 100_000_000_000_i64,
+        "ipv4": "1.2.3.4",
+        "ipv6": null,
+        "virtualization": "kvm",
+        "agent_version": "0.1.0"
+    });
+
+    ws_sink
+        .send(tungstenite::Message::Text(system_info.to_string().into()))
+        .await
+        .expect("Failed to send SystemInfo");
+
+    // Read messages until we get the Ack for SystemInfo (skip ping_tasks_sync etc.)
+    let ack = loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws_reader.next())
+            .await
+            .expect("Timeout waiting for Ack")
+            .expect("WebSocket stream ended")
+            .expect("WebSocket read error");
+
+        let text = match msg {
+            tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("Expected Text message, got: {:?}", other),
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).expect("Failed to parse message");
+        if parsed["type"] == "ack" {
+            break parsed;
+        }
+    };
+    assert_eq!(ack["msg_id"], "test-msg-1");
+
+    // ── Step 4: Send Report ──
+    let report = json!({
+        "type": "report",
+        "cpu": 45.5,
+        "mem_used": 8_000_000_000_i64,
+        "swap_used": 500_000_000_i64,
+        "disk_used": 30_000_000_000_i64,
+        "net_in_speed": 1_000_000_i64,
+        "net_out_speed": 500_000_i64,
+        "net_in_transfer": 10_000_000_000_i64,
+        "net_out_transfer": 5_000_000_000_i64,
+        "load1": 1.5,
+        "load5": 1.2,
+        "load15": 0.8,
+        "tcp_conn": 42,
+        "udp_conn": 5,
+        "process_count": 120,
+        "uptime": 86400_u64,
+        "temperature": 55.0,
+        "gpu": null
+    });
+
+    ws_sink
+        .send(tungstenite::Message::Text(report.to_string().into()))
+        .await
+        .expect("Failed to send Report");
+
+    // Small delay to let the server process the report
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // ── Step 5: Login as admin and verify ──
+    let login_body = login_admin(&client, &base_url).await;
+    assert_eq!(login_body["data"]["username"], "admin");
+
+    // ── Step 6: GET /api/servers → verify server is listed ──
+    let servers_resp = client
+        .get(format!("{}/api/servers", base_url))
+        .send()
+        .await
+        .expect("GET /api/servers failed");
+
+    assert_eq!(servers_resp.status(), 200);
+    let servers_body: serde_json::Value = servers_resp
+        .json()
+        .await
+        .expect("Failed to parse servers response");
+
+    let servers = servers_body["data"]
+        .as_array()
+        .expect("data should be an array");
+    assert!(
+        servers.iter().any(|s| s["id"] == server_id),
+        "Registered server should appear in /api/servers"
+    );
+
+    // ── Step 7: GET /api/servers/{server_id} → verify SystemInfo fields ──
+    let server_resp = client
+        .get(format!("{}/api/servers/{}", base_url, server_id))
+        .send()
+        .await
+        .expect("GET /api/servers/{id} failed");
+
+    assert_eq!(server_resp.status(), 200);
+    let server_body: serde_json::Value = server_resp
+        .json()
+        .await
+        .expect("Failed to parse server detail response");
+
+    let server_data = &server_body["data"];
+    assert_eq!(server_data["cpu_name"], "Intel Xeon E5-2680 v4");
+    assert_eq!(server_data["cpu_cores"], 8);
+    assert_eq!(server_data["cpu_arch"], "x86_64");
+    assert_eq!(server_data["os"], "Ubuntu 22.04");
+    assert_eq!(server_data["kernel_version"], "5.15.0-100-generic");
+    assert_eq!(server_data["virtualization"], "kvm");
+    assert_eq!(server_data["agent_version"], "0.1.0");
+    assert_eq!(server_data["ipv4"], "1.2.3.4");
+
+    // Clean up: close the WS connection
+    let _ = ws_sink.close().await;
+}
+
+#[tokio::test]
+async fn test_server_detail_returns_runtime_capability_fields() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    let (server_id, token) = register_agent(&client, &base_url).await;
+    let (mut ws_sink, mut ws_reader) = connect_agent(&base_url, &token).await;
+
+    let welcome = recv_agent_text(&mut ws_reader).await;
+    assert_eq!(welcome["type"], "welcome");
+    assert_eq!(welcome["server_id"], server_id);
+
+    let agent_local_capabilities = CAP_PING_TCP | CAP_FILE;
+    send_system_info(
+        &mut ws_sink,
+        &mut ws_reader,
+        "runtime-capabilities-msg",
+        Some(agent_local_capabilities),
+    )
+    .await;
+
+    login_admin(&client, &base_url).await;
+
+    let server_resp = client
+        .get(format!("{}/api/servers/{}", base_url, server_id))
+        .send()
+        .await
+        .expect("GET /api/servers/{id} failed");
+
+    assert_eq!(server_resp.status(), 200);
+    let server_body: serde_json::Value = server_resp
+        .json()
+        .await
+        .expect("Failed to parse server detail response");
+
+    let server_data = &server_body["data"];
+    // Capabilities are agent-owned: the `capabilities` column is now a mirror
+    // of what the agent reported, and effective == agent-local (no server mask).
+    assert_eq!(server_data["capabilities"], agent_local_capabilities);
+    assert_eq!(
+        server_data["agent_local_capabilities"],
+        agent_local_capabilities
+    );
+    assert_eq!(
+        server_data["effective_capabilities"],
+        agent_local_capabilities
+    );
+
+    let _ = ws_sink.close().await;
+}
+
+#[tokio::test]
+async fn test_server_records_api_returns_disk_io_json() {
+    let (base_url, tmp) = start_test_server().await;
+    let client = http_client();
+
+    let enrollment_code = mint_enrollment_code(&client, &base_url).await;
+    let register_resp = client
+        .post(format!("{}/api/agent/register", base_url))
+        .header("Authorization", format!("Bearer {enrollment_code}"))
+        .json(&json!({
+            "proposed_run_token": format!("integration-token-{}", uuid::Uuid::new_v4())
+        }))
+        .send()
+        .await
+        .expect("Register request failed");
+    assert_eq!(
+        register_resp.status(),
+        200,
+        "Agent registration should succeed"
+    );
+
+    let register_body: serde_json::Value = register_resp
+        .json()
+        .await
+        .expect("Failed to parse register response");
+    let server_id = register_body["data"]["server_id"]
+        .as_str()
+        .expect("server_id missing")
+        .to_string();
+
+    let db_url = format!("sqlite://{}?mode=rwc", tmp.path().join("test.db").display());
+    let db = Database::connect(&db_url)
+        .await
+        .expect("Failed to connect to test database");
+
+    RecordService::save_report(
+        &db,
+        &server_id,
+        &SystemReport {
+            disk_io: Some(vec![DiskIo {
+                name: "sda".to_string(),
+                read_bytes_per_sec: 1024,
+                write_bytes_per_sec: 2048,
+            }]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("save_report should succeed");
+
+    login_admin(&client, &base_url).await;
+
+    let now = chrono::Utc::now();
+    let from = (now - chrono::Duration::hours(1)).to_rfc3339();
+    let to = now.to_rfc3339();
+    let records_resp = client
+        .get(format!("{}/api/servers/{}/records", base_url, server_id))
+        .query(&[
+            ("from", from.as_str()),
+            ("to", to.as_str()),
+            ("interval", "raw"),
+        ])
+        .send()
+        .await
+        .expect("GET /api/servers/{id}/records failed");
+
+    assert_eq!(records_resp.status(), 200);
+    let records_body: serde_json::Value = records_resp
+        .json()
+        .await
+        .expect("Failed to parse records response");
+
+    let disk_io_json = records_body["data"][0]["disk_io_json"]
+        .as_str()
+        .expect("disk_io_json should be present");
+    let disk_io: Vec<DiskIo> =
+        serde_json::from_str(disk_io_json).expect("disk_io_json should deserialize");
+
+    assert_eq!(disk_io.len(), 1);
+    assert_eq!(disk_io[0].name, "sda");
+    assert_eq!(disk_io[0].read_bytes_per_sec, 1024);
+    assert_eq!(disk_io[0].write_bytes_per_sec, 2048);
+}
+
+#[tokio::test]
+async fn test_backup_restore() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    // ── Step 1: Login as admin ──
+    login_admin(&client, &base_url).await;
+
+    // ── Step 2: Create a notification (to verify backup contains data) ──
+    let create_resp = client
+        .post(format!("{}/api/notifications", base_url))
+        .json(&json!({
+            "name": "Test Webhook",
+            "notify_type": "webhook",
+            "config_json": {
+                "type": "webhook",
+                "url": "https://example.com/hook",
+                "method": "POST",
+                "headers": {},
+                "body_template": null
+            },
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("Create notification failed");
+
+    assert_eq!(
+        create_resp.status(),
+        200,
+        "Create notification should succeed"
+    );
+    let create_body: serde_json::Value = create_resp
+        .json()
+        .await
+        .expect("Failed to parse create notification response");
+
+    let notification_id = create_body["data"]["id"]
+        .as_str()
+        .expect("notification id missing");
+
+    // Verify the notification exists
+    let list_resp = client
+        .get(format!("{}/api/notifications", base_url))
+        .send()
+        .await
+        .expect("List notifications failed");
+
+    assert_eq!(list_resp.status(), 200);
+    let list_body: serde_json::Value = list_resp.json().await.unwrap();
+    let notifications = list_body["data"].as_array().unwrap();
+    assert_eq!(notifications.len(), 1, "Should have 1 notification");
+
+    // ── Step 3: Create backup ──
+    let backup_resp = client
+        .post(format!("{}/api/settings/backup", base_url))
+        .send()
+        .await
+        .expect("Backup request failed");
+
+    assert_eq!(backup_resp.status(), 200, "Backup should succeed");
+
+    let content_type = backup_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        content_type, "application/octet-stream",
+        "Backup should return octet-stream"
+    );
+
+    let backup_bytes = backup_resp
+        .bytes()
+        .await
+        .expect("Failed to read backup bytes");
+    assert!(backup_bytes.len() > 16, "Backup file should not be empty");
+    assert_eq!(
+        &backup_bytes[..16],
+        b"SQLite format 3\0",
+        "Backup should be a valid SQLite file"
+    );
+
+    // ── Step 4: Delete the notification ──
+    let delete_resp = client
+        .delete(format!(
+            "{}/api/notifications/{}",
+            base_url, notification_id
+        ))
+        .send()
+        .await
+        .expect("Delete notification failed");
+
+    assert_eq!(delete_resp.status(), 200, "Delete should succeed");
+
+    // Verify notification is gone
+    let list_resp2 = client
+        .get(format!("{}/api/notifications", base_url))
+        .send()
+        .await
+        .expect("List notifications failed");
+
+    assert_eq!(list_resp2.status(), 200);
+    let list_body2: serde_json::Value = list_resp2.json().await.unwrap();
+    let notifications2 = list_body2["data"].as_array().unwrap();
+    assert!(
+        notifications2.is_empty(),
+        "Notifications should be empty after delete"
+    );
+
+    // ── Step 5: Restore from backup ──
+    let restore_resp = client
+        .post(format!("{}/api/settings/restore", base_url))
+        .header("content-type", "application/octet-stream")
+        .body(backup_bytes)
+        .send()
+        .await
+        .expect("Restore request failed");
+
+    assert_eq!(restore_resp.status(), 200, "Restore should succeed");
+    let restore_body: serde_json::Value = restore_resp
+        .json()
+        .await
+        .expect("Failed to parse restore response");
+
+    // The restore endpoint returns a success message indicating restart is needed
+    assert!(
+        restore_body["data"]
+            .as_str()
+            .unwrap_or("")
+            .contains("restart"),
+        "Restore should mention restart"
+    );
+}
+
+// ── Task 10: Authentication flow integration tests ────────────────────────────
+
+#[tokio::test]
+async fn test_login_logout_flow() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    // Login
+    let login_body = login_admin(&client, &base_url).await;
+    assert_eq!(login_body["data"]["username"], "admin");
+
+    // GET /api/auth/me → should return 200 while session cookie is active
+    let me_resp = client
+        .get(format!("{}/api/auth/me", base_url))
+        .send()
+        .await
+        .expect("GET /api/auth/me failed");
+
+    assert_eq!(
+        me_resp.status(),
+        200,
+        "auth/me should return 200 when logged in"
+    );
+    let me_body: serde_json::Value = me_resp.json().await.unwrap();
+    assert_eq!(me_body["data"]["username"], "admin");
+    assert_eq!(me_body["data"]["role"], "admin");
+
+    // Logout
+    let logout_resp = client
+        .post(format!("{}/api/auth/logout", base_url))
+        .send()
+        .await
+        .expect("POST /api/auth/logout failed");
+
+    assert_eq!(logout_resp.status(), 200, "logout should succeed");
+
+    // After logout, GET /api/auth/me should return 401
+    let me_after_resp = client
+        .get(format!("{}/api/auth/me", base_url))
+        .send()
+        .await
+        .expect("GET /api/auth/me after logout failed");
+
+    assert_eq!(
+        me_after_resp.status(),
+        401,
+        "auth/me should return 401 after logout"
+    );
+}
+
+#[tokio::test]
+async fn test_api_key_lifecycle() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    // Login as admin
+    login_admin(&client, &base_url).await;
+
+    // Create an API key
+    let create_resp = client
+        .post(format!("{}/api/auth/api-keys", base_url))
+        .json(&json!({ "name": "test-key" }))
+        .send()
+        .await
+        .expect("POST /api/auth/api-keys failed");
+
+    assert_eq!(create_resp.status(), 200, "API key creation should succeed");
+    let create_body: serde_json::Value = create_resp.json().await.unwrap();
+    let api_key = create_body["data"]["key"]
+        .as_str()
+        .expect("key field missing from API key response");
+    assert!(
+        api_key.starts_with("serverbee_"),
+        "API key should start with 'serverbee_'"
+    );
+
+    // Use the API key (X-API-Key header) to access a protected endpoint with a fresh client
+    // (no session cookies — purely API key auth)
+    let key_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to build key-only HTTP client");
+
+    let servers_resp = key_client
+        .get(format!("{}/api/servers", base_url))
+        .header("X-API-Key", api_key)
+        .send()
+        .await
+        .expect("GET /api/servers with API key failed");
+
+    assert_eq!(
+        servers_resp.status(),
+        200,
+        "API key should grant access to /api/servers"
+    );
+    let servers_body: serde_json::Value = servers_resp.json().await.unwrap();
+    assert!(servers_body["data"].is_array(), "data should be an array");
+}
+
+#[tokio::test]
+async fn test_member_read_only() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin_client = http_client();
+
+    // Login as admin and create a member user
+    login_admin(&admin_client, &base_url).await;
+
+    let create_resp = admin_client
+        .post(format!("{}/api/users", base_url))
+        .json(&json!({
+            "username": "testmember",
+            "password": "memberpass123",
+            "role": "member"
+        }))
+        .send()
+        .await
+        .expect("POST /api/users failed");
+
+    assert_eq!(
+        create_resp.status(),
+        200,
+        "Admin should be able to create member"
+    );
+
+    // Login as the member user in a separate client
+    let member_client = http_client();
+    let member_login = member_client
+        .post(format!("{}/api/auth/login", base_url))
+        .json(&json!({
+            "username": "testmember",
+            "password": "memberpass123"
+        }))
+        .send()
+        .await
+        .expect("Member login request failed");
+
+    assert_eq!(member_login.status(), 200, "Member login should succeed");
+
+    // Member can do GET /api/servers (read-only route)
+    let servers_resp = member_client
+        .get(format!("{}/api/servers", base_url))
+        .send()
+        .await
+        .expect("GET /api/servers as member failed");
+
+    assert_eq!(
+        servers_resp.status(),
+        200,
+        "Member should be able to read /api/servers"
+    );
+
+    // Member cannot POST /api/users (admin-only write route)
+    let create_user_resp = member_client
+        .post(format!("{}/api/users", base_url))
+        .json(&json!({
+            "username": "anothermember",
+            "password": "pass123",
+            "role": "member"
+        }))
+        .send()
+        .await
+        .expect("POST /api/users as member failed");
+
+    assert_eq!(
+        create_user_resp.status(),
+        403,
+        "Member should receive 403 when attempting to create users"
+    );
+}
+
+#[tokio::test]
+async fn test_public_status_no_auth() {
+    // After the R1 refactor the public status surface is `/api/status/*` and
+    // the singleton config defaults to `enabled = false`. The unauthenticated
+    // contract on the bare `/api/status` route is therefore:
+    //   - disabled => 403 with body `{"error":"public_status_disabled", ...}`
+    //   - enabled  => 200 with body `{"data":[...]}` (Vec<PublicServerSummary>)
+    // Detailed scope/gating/redaction behavior is exercised by the dedicated
+    // `public_status_*.rs` integration tests; this test pins only the
+    // "unauthenticated access reaches the surface" property.
+    let (base_url, _tmp) = start_test_server().await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to build plain HTTP client");
+
+    let resp = client
+        .get(format!("{}/api/status/config", base_url))
+        .send()
+        .await
+        .expect("GET /api/status/config failed");
+
+    // /api/status/config is reachable without auth even when the page is
+    // disabled (the SPA needs to render a "site disabled" notice).
+    assert_eq!(
+        resp.status(),
+        200,
+        "Public /api/status/config should be accessible without auth"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["data"]["enabled"], false,
+        "default singleton row has enabled = false"
+    );
+}
+
+#[tokio::test]
+async fn test_audit_log_recorded() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    // Login — this should create an audit log entry with action "login"
+    login_admin(&client, &base_url).await;
+
+    // Fetch audit logs
+    let audit_resp = client
+        .get(format!("{}/api/audit-logs", base_url))
+        .send()
+        .await
+        .expect("GET /api/audit-logs failed");
+
+    assert_eq!(
+        audit_resp.status(),
+        200,
+        "audit-logs endpoint should be accessible to admin"
+    );
+    let audit_body: serde_json::Value = audit_resp.json().await.unwrap();
+    let entries = audit_body["data"]["entries"]
+        .as_array()
+        .expect("entries should be an array");
+    let total = audit_body["data"]["total"].as_u64().unwrap_or(0);
+
+    assert!(
+        total >= 1,
+        "There should be at least one audit log entry after login"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["action"].as_str() == Some("login")),
+        "Audit log should contain a 'login' entry"
+    );
+}
+
+#[tokio::test]
+async fn test_terminal_open_denied_is_audited() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+    let api_key = create_api_key(&client, &base_url).await;
+
+    let (server_id, token) = register_agent(&client, &base_url).await;
+    let (_ws_sink, mut ws_reader) = connect_agent(&base_url, &token).await;
+
+    // connect_agent returns once the client handshake completes, but the server
+    // registers the agent in the async upgrade callback. Welcome is sent only
+    // after registration, so waiting for it guarantees the terminal handshake
+    // below is rejected by the capability gate (audited) instead of the
+    // agent-offline check (not audited).
+    let welcome = tokio::time::timeout(Duration::from_secs(5), ws_reader.next())
+        .await
+        .expect("Timeout waiting for Welcome")
+        .expect("WebSocket stream ended")
+        .expect("WebSocket read error");
+    assert!(
+        matches!(welcome, tungstenite::Message::Text(_)),
+        "expected Welcome text frame, got {welcome:?}"
+    );
+
+    let ws_url = format!(
+        "{}/api/ws/terminal/{}",
+        base_url.replace("http://", "ws://"),
+        server_id
+    );
+    let mut request = ws_url
+        .into_client_request()
+        .expect("terminal ws request should build");
+    request.headers_mut().insert(
+        "x-api-key",
+        HeaderValue::from_str(&api_key).expect("api key header should be valid"),
+    );
+
+    let err = tokio_tungstenite::connect_async(request)
+        .await
+        .expect_err("terminal websocket should be denied without terminal capability");
+    assert!(
+        matches!(err, tungstenite::Error::Http(_)),
+        "expected http handshake failure, got {err:?}"
+    );
+
+    let entries = list_audit_entries(&client, &base_url).await;
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["action"].as_str() == Some("terminal_open_denied")),
+        "terminal capability denial should be audited"
+    );
+}
+
+#[tokio::test]
+async fn test_terminal_open_and_close_are_audited() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+    let api_key = create_api_key(&client, &base_url).await;
+
+    let (server_id, token) = register_agent(&client, &base_url).await;
+
+    let (mut agent_sink, mut agent_reader) = connect_agent(&base_url, &token).await;
+    let welcome = recv_agent_text(&mut agent_reader).await;
+    assert_eq!(welcome["type"], "welcome");
+    // Capabilities are agent-owned: the agent enabling CAP_TERMINAL in its
+    // reported caps is all that's needed for the terminal to be authorized.
+    send_system_info(
+        &mut agent_sink,
+        &mut agent_reader,
+        "terminal-audit-msg",
+        Some(CAP_DEFAULT | 1),
+    )
+    .await;
+
+    let ws_url = format!(
+        "{}/api/ws/terminal/{}",
+        base_url.replace("http://", "ws://"),
+        server_id
+    );
+    let mut request = ws_url
+        .into_client_request()
+        .expect("terminal ws request should build");
+    request.headers_mut().insert(
+        "x-api-key",
+        HeaderValue::from_str(&api_key).expect("api key header should be valid"),
+    );
+
+    let (mut terminal_ws, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("terminal websocket should connect");
+
+    let session_msg = tokio::time::timeout(Duration::from_secs(5), terminal_ws.next())
+        .await
+        .expect("timeout waiting for terminal session message")
+        .expect("terminal ws ended")
+        .expect("terminal ws read error");
+    let session_text = match session_msg {
+        tungstenite::Message::Text(text) => text.to_string(),
+        other => panic!("Expected terminal session message, got: {:?}", other),
+    };
+    let session_json: serde_json::Value =
+        serde_json::from_str(&session_text).expect("terminal session message should be json");
+    assert_eq!(session_json["type"], "session");
+
+    let _ = terminal_ws.close(None).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let entries = list_audit_entries(&client, &base_url).await;
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["action"].as_str() == Some("terminal_opened")),
+        "terminal open should be audited"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["action"].as_str() == Some("terminal_closed")),
+        "terminal close should be audited"
+    );
+
+    let _ = agent_sink.close().await;
+}
+
+/// Drive the full temporary-capability-grant path end to end:
+///
+/// 1. Agent reports `CAP_DEFAULT` (terminal OFF) — terminal control plane is denied.
+/// 2. Agent sends `CapabilitiesChanged` granting `terminal` temporarily — gate opens.
+/// 3. Server audits the grant (`capability_temporarily_granted`) and broadcasts a
+///    `capabilities_changed` event carrying the `temporary` grant to browsers.
+/// 4. Agent sends `CapabilitiesChanged` back to `CAP_DEFAULT` with an `expired`
+///    change — gate closes again and the expiry is audited
+///    (`capability_grant_expired`).
+///
+/// The terminal WS handshake is the observable control-plane gate: a denied
+/// capability fails the upgrade with an HTTP 403, while a granted one upgrades
+/// and immediately emits a `session` message. We synchronize on the browser
+/// broadcast (not a fixed sleep) so the assertions race-free against the
+/// server's async processing of each `CapabilitiesChanged` message.
+#[tokio::test]
+async fn test_temporary_capability_grant_gate_audit_and_expiry() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+    let api_key = create_api_key(&client, &base_url).await;
+
+    let (server_id, token) = register_agent(&client, &base_url).await;
+
+    // Bring the agent online with CAP_DEFAULT (terminal OFF — see CAP_DEFAULT).
+    let (mut agent_sink, mut agent_reader) = connect_agent(&base_url, &token).await;
+    let welcome = recv_agent_text(&mut agent_reader).await;
+    assert_eq!(welcome["type"], "welcome");
+    assert!(
+        !serverbee_common::constants::has_capability(CAP_DEFAULT, CAP_TERMINAL),
+        "precondition: CAP_DEFAULT must not include terminal"
+    );
+    send_system_info(
+        &mut agent_sink,
+        &mut agent_reader,
+        "grant-test-initial",
+        Some(CAP_DEFAULT),
+    )
+    .await;
+
+    // Connect a browser WS BEFORE issuing the grant so it catches the broadcast.
+    let mut browser_ws = connect_browser_ws(&base_url, &api_key).await;
+
+    // --- Step 2: terminal control plane is DENIED (no CAP_TERMINAL) ---
+    assert!(
+        terminal_gate_denied(&base_url, &server_id, &api_key).await,
+        "terminal WS should be denied before the grant"
+    );
+
+    // --- Step 3: agent grants `terminal` temporarily ---
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_secs() as i64;
+    let expires_at = now + 3600;
+    send_capabilities_changed(
+        &mut agent_sink,
+        json!({
+            "type": "capabilities_changed",
+            "msg_id": "grant-test-grant",
+            "capabilities": CAP_DEFAULT | CAP_TERMINAL,
+            "temporary": [{
+                "cap": "terminal",
+                "granted_at": now,
+                "expires_at": expires_at
+            }],
+            "changes": [{
+                "cap": "terminal",
+                "action": "granted",
+                "expires_at": expires_at,
+                "granted_by": "test"
+            }]
+        }),
+    )
+    .await;
+
+    // --- Step 6 (observed first): browser receives the `capabilities_changed`
+    // broadcast carrying the temporary grant. Awaiting this also synchronizes
+    // the rest of the assertions against the server's async processing. ---
+    let grant_broadcast =
+        wait_for_capabilities_changed(&mut browser_ws, &server_id, CAP_DEFAULT | CAP_TERMINAL).await;
+    let temporary = grant_broadcast["temporary"]
+        .as_array()
+        .expect("broadcast temporary should be an array");
+    assert!(
+        temporary
+            .iter()
+            .any(|g| g["cap"].as_str() == Some("terminal")
+                && g["expires_at"].as_i64() == Some(expires_at)),
+        "broadcast temporary grants should contain the terminal grant, got {temporary:?}"
+    );
+
+    // --- Step 4: the SAME terminal gate now PASSES ---
+    assert!(
+        !terminal_gate_denied(&base_url, &server_id, &api_key).await,
+        "terminal WS should be allowed after the temporary grant"
+    );
+
+    // --- Step 5: the grant is audited ---
+    let entries = list_audit_entries(&client, &base_url).await;
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["action"].as_str() == Some("capability_temporarily_granted")),
+        "temporary grant should be audited as capability_temporarily_granted"
+    );
+
+    // --- Step 7: agent reports the grant expired ---
+    send_capabilities_changed(
+        &mut agent_sink,
+        json!({
+            "type": "capabilities_changed",
+            "msg_id": "grant-test-expire",
+            "capabilities": CAP_DEFAULT,
+            "temporary": [],
+            "changes": [{
+                "cap": "terminal",
+                "action": "expired"
+            }]
+        }),
+    )
+    .await;
+
+    let expire_broadcast =
+        wait_for_capabilities_changed(&mut browser_ws, &server_id, CAP_DEFAULT).await;
+    assert!(
+        expire_broadcast["temporary"]
+            .as_array()
+            .is_none_or(|t| t.is_empty()),
+        "expiry broadcast should carry no temporary grants, got {:?}",
+        expire_broadcast["temporary"]
+    );
+
+    // Gate is DENIED again now that the grant expired.
+    assert!(
+        terminal_gate_denied(&base_url, &server_id, &api_key).await,
+        "terminal WS should be denied again after the grant expires"
+    );
+
+    // Expiry is audited.
+    let entries = list_audit_entries(&client, &base_url).await;
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["action"].as_str() == Some("capability_grant_expired")),
+        "grant expiry should be audited as capability_grant_expired"
+    );
+
+    let _ = browser_ws.close(None).await;
+    let _ = agent_sink.close().await;
+}
+
+/// Connect a browser WS (x-api-key auth) and drain the initial `full_sync`.
+async fn connect_browser_ws(
+    base_url: &str,
+    api_key: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let ws_url = base_url.replace("http://", "ws://") + "/api/ws/servers";
+    let mut request = ws_url
+        .into_client_request()
+        .expect("browser ws request should build");
+    request.headers_mut().insert(
+        "x-api-key",
+        HeaderValue::from_str(api_key).expect("api key header should be valid"),
+    );
+    let (mut browser_ws, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("browser websocket should connect");
+    let full_sync = tokio::time::timeout(Duration::from_secs(5), browser_ws.next())
+        .await
+        .expect("full_sync timeout")
+        .expect("browser ws closed")
+        .expect("browser ws error");
+    let full_sync: serde_json::Value =
+        serde_json::from_str(full_sync.to_text().unwrap()).unwrap();
+    assert_eq!(full_sync["type"], "full_sync");
+    browser_ws
+}
+
+/// Send a raw `capabilities_changed` agent message. The server does not Ack this
+/// message (unlike SystemInfo), so callers synchronize on the browser broadcast.
+async fn send_capabilities_changed(
+    sink: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tungstenite::Message,
+    >,
+    msg: serde_json::Value,
+) {
+    sink.send(tungstenite::Message::Text(msg.to_string().into()))
+        .await
+        .expect("Failed to send CapabilitiesChanged");
+}
+
+/// Wait for a `capabilities_changed` broadcast for `server_id` reporting the
+/// expected capability bitmask. Tolerates interleaved updates/online events.
+async fn wait_for_capabilities_changed(
+    browser_ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    server_id: &str,
+    expected_capabilities: u32,
+) -> serde_json::Value {
+    for _ in 0..40 {
+        let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_secs(3), browser_ws.next()).await
+        else {
+            break;
+        };
+        let Ok(text) = msg.to_text() else { continue };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) else {
+            continue;
+        };
+        if parsed["type"] == "capabilities_changed"
+            && parsed["server_id"] == server_id
+            && parsed["capabilities"].as_u64() == Some(expected_capabilities as u64)
+        {
+            return parsed;
+        }
+    }
+    panic!("did not observe capabilities_changed broadcast for {server_id} with caps {expected_capabilities}");
+}
+
+/// Probe the terminal control-plane gate by attempting the terminal WS upgrade.
+/// Returns `true` when the upgrade is denied (HTTP 403 handshake failure), and
+/// `false` when it succeeds and yields a `session` message. The agent must stay
+/// online for the allow path (the handler enforces `is_online`).
+async fn terminal_gate_denied(base_url: &str, server_id: &str, api_key: &str) -> bool {
+    let ws_url = format!(
+        "{}/api/ws/terminal/{}",
+        base_url.replace("http://", "ws://"),
+        server_id
+    );
+    let mut request = ws_url
+        .into_client_request()
+        .expect("terminal ws request should build");
+    request.headers_mut().insert(
+        "x-api-key",
+        HeaderValue::from_str(api_key).expect("api key header should be valid"),
+    );
+
+    match tokio_tungstenite::connect_async(request).await {
+        Err(tungstenite::Error::Http(_)) => true,
+        Err(other) => panic!("unexpected terminal handshake error: {other:?}"),
+        Ok((mut terminal_ws, _)) => {
+            // Allowed: drain the leading `session` message, then close.
+            let session_msg = tokio::time::timeout(Duration::from_secs(5), terminal_ws.next())
+                .await
+                .expect("timeout waiting for terminal session message")
+                .expect("terminal ws ended")
+                .expect("terminal ws read error");
+            let session_text = session_msg.to_text().expect("session msg should be text");
+            let session_json: serde_json::Value =
+                serde_json::from_str(session_text).expect("session message should be json");
+            assert_eq!(session_json["type"], "session");
+            let _ = terminal_ws.close(None).await;
+            false
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_oneshot_exec_started_and_finished_are_audited() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    let (server_id, token) = register_agent(&client, &base_url).await;
+
+    let (mut ws_sink, mut ws_reader) = connect_agent(&base_url, &token).await;
+    let welcome = recv_agent_text(&mut ws_reader).await;
+    assert_eq!(welcome["type"], "welcome");
+
+    // Agent-owned caps: reporting CAP_EXEC is sufficient to authorize exec.
+    send_system_info(
+        &mut ws_sink,
+        &mut ws_reader,
+        "exec-audit-msg",
+        Some(CAP_DEFAULT | CAP_EXEC),
+    )
+    .await;
+
+    let create_resp = client
+        .post(format!("{}/api/tasks", base_url))
+        .json(&json!({
+            "command": "echo audit",
+            "server_ids": [server_id],
+            "task_type": "oneshot"
+        }))
+        .send()
+        .await
+        .expect("POST /api/tasks failed");
+    assert_eq!(create_resp.status(), 200);
+
+    let exec_msg = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let msg = recv_agent_text(&mut ws_reader).await;
+            if msg["type"] == "exec" {
+                break msg;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for scheduled exec dispatch");
+    let task_id = exec_msg["task_id"]
+        .as_str()
+        .expect("exec message task_id missing")
+        .to_string();
+
+    ws_sink
+        .send(tungstenite::Message::Text(
+            json!({
+                "type": "task_result",
+                "msg_id": "exec-audit-result",
+                "task_id": task_id,
+                "output": "ok",
+                "exit_code": 0
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("Failed to send TaskResult");
+
+    loop {
+        let msg = recv_agent_text(&mut ws_reader).await;
+        if msg["type"] == "ack" && msg["msg_id"] == "exec-audit-result" {
+            break;
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let entries = list_audit_entries(&client, &base_url).await;
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["action"].as_str() == Some("exec_started")),
+        "oneshot task dispatch should be audited as exec_started"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["action"].as_str() == Some("exec_finished")),
+        "oneshot task completion should be audited as exec_finished"
+    );
+}
+
+#[tokio::test]
+async fn test_file_read_is_audited() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    let (server_id, token) = register_agent(&client, &base_url).await;
+
+    let (mut ws_sink, mut ws_reader) = connect_agent(&base_url, &token).await;
+    let welcome = recv_agent_text(&mut ws_reader).await;
+    assert_eq!(welcome["type"], "welcome");
+
+    // Agent-owned caps: reporting CAP_FILE is sufficient to authorize file ops.
+    send_system_info(
+        &mut ws_sink,
+        &mut ws_reader,
+        "file-read-audit-msg",
+        Some(CAP_DEFAULT | CAP_FILE),
+    )
+    .await;
+
+    let read_client = client.clone();
+    let read_base_url = base_url.clone();
+    let read_server_id = server_id.clone();
+    let read_handle = tokio::spawn(async move {
+        read_client
+            .post(format!(
+                "{}/api/files/{}/read",
+                read_base_url, read_server_id
+            ))
+            .json(&json!({ "path": "/etc/hostname" }))
+            .send()
+            .await
+    });
+
+    let file_read_msg = loop {
+        let msg = recv_agent_text(&mut ws_reader).await;
+        if msg["type"] == "file_read" {
+            break msg;
+        }
+    };
+
+    ws_sink
+        .send(tungstenite::Message::Text(
+            json!({
+                "type": "file_read_result",
+                "msg_id": file_read_msg["msg_id"],
+                "content": "serverbee\n",
+                "error": null
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("Failed to send FileReadResult");
+
+    let read_resp = read_handle
+        .await
+        .expect("file read task should join")
+        .expect("POST /api/files/{id}/read failed");
+    assert_eq!(read_resp.status(), 200);
+
+    let entries = list_audit_entries(&client, &base_url).await;
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["action"].as_str() == Some("file_read")),
+        "successful file reads should be audited"
+    );
+
+    let _ = ws_sink.close().await;
+}
+
+// ── Network probe integration tests ──────────────────────────────────────────
+
+#[tokio::test]
+async fn test_network_probe_target_crud() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    login_admin(&client, &base_url).await;
+
+    // ── Step 1: GET /api/network-probes/targets — verify 96 preset targets ──
+    let list_resp = client
+        .get(format!("{}/api/network-probes/targets", base_url))
+        .send()
+        .await
+        .expect("GET /api/network-probes/targets failed");
+
+    assert_eq!(list_resp.status(), 200, "list targets should succeed");
+    let list_body: serde_json::Value = list_resp.json().await.unwrap();
+    let targets = list_body["data"]
+        .as_array()
+        .expect("data should be an array");
+    assert_eq!(targets.len(), 96, "should have 96 builtin targets");
+
+    // ── Step 2: POST /api/network-probes/targets — create a custom target ──
+    let create_resp = client
+        .post(format!("{}/api/network-probes/targets", base_url))
+        .json(&json!({
+            "name": "My Custom Target",
+            "provider": "Custom ISP",
+            "location": "Test Location",
+            "target": "192.168.1.1",
+            "probe_type": "icmp"
+        }))
+        .send()
+        .await
+        .expect("POST /api/network-probes/targets failed");
+
+    assert_eq!(create_resp.status(), 200, "create target should succeed");
+    let create_body: serde_json::Value = create_resp.json().await.unwrap();
+    let target_id = create_body["data"]["id"]
+        .as_str()
+        .expect("target id missing");
+    assert_eq!(create_body["data"]["name"], "My Custom Target");
+
+    // ── Step 3: GET /api/network-probes/targets — verify 97 targets ──
+    let list_resp2 = client
+        .get(format!("{}/api/network-probes/targets", base_url))
+        .send()
+        .await
+        .expect("GET /api/network-probes/targets failed");
+
+    assert_eq!(list_resp2.status(), 200);
+    let list_body2: serde_json::Value = list_resp2.json().await.unwrap();
+    let targets2 = list_body2["data"].as_array().unwrap();
+    assert_eq!(
+        targets2.len(),
+        97,
+        "should have 97 targets after creating custom one"
+    );
+    assert!(
+        targets2.iter().any(|t| t["id"].as_str() == Some(target_id)),
+        "Custom target should appear in list"
+    );
+
+    // ── Step 4: PUT /api/network-probes/targets/{id} — update the custom target ──
+    let update_resp = client
+        .put(format!(
+            "{}/api/network-probes/targets/{}",
+            base_url, target_id
+        ))
+        .json(&json!({
+            "name": "Updated Custom Target",
+            "provider": null,
+            "location": null,
+            "target": null,
+            "probe_type": null
+        }))
+        .send()
+        .await
+        .expect("PUT /api/network-probes/targets/{id} failed");
+
+    assert_eq!(update_resp.status(), 200, "update target should succeed");
+    let update_body: serde_json::Value = update_resp.json().await.unwrap();
+    assert_eq!(update_body["data"]["name"], "Updated Custom Target");
+    assert_eq!(
+        update_body["data"]["target"], "192.168.1.1",
+        "target address should be unchanged"
+    );
+
+    // ── Step 5: DELETE /api/network-probes/targets/{id} — delete the custom target ──
+    let delete_resp = client
+        .delete(format!(
+            "{}/api/network-probes/targets/{}",
+            base_url, target_id
+        ))
+        .send()
+        .await
+        .expect("DELETE /api/network-probes/targets/{id} failed");
+
+    assert_eq!(delete_resp.status(), 200, "delete target should succeed");
+
+    // ── Step 6: GET /api/network-probes/targets — verify back to 96 ──
+    let list_resp3 = client
+        .get(format!("{}/api/network-probes/targets", base_url))
+        .send()
+        .await
+        .expect("GET /api/network-probes/targets failed");
+
+    assert_eq!(list_resp3.status(), 200);
+    let list_body3: serde_json::Value = list_resp3.json().await.unwrap();
+    let targets3 = list_body3["data"].as_array().unwrap();
+    assert_eq!(
+        targets3.len(),
+        96,
+        "should be back to 96 builtin targets after delete"
+    );
+    assert!(
+        !targets3.iter().any(|t| t["id"].as_str() == Some(target_id)),
+        "Deleted target should not appear in list"
+    );
+}
+
+#[tokio::test]
+async fn test_network_probe_setting_crud() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    login_admin(&client, &base_url).await;
+
+    // ── Step 1: GET /api/network-probes/setting — verify defaults ──
+    let get_resp = client
+        .get(format!("{}/api/network-probes/setting", base_url))
+        .send()
+        .await
+        .expect("GET /api/network-probes/setting failed");
+
+    assert_eq!(get_resp.status(), 200, "get setting should succeed");
+    let get_body: serde_json::Value = get_resp.json().await.unwrap();
+    assert_eq!(
+        get_body["data"]["interval"], 60,
+        "default interval should be 60"
+    );
+    assert_eq!(
+        get_body["data"]["packet_count"], 10,
+        "default packet_count should be 10"
+    );
+
+    // ── Step 2: PUT /api/network-probes/setting — update interval to 120 ──
+    let update_resp = client
+        .put(format!("{}/api/network-probes/setting", base_url))
+        .json(&json!({
+            "interval": 120,
+            "packet_count": 10,
+            "default_target_ids": []
+        }))
+        .send()
+        .await
+        .expect("PUT /api/network-probes/setting failed");
+
+    assert_eq!(update_resp.status(), 200, "update setting should succeed");
+    let update_body: serde_json::Value = update_resp.json().await.unwrap();
+    assert_eq!(
+        update_body["data"]["interval"], 120,
+        "interval should be updated to 120"
+    );
+
+    // ── Step 3: GET /api/network-probes/setting — verify interval=120 ──
+    let get_resp2 = client
+        .get(format!("{}/api/network-probes/setting", base_url))
+        .send()
+        .await
+        .expect("GET /api/network-probes/setting failed");
+
+    assert_eq!(get_resp2.status(), 200);
+    let get_body2: serde_json::Value = get_resp2.json().await.unwrap();
+    assert_eq!(
+        get_body2["data"]["interval"], 120,
+        "interval should persist as 120"
+    );
+    assert_eq!(
+        get_body2["data"]["packet_count"], 10,
+        "packet_count should remain 10"
+    );
+}
+
+#[tokio::test]
+async fn test_network_probe_server_targets() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    login_admin(&client, &base_url).await;
+
+    // ── Step 1: Register an agent to get a server id ──
+    let enrollment_code = mint_enrollment_code(&client, &base_url).await;
+    let register_resp = client
+        .post(format!("{}/api/agent/register", base_url))
+        .header("Authorization", format!("Bearer {enrollment_code}"))
+        .json(&json!({
+            "proposed_run_token": format!("integration-token-{}", uuid::Uuid::new_v4())
+        }))
+        .send()
+        .await
+        .expect("Agent register failed");
+
+    assert_eq!(register_resp.status(), 200);
+    let register_body: serde_json::Value = register_resp.json().await.unwrap();
+    let server_id = register_body["data"]["server_id"]
+        .as_str()
+        .expect("server_id missing");
+
+    // ── Step 2: Get two builtin target ids ──
+    let targets_resp = client
+        .get(format!("{}/api/network-probes/targets", base_url))
+        .send()
+        .await
+        .expect("GET /api/network-probes/targets failed");
+
+    assert_eq!(targets_resp.status(), 200);
+    let targets_body: serde_json::Value = targets_resp.json().await.unwrap();
+    let all_targets = targets_body["data"].as_array().unwrap();
+    let target_id_1 = all_targets[0]["id"].as_str().unwrap().to_string();
+    let target_id_2 = all_targets[1]["id"].as_str().unwrap().to_string();
+
+    // ── Step 3: PUT /api/servers/{id}/network-probes/targets — assign 2 targets ──
+    let assign_resp = client
+        .put(format!(
+            "{}/api/servers/{}/network-probes/targets",
+            base_url, server_id
+        ))
+        .json(&json!({
+            "target_ids": [target_id_1, target_id_2]
+        }))
+        .send()
+        .await
+        .expect("PUT /api/servers/{id}/network-probes/targets failed");
+
+    assert_eq!(
+        assign_resp.status(),
+        200,
+        "assigning targets should succeed"
+    );
+
+    // ── Step 4: GET /api/servers/{id}/network-probes/targets — verify 2 targets ──
+    let server_targets_resp = client
+        .get(format!(
+            "{}/api/servers/{}/network-probes/targets",
+            base_url, server_id
+        ))
+        .send()
+        .await
+        .expect("GET /api/servers/{id}/network-probes/targets failed");
+
+    assert_eq!(
+        server_targets_resp.status(),
+        200,
+        "get server targets should succeed"
+    );
+    let server_targets_body: serde_json::Value = server_targets_resp.json().await.unwrap();
+    let server_targets = server_targets_body["data"].as_array().unwrap();
+    assert_eq!(
+        server_targets.len(),
+        2,
+        "server should have 2 assigned targets"
+    );
+
+    // ── Step 5: PUT /api/servers/{id}/network-probes/targets — assign 0 targets ──
+    let clear_resp = client
+        .put(format!(
+            "{}/api/servers/{}/network-probes/targets",
+            base_url, server_id
+        ))
+        .json(&json!({ "target_ids": [] }))
+        .send()
+        .await
+        .expect("PUT /api/servers/{id}/network-probes/targets (clear) failed");
+
+    assert_eq!(clear_resp.status(), 200, "clearing targets should succeed");
+
+    // ── Step 6: GET /api/servers/{id}/network-probes/targets — verify empty ──
+    let server_targets_resp2 = client
+        .get(format!(
+            "{}/api/servers/{}/network-probes/targets",
+            base_url, server_id
+        ))
+        .send()
+        .await
+        .expect("GET /api/servers/{id}/network-probes/targets failed");
+
+    assert_eq!(server_targets_resp2.status(), 200);
+    let server_targets_body2: serde_json::Value = server_targets_resp2.json().await.unwrap();
+    let server_targets2 = server_targets_body2["data"].as_array().unwrap();
+    assert!(
+        server_targets2.is_empty(),
+        "server targets should be empty after clearing"
+    );
+}
+
+#[tokio::test]
+async fn test_builtin_target_cannot_be_deleted() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    login_admin(&client, &base_url).await;
+
+    // ── Step 1: Try to DELETE a known preset target id ──
+    let preset_id = "cn-bj-ct";
+
+    let delete_resp = client
+        .delete(format!(
+            "{}/api/network-probes/targets/{}",
+            base_url, preset_id
+        ))
+        .send()
+        .await
+        .expect("DELETE /api/network-probes/targets/{id} failed");
+
+    assert!(
+        delete_resp.status() == 400 || delete_resp.status() == 403,
+        "Deleting a builtin target should return 400 or 403, got {}",
+        delete_resp.status()
+    );
+
+    // ── Step 2: Verify preset target still exists ──
+    let list_resp2 = client
+        .get(format!("{}/api/network-probes/targets", base_url))
+        .send()
+        .await
+        .expect("GET /api/network-probes/targets failed");
+
+    assert_eq!(list_resp2.status(), 200);
+    let list_body2: serde_json::Value = list_resp2.json().await.unwrap();
+    let targets2 = list_body2["data"].as_array().unwrap();
+    assert_eq!(
+        targets2.len(),
+        96,
+        "preset targets should remain 96 after failed delete"
+    );
+    assert!(
+        targets2.iter().any(|t| t["id"].as_str() == Some(preset_id)),
+        "Preset target should still be present after failed delete"
+    );
+}
+
+#[tokio::test]
+async fn test_preset_target_source_field() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // ── Step 1: Verify preset targets have source field ──
+    let list_resp = client
+        .get(format!("{}/api/network-probes/targets", base_url))
+        .send()
+        .await
+        .expect("GET targets failed");
+
+    let body: serde_json::Value = list_resp.json().await.unwrap();
+    let targets = body["data"].as_array().unwrap();
+
+    // Find a known preset target
+    let preset = targets.iter().find(|t| t["id"] == "cn-bj-ct").unwrap();
+    assert_eq!(preset["source"], "preset:china-telecom");
+    assert_eq!(preset["source_name"], "中国电信");
+    assert!(preset["created_at"].is_null());
+
+    let intl = targets
+        .iter()
+        .find(|t| t["id"] == "intl-cloudflare")
+        .unwrap();
+    assert_eq!(intl["source"], "preset:international");
+    assert_eq!(intl["source_name"], "国际节点");
+
+    // ── Step 2: Create a custom target and verify no source ──
+    let create_resp = client
+        .post(format!("{}/api/network-probes/targets", base_url))
+        .json(&serde_json::json!({
+            "name": "Custom Test",
+            "provider": "Test",
+            "location": "Test",
+            "target": "10.0.0.1",
+            "probe_type": "tcp"
+        }))
+        .send()
+        .await
+        .expect("POST targets failed");
+
+    let create_body: serde_json::Value = create_resp.json().await.unwrap();
+
+    // Verify custom target via list (create returns Model, not TargetDto)
+    let list_resp2 = client
+        .get(format!("{}/api/network-probes/targets", base_url))
+        .send()
+        .await
+        .expect("GET targets failed");
+
+    let body2: serde_json::Value = list_resp2.json().await.unwrap();
+    let targets2 = body2["data"].as_array().unwrap();
+    let custom_id = create_body["data"]["id"].as_str().unwrap();
+    let custom = targets2
+        .iter()
+        .find(|t| t["id"].as_str() == Some(custom_id))
+        .unwrap();
+    assert!(custom["source"].is_null());
+    assert!(custom["source_name"].is_null());
+    assert!(!custom["created_at"].is_null());
+
+    // ── Step 3: Cleanup ──
+    client
+        .delete(format!(
+            "{}/api/network-probes/targets/{}",
+            base_url, custom_id
+        ))
+        .send()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_preset_target_cannot_be_updated() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    let update_resp = client
+        .put(format!("{}/api/network-probes/targets/cn-bj-ct", base_url))
+        .json(&serde_json::json!({
+            "name": "Hacked",
+            "provider": null,
+            "location": null,
+            "target": null,
+            "probe_type": null
+        }))
+        .send()
+        .await
+        .expect("PUT preset target failed");
+
+    assert_eq!(
+        update_resp.status(),
+        403,
+        "Updating a preset target should return 403"
+    );
+}
+
+// ── Task 11: CRUD integration tests ──────────────────────────────────────────
+
+#[tokio::test]
+async fn test_notification_and_alert_crud() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    login_admin(&client, &base_url).await;
+
+    // ── Create notification channel ──
+    let notif_resp = client
+        .post(format!("{}/api/notifications", base_url))
+        .json(&json!({
+            "name": "Test Webhook",
+            "notify_type": "webhook",
+            "config_json": {
+                "type": "webhook",
+                "url": "https://example.com/hook",
+                "method": "POST",
+                "headers": {},
+                "body_template": null
+            },
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("POST /api/notifications failed");
+
+    assert_eq!(
+        notif_resp.status(),
+        200,
+        "notification creation should succeed"
+    );
+    let notif_body: serde_json::Value = notif_resp.json().await.unwrap();
+    let notif_id = notif_body["data"]["id"]
+        .as_str()
+        .expect("notification id missing");
+
+    // ── Create notification group ──
+    let group_resp = client
+        .post(format!("{}/api/notification-groups", base_url))
+        .json(&json!({
+            "name": "Test Group",
+            "notification_ids": [notif_id]
+        }))
+        .send()
+        .await
+        .expect("POST /api/notification-groups failed");
+
+    assert_eq!(
+        group_resp.status(),
+        200,
+        "notification group creation should succeed"
+    );
+    let group_body: serde_json::Value = group_resp.json().await.unwrap();
+    let group_id = group_body["data"]["id"].as_str().expect("group id missing");
+
+    // ── Create alert rule ──
+    let alert_resp = client
+        .post(format!("{}/api/alert-rules", base_url))
+        .json(&json!({
+            "name": "High CPU Alert",
+            "rules": [
+                {
+                    "rule_type": "cpu",
+                    "min": 90.0
+                }
+            ],
+            "trigger_mode": "once",
+            "notification_group_id": group_id,
+            "cover_type": "all",
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("POST /api/alert-rules failed");
+
+    assert_eq!(
+        alert_resp.status(),
+        200,
+        "alert rule creation should succeed"
+    );
+    let alert_body: serde_json::Value = alert_resp.json().await.unwrap();
+    let alert_id = alert_body["data"]["id"].as_str().expect("alert id missing");
+    assert_eq!(alert_body["data"]["name"], "High CPU Alert");
+
+    // ── List alert rules — verify the rule appears ──
+    let list_resp = client
+        .get(format!("{}/api/alert-rules", base_url))
+        .send()
+        .await
+        .expect("GET /api/alert-rules failed");
+
+    assert_eq!(list_resp.status(), 200);
+    let list_body: serde_json::Value = list_resp.json().await.unwrap();
+    let rules = list_body["data"].as_array().expect("data should be array");
+    assert!(
+        rules.iter().any(|r| r["id"].as_str() == Some(alert_id)),
+        "Created alert rule should appear in list"
+    );
+
+    // ── Delete alert rule ──
+    let delete_resp = client
+        .delete(format!("{}/api/alert-rules/{}", base_url, alert_id))
+        .send()
+        .await
+        .expect("DELETE /api/alert-rules/{id} failed");
+
+    assert_eq!(
+        delete_resp.status(),
+        200,
+        "alert rule deletion should succeed"
+    );
+
+    // Verify it's gone
+    let list_after_resp = client
+        .get(format!("{}/api/alert-rules", base_url))
+        .send()
+        .await
+        .expect("GET /api/alert-rules after delete failed");
+
+    let list_after_body: serde_json::Value = list_after_resp.json().await.unwrap();
+    let rules_after = list_after_body["data"].as_array().unwrap();
+    assert!(
+        !rules_after
+            .iter()
+            .any(|r| r["id"].as_str() == Some(alert_id)),
+        "Deleted alert rule should not appear in list"
+    );
+}
+
+#[tokio::test]
+async fn test_user_management_crud() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    login_admin(&client, &base_url).await;
+
+    // ── Create user ──
+    let create_resp = client
+        .post(format!("{}/api/users", base_url))
+        .json(&json!({
+            "username": "crudusr",
+            "password": "crudpass123",
+            "role": "member"
+        }))
+        .send()
+        .await
+        .expect("POST /api/users failed");
+
+    assert_eq!(create_resp.status(), 200, "user creation should succeed");
+    let create_body: serde_json::Value = create_resp.json().await.unwrap();
+    let user_id = create_body["data"]["id"].as_str().expect("user id missing");
+    assert_eq!(create_body["data"]["role"], "member");
+
+    // ── List users — verify the new user appears ──
+    let list_resp = client
+        .get(format!("{}/api/users", base_url))
+        .send()
+        .await
+        .expect("GET /api/users failed");
+
+    assert_eq!(list_resp.status(), 200);
+    let list_body: serde_json::Value = list_resp.json().await.unwrap();
+    let users = list_body["data"].as_array().expect("data should be array");
+    assert!(
+        users.iter().any(|u| u["id"].as_str() == Some(user_id)),
+        "Newly created user should appear in user list"
+    );
+
+    // ── Update role to admin ──
+    let update_resp = client
+        .put(format!("{}/api/users/{}", base_url, user_id))
+        .json(&json!({ "role": "admin" }))
+        .send()
+        .await
+        .expect("PUT /api/users/{id} failed");
+
+    assert_eq!(update_resp.status(), 200, "user role update should succeed");
+    let update_body: serde_json::Value = update_resp.json().await.unwrap();
+    assert_eq!(
+        update_body["data"]["role"], "admin",
+        "Role should be updated to admin"
+    );
+
+    // ── Delete user ──
+    let delete_resp = client
+        .delete(format!("{}/api/users/{}", base_url, user_id))
+        .send()
+        .await
+        .expect("DELETE /api/users/{id} failed");
+
+    assert_eq!(delete_resp.status(), 200, "user deletion should succeed");
+
+    // Verify user is gone
+    let list_after_resp = client
+        .get(format!("{}/api/users", base_url))
+        .send()
+        .await
+        .expect("GET /api/users after delete failed");
+
+    let list_after_body: serde_json::Value = list_after_resp.json().await.unwrap();
+    let users_after = list_after_body["data"].as_array().unwrap();
+    assert!(
+        !users_after
+            .iter()
+            .any(|u| u["id"].as_str() == Some(user_id)),
+        "Deleted user should not appear in user list"
+    );
+}
+
+#[tokio::test]
+async fn test_cleanup_orphans_skips_online_uninitialized_server() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // The cleanup heuristic matches `name == "New Server"` AND `os IS NULL`,
+    // so the test must create rows with that name explicitly.
+    let orphan_code = create_pending_server_named(&client, &base_url, "New Server").await;
+    let orphan_token = format!("orphan-token-{}", uuid::Uuid::new_v4());
+    let orphan_resp = client
+        .post(format!("{}/api/agent/register", base_url))
+        .header("Authorization", format!("Bearer {orphan_code}"))
+        .json(&json!({ "proposed_run_token": orphan_token }))
+        .send()
+        .await
+        .expect("Offline orphan registration failed");
+
+    assert_eq!(orphan_resp.status(), 200);
+    let orphan_body: serde_json::Value = orphan_resp.json().await.unwrap();
+    let orphan_server_id = orphan_body["data"]["server_id"]
+        .as_str()
+        .expect("orphan server_id missing")
+        .to_string();
+
+    let online_code = create_pending_server_named(&client, &base_url, "New Server").await;
+    let online_token = format!("online-token-{}", uuid::Uuid::new_v4());
+    let online_resp = client
+        .post(format!("{}/api/agent/register", base_url))
+        .header("Authorization", format!("Bearer {online_code}"))
+        .json(&json!({ "proposed_run_token": online_token }))
+        .send()
+        .await
+        .expect("Online placeholder registration failed");
+
+    assert_eq!(online_resp.status(), 200);
+    let online_body: serde_json::Value = online_resp.json().await.unwrap();
+    let online_server_id = online_body["data"]["server_id"]
+        .as_str()
+        .expect("online server_id missing")
+        .to_string();
+    let ws_url = format!(
+        "{}/api/agent/ws?token={}",
+        base_url.replace("http://", "ws://"),
+        online_token
+    );
+    let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WebSocket connection failed");
+    let (mut ws_sink, mut ws_reader) = ws_stream.split();
+
+    let welcome_msg = tokio::time::timeout(Duration::from_secs(5), ws_reader.next())
+        .await
+        .expect("Timeout waiting for Welcome")
+        .expect("WebSocket stream ended")
+        .expect("WebSocket read error");
+    let welcome_text = match welcome_msg {
+        tungstenite::Message::Text(t) => t.to_string(),
+        other => panic!("Expected Text message, got: {:?}", other),
+    };
+    let welcome: serde_json::Value =
+        serde_json::from_str(&welcome_text).expect("Failed to parse Welcome");
+    assert_eq!(welcome["type"], "welcome");
+    assert_eq!(welcome["server_id"], online_server_id);
+
+    let cleanup_resp = client
+        .delete(format!("{}/api/servers/cleanup", base_url))
+        .send()
+        .await
+        .expect("DELETE /api/servers/cleanup failed");
+
+    assert_eq!(cleanup_resp.status(), 200);
+    let cleanup_body: serde_json::Value = cleanup_resp.json().await.unwrap();
+    assert_eq!(
+        cleanup_body["data"]["deleted_count"].as_u64(),
+        Some(1),
+        "Cleanup should delete only the offline orphan"
+    );
+
+    let list_resp = client
+        .get(format!("{}/api/servers", base_url))
+        .send()
+        .await
+        .expect("GET /api/servers failed");
+
+    assert_eq!(list_resp.status(), 200);
+    let list_body: serde_json::Value = list_resp.json().await.unwrap();
+    let servers = list_body["data"]
+        .as_array()
+        .expect("servers should be an array");
+    let server_ids: Vec<&str> = servers.iter().filter_map(|s| s["id"].as_str()).collect();
+
+    assert_eq!(
+        servers.len(),
+        1,
+        "Only the online placeholder should remain"
+    );
+    assert!(
+        !server_ids.contains(&orphan_server_id.as_str()),
+        "Offline orphan should be removed"
+    );
+    assert!(
+        server_ids.contains(&online_server_id.as_str()),
+        "Online placeholder should not be deleted"
+    );
+
+    ws_sink.close().await.expect("Failed to close ws");
+}
+
+#[tokio::test]
+async fn test_alert_states_endpoint() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // Create an alert rule
+    let resp = client
+        .post(format!("{base_url}/api/alert-rules"))
+        .json(&serde_json::json!({
+            "name": "Test States",
+            "rules": [{"rule_type": "cpu", "min": 1.0}],
+            "cover_type": "all",
+            "trigger_mode": "always"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let rule_id = body["data"]["id"].as_str().unwrap();
+
+    // Query states (should be empty initially)
+    let resp = client
+        .get(format!("{base_url}/api/alert-rules/{rule_id}/states"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let states = body["data"].as_array().unwrap();
+    assert!(states.is_empty());
+
+    // Cleanup
+    client
+        .delete(format!("{base_url}/api/alert-rules/{rule_id}"))
+        .send()
+        .await
+        .unwrap();
+}
+
+// ── File management integration tests ─────────────────────────────────────────
+
+#[tokio::test]
+async fn test_file_list_server_offline() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+    let api_key = create_api_key(&client, &base_url).await;
+
+    let (server_id, token) = register_agent(&client, &base_url).await;
+
+    // Bring the agent online and have it report CAP_FILE so the capability is
+    // persisted into the mirror column. Capabilities are agent-owned, so the
+    // mirror is the only way an offline server is "known" to be file-capable.
+    let (mut ws_sink, mut ws_reader) = connect_agent(&base_url, &token).await;
+    let welcome = recv_agent_text(&mut ws_reader).await;
+    assert_eq!(welcome["type"], "welcome");
+    send_system_info(
+        &mut ws_sink,
+        &mut ws_reader,
+        "offline-file-msg",
+        Some(CAP_DEFAULT | CAP_FILE),
+    )
+    .await;
+
+    // Connect a browser WS so we can observe the authoritative `server_offline`
+    // event (REST responses carry no online flag — it is a WS-only concept).
+    let ws_url = base_url.replace("http://", "ws://") + "/api/ws/servers";
+    let mut request = ws_url
+        .into_client_request()
+        .expect("browser ws request should build");
+    request.headers_mut().insert(
+        "x-api-key",
+        HeaderValue::from_str(&api_key).expect("api key header should be valid"),
+    );
+    let (mut browser_ws, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("browser websocket should connect");
+    let full_sync = tokio::time::timeout(Duration::from_secs(5), browser_ws.next())
+        .await
+        .expect("full_sync timeout")
+        .expect("browser ws closed")
+        .expect("browser ws error");
+    let full_sync: serde_json::Value =
+        serde_json::from_str(full_sync.to_text().unwrap()).unwrap();
+    assert_eq!(full_sync["type"], "full_sync");
+
+    // Take the agent offline and wait for the broadcast.
+    let _ = ws_sink.close().await;
+    let mut saw_offline = false;
+    for _ in 0..40 {
+        let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(Duration::from_secs(3), browser_ws.next()).await
+        else {
+            break;
+        };
+        let Ok(text) = msg.to_text() else { continue };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) else {
+            continue;
+        };
+        if parsed["type"] == "server_offline" && parsed["server_id"] == server_id {
+            saw_offline = true;
+            break;
+        }
+    }
+    assert!(saw_offline, "agent should be observed offline after closing its WS");
+
+    // POST /api/files/{server_id}/list — file-capable (via mirror) but offline.
+    // The capability check passes (mirror has CAP_FILE), so the failure is the
+    // offline 404, not the 403 capability denial.
+    let list_resp = client
+        .post(format!("{}/api/files/{}/list", base_url, server_id))
+        .json(&json!({ "path": "/" }))
+        .send()
+        .await
+        .expect("POST /api/files/{id}/list failed");
+
+    assert_eq!(
+        list_resp.status(),
+        404,
+        "File list should return 404 when a file-capable server is offline"
+    );
+
+    let _ = browser_ws.close(None).await;
+}
+
+#[tokio::test]
+async fn test_file_capability_enforcement() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // Register an agent — default capabilities = CAP_DEFAULT (316), no CAP_FILE
+    let enrollment_code = mint_enrollment_code(&client, &base_url).await;
+    let register_resp = client
+        .post(format!("{}/api/agent/register", base_url))
+        .header("Authorization", format!("Bearer {enrollment_code}"))
+        .json(&json!({
+            "proposed_run_token": format!("integration-token-{}", uuid::Uuid::new_v4())
+        }))
+        .send()
+        .await
+        .expect("Register request failed");
+
+    assert_eq!(register_resp.status(), 200);
+    let register_body: serde_json::Value = register_resp.json().await.unwrap();
+    let server_id = register_body["data"]["server_id"]
+        .as_str()
+        .expect("server_id missing");
+
+    // POST /api/files/{server_id}/list — should get 403 (CAP_FILE not set)
+    let list_resp = client
+        .post(format!("{}/api/files/{}/list", base_url, server_id))
+        .json(&json!({ "path": "/" }))
+        .send()
+        .await
+        .expect("POST /api/files/{id}/list failed");
+
+    assert_eq!(
+        list_resp.status(),
+        403,
+        "File list should return 403 when CAP_FILE is not enabled"
+    );
+
+    let body: serde_json::Value = list_resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("agent_capability_disabled"),
+        "Capabilities are agent-owned, so the denial reason is always agent-side"
+    );
+}
+
+#[tokio::test]
+async fn test_file_capability_enforcement_uses_agent_local_policy_reason() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    let (server_id, token) = register_agent(&client, &base_url).await;
+
+    let (mut ws_sink, mut ws_reader) = connect_agent(&base_url, &token).await;
+    let welcome = recv_agent_text(&mut ws_reader).await;
+    assert_eq!(welcome["type"], "welcome");
+
+    // Agent reports default caps (no CAP_FILE), so file ops are denied with an
+    // agent-side reason — the server cannot grant what the agent didn't enable.
+    send_system_info(
+        &mut ws_sink,
+        &mut ws_reader,
+        "file-local-caps-msg",
+        Some(CAP_DEFAULT),
+    )
+    .await;
+
+    let list_resp = client
+        .post(format!("{}/api/files/{}/list", base_url, server_id))
+        .json(&json!({ "path": "/" }))
+        .send()
+        .await
+        .expect("POST /api/files/{id}/list failed");
+
+    assert_eq!(list_resp.status(), 403);
+    let body: serde_json::Value = list_resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("agent_capability_disabled"),
+        "Error message should preserve the agent-local capability denial reason"
+    );
+
+    let _ = ws_sink.close().await;
+}
+
+#[tokio::test]
+async fn test_oneshot_exec_capability_denial_uses_agent_local_policy_reason() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    let (server_id, token) = register_agent(&client, &base_url).await;
+
+    let (mut ws_sink, mut ws_reader) = connect_agent(&base_url, &token).await;
+    let welcome = recv_agent_text(&mut ws_reader).await;
+    assert_eq!(welcome["type"], "welcome");
+
+    // Agent reports default caps (no CAP_EXEC), so exec is denied agent-side.
+    send_system_info(
+        &mut ws_sink,
+        &mut ws_reader,
+        "exec-local-caps-msg",
+        Some(CAP_DEFAULT),
+    )
+    .await;
+
+    let create_resp = client
+        .post(format!("{}/api/tasks", base_url))
+        .json(&json!({
+            "command": "echo hello",
+            "server_ids": [server_id],
+            "task_type": "oneshot"
+        }))
+        .send()
+        .await
+        .expect("POST /api/tasks failed");
+
+    assert_eq!(create_resp.status(), 200);
+    let create_body: serde_json::Value = create_resp
+        .json()
+        .await
+        .expect("Failed to parse task create response");
+    let task_id = create_body["data"]["id"].as_str().expect("task id missing");
+
+    let results_resp = client
+        .get(format!("{}/api/tasks/{}/results", base_url, task_id))
+        .send()
+        .await
+        .expect("GET /api/tasks/{id}/results failed");
+    assert_eq!(results_resp.status(), 200);
+
+    let results_body: serde_json::Value = results_resp
+        .json()
+        .await
+        .expect("Failed to parse task results response");
+    let results = results_body["data"]
+        .as_array()
+        .expect("task results should be an array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["server_id"], server_id);
+    assert!(
+        results[0]["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("exec is disabled in the agent's config"),
+        "Task result should preserve the agent-local exec denial reason"
+    );
+
+    let _ = ws_sink.close().await;
+}
+
+#[tokio::test]
+async fn test_file_transfers_endpoint() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // GET /api/files/transfers — should return empty list
+    let transfers_resp = client
+        .get(format!("{}/api/files/transfers", base_url))
+        .send()
+        .await
+        .expect("GET /api/files/transfers failed");
+
+    assert_eq!(transfers_resp.status(), 200);
+    let transfers_body: serde_json::Value = transfers_resp.json().await.unwrap();
+    let transfers = transfers_body["data"]["transfers"]
+        .as_array()
+        .expect("transfers should be an array");
+    assert!(
+        transfers.is_empty(),
+        "Transfers list should be empty initially"
+    );
+
+    // DELETE /api/files/transfers/nonexistent — should return 404
+    let cancel_resp = client
+        .delete(format!("{}/api/files/transfers/nonexistent-id", base_url))
+        .send()
+        .await
+        .expect("DELETE /api/files/transfers/nonexistent failed");
+
+    assert_eq!(
+        cancel_resp.status(),
+        404,
+        "Cancelling nonexistent transfer should return 404"
+    );
+}
+
+#[tokio::test]
+async fn test_file_write_requires_admin() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin_client = http_client();
+
+    // Login as admin and create a member user
+    login_admin(&admin_client, &base_url).await;
+
+    let create_resp = admin_client
+        .post(format!("{}/api/users", base_url))
+        .json(&json!({
+            "username": "filemember",
+            "password": "memberpass123",
+            "role": "member"
+        }))
+        .send()
+        .await
+        .expect("POST /api/users failed");
+
+    assert_eq!(
+        create_resp.status(),
+        200,
+        "Admin should be able to create member"
+    );
+
+    // Login as the member user in a separate client
+    let member_client = http_client();
+    let member_login = member_client
+        .post(format!("{}/api/auth/login", base_url))
+        .json(&json!({
+            "username": "filemember",
+            "password": "memberpass123"
+        }))
+        .send()
+        .await
+        .expect("Member login request failed");
+
+    assert_eq!(member_login.status(), 200, "Member login should succeed");
+
+    // POST /api/files/1/write as member -> 403 (require_admin)
+    let write_resp = member_client
+        .post(format!("{}/api/files/1/write", base_url))
+        .json(&json!({
+            "path": "/tmp/test.txt",
+            "content": "dGVzdA=="
+        }))
+        .send()
+        .await
+        .expect("POST /api/files/1/write as member failed");
+
+    assert_eq!(
+        write_resp.status(),
+        403,
+        "Member should receive 403 when attempting file write"
+    );
+}
+
+#[tokio::test]
+async fn test_file_delete_requires_admin() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin_client = http_client();
+
+    login_admin(&admin_client, &base_url).await;
+
+    let create_resp = admin_client
+        .post(format!("{}/api/users", base_url))
+        .json(&json!({
+            "username": "filedelmember",
+            "password": "memberpass123",
+            "role": "member"
+        }))
+        .send()
+        .await
+        .expect("POST /api/users failed");
+
+    assert_eq!(create_resp.status(), 200);
+
+    let member_client = http_client();
+    let member_login = member_client
+        .post(format!("{}/api/auth/login", base_url))
+        .json(&json!({
+            "username": "filedelmember",
+            "password": "memberpass123"
+        }))
+        .send()
+        .await
+        .expect("Member login request failed");
+
+    assert_eq!(member_login.status(), 200);
+
+    // POST /api/files/1/delete as member -> 403
+    let delete_resp = member_client
+        .post(format!("{}/api/files/1/delete", base_url))
+        .json(&json!({
+            "path": "/tmp/test.txt",
+            "recursive": false
+        }))
+        .send()
+        .await
+        .expect("POST /api/files/1/delete as member failed");
+
+    assert_eq!(
+        delete_resp.status(),
+        403,
+        "Member should receive 403 when attempting file delete"
+    );
+}
+
+#[tokio::test]
+async fn test_file_mkdir_requires_admin() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin_client = http_client();
+
+    login_admin(&admin_client, &base_url).await;
+
+    let create_resp = admin_client
+        .post(format!("{}/api/users", base_url))
+        .json(&json!({
+            "username": "filemkdirmember",
+            "password": "memberpass123",
+            "role": "member"
+        }))
+        .send()
+        .await
+        .expect("POST /api/users failed");
+
+    assert_eq!(create_resp.status(), 200);
+
+    let member_client = http_client();
+    let member_login = member_client
+        .post(format!("{}/api/auth/login", base_url))
+        .json(&json!({
+            "username": "filemkdirmember",
+            "password": "memberpass123"
+        }))
+        .send()
+        .await
+        .expect("Member login request failed");
+
+    assert_eq!(member_login.status(), 200);
+
+    // POST /api/files/1/mkdir as member -> 403
+    let mkdir_resp = member_client
+        .post(format!("{}/api/files/1/mkdir", base_url))
+        .json(&json!({
+            "path": "/tmp/newdir"
+        }))
+        .send()
+        .await
+        .expect("POST /api/files/1/mkdir as member failed");
+
+    assert_eq!(
+        mkdir_resp.status(),
+        403,
+        "Member should receive 403 when attempting file mkdir"
+    );
+}
+
+// ─── Traffic Stats Integration Tests ──────────────────────────────────
+
+#[tokio::test]
+async fn test_oneshot_task_backward_compat() {
+    // Verify that creating a one-shot task still works after migration adds new NOT NULL columns
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // Register agent to get a server_id
+    let enrollment_code = mint_enrollment_code(&client, &base_url).await;
+    let register_resp = client
+        .post(format!("{}/api/agent/register", base_url))
+        .header("Authorization", format!("Bearer {enrollment_code}"))
+        .json(&json!({
+            "proposed_run_token": format!("integration-token-{}", uuid::Uuid::new_v4())
+        }))
+        .send()
+        .await
+        .expect("Register failed");
+    assert_eq!(register_resp.status(), 200);
+    let body: serde_json::Value = register_resp.json().await.unwrap();
+    let server_id = body["data"]["server_id"].as_str().unwrap();
+
+    // Create a one-shot task (should work with new schema defaults)
+    let task_resp = client
+        .post(format!("{}/api/tasks", base_url))
+        .json(&json!({
+            "command": "echo hello",
+            "server_ids": [server_id]
+        }))
+        .send()
+        .await
+        .expect("Create task failed");
+
+    assert_eq!(
+        task_resp.status(),
+        200,
+        "One-shot task creation should still work after migration"
+    );
+}
+
+#[tokio::test]
+async fn test_traffic_api_returns_data() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // Register agent
+    let enrollment_code = mint_enrollment_code(&client, &base_url).await;
+    let register_resp = client
+        .post(format!("{}/api/agent/register", base_url))
+        .header("Authorization", format!("Bearer {enrollment_code}"))
+        .json(&json!({
+            "proposed_run_token": format!("integration-token-{}", uuid::Uuid::new_v4())
+        }))
+        .send()
+        .await
+        .expect("Register failed");
+    assert_eq!(register_resp.status(), 200);
+    let body: serde_json::Value = register_resp.json().await.unwrap();
+    let server_id = body["data"]["server_id"].as_str().unwrap();
+
+    // Query traffic (should return empty but valid structure)
+    let traffic_resp = client
+        .get(format!("{}/api/servers/{}/traffic", base_url, server_id))
+        .send()
+        .await
+        .expect("Traffic query failed");
+
+    assert_eq!(traffic_resp.status(), 200, "Traffic API should return 200");
+    let traffic: serde_json::Value = traffic_resp.json().await.unwrap();
+    let data = &traffic["data"];
+    assert!(data["cycle_start"].is_string());
+    assert!(data["cycle_end"].is_string());
+    assert_eq!(data["bytes_in"].as_i64(), Some(0));
+    assert_eq!(data["bytes_out"].as_i64(), Some(0));
+    assert_eq!(data["bytes_total"].as_i64(), Some(0));
+    assert!(data["daily"].is_array());
+    assert!(data["hourly"].is_array());
+}
+
+#[tokio::test]
+async fn test_service_monitor_crud_and_check() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // ── Step 1a: loopback targets are rejected at create time (SSRF guard) ──
+    let addr = base_url.trim_start_matches("http://");
+    let loopback_resp = client
+        .post(format!("{}/api/service-monitors", base_url))
+        .json(&json!({
+            "name": "Loopback TCP Check",
+            "monitor_type": "tcp",
+            "target": addr,
+            "interval": 300,
+            "config_json": {},
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("POST /api/service-monitors failed");
+    assert_eq!(
+        loopback_resp.status(),
+        422,
+        "creating a loopback-target monitor must be rejected at config time"
+    );
+
+    // ── Step 1b: create a monitor with a safe, non-routable target ──
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737): it passes the monitor SSRF guard (not
+    // loopback/link-local/metadata) but is non-routable, so the live check below
+    // fails to connect rather than being blocked — exercising the full CRUD +
+    // check lifecycle without depending on an external host.
+    let create_resp = client
+        .post(format!("{}/api/service-monitors", base_url))
+        .json(&json!({
+            "name": "TCP Check",
+            "monitor_type": "tcp",
+            "target": "192.0.2.1:9",
+            "interval": 300,
+            "config_json": { "timeout": 2 },
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("POST /api/service-monitors failed");
+
+    assert_eq!(
+        create_resp.status(),
+        200,
+        "create service monitor should succeed"
+    );
+    let create_body: serde_json::Value = create_resp.json().await.unwrap();
+    let monitor_id = create_body["data"]["id"]
+        .as_str()
+        .expect("monitor id missing");
+    assert_eq!(create_body["data"]["name"], "TCP Check");
+    assert_eq!(create_body["data"]["monitor_type"], "tcp");
+
+    // ── Step 2: List monitors — verify it appears ──
+    let list_resp = client
+        .get(format!("{}/api/service-monitors", base_url))
+        .send()
+        .await
+        .expect("GET /api/service-monitors failed");
+
+    assert_eq!(list_resp.status(), 200);
+    let list_body: serde_json::Value = list_resp.json().await.unwrap();
+    let monitors = list_body["data"].as_array().expect("data should be array");
+    assert!(
+        monitors
+            .iter()
+            .any(|m| m["id"].as_str() == Some(monitor_id)),
+        "Created monitor should appear in list"
+    );
+
+    // ── Step 3: Trigger check — non-routable target fails to connect ──
+    let check_resp = client
+        .post(format!(
+            "{}/api/service-monitors/{}/check",
+            base_url, monitor_id
+        ))
+        .send()
+        .await
+        .expect("POST /api/service-monitors/{id}/check failed");
+
+    assert_eq!(check_resp.status(), 200, "trigger check should succeed");
+    let check_body: serde_json::Value = check_resp.json().await.unwrap();
+    let record = &check_body["data"];
+    assert!(record["id"].is_number(), "record should have a numeric id");
+    assert_eq!(record["monitor_id"], monitor_id);
+    // Whether the TCP connect to a non-routable address succeeds, is refused,
+    // or times out is environment-dependent; the invariant here is that the
+    // check endpoint runs the checker and persists a record with a real boolean
+    // success field. (Loopback/metadata rejection is covered by the checker unit
+    // tests and the Step 1a create-time guard above.)
+    assert!(
+        record["success"].is_boolean(),
+        "check should persist a boolean success, got: {:?}",
+        record["success"]
+    );
+
+    // ── Step 4: Get records — verify the check created a record ──
+    let records_resp = client
+        .get(format!(
+            "{}/api/service-monitors/{}/records",
+            base_url, monitor_id
+        ))
+        .send()
+        .await
+        .expect("GET /api/service-monitors/{id}/records failed");
+
+    assert_eq!(records_resp.status(), 200);
+    let records_body: serde_json::Value = records_resp.json().await.unwrap();
+    let records = records_body["data"]
+        .as_array()
+        .expect("data should be array");
+    assert_eq!(records.len(), 1, "should have 1 record after one check");
+    assert!(records[0]["success"].is_boolean());
+
+    // ── Step 5: Delete monitor ──
+    let delete_resp = client
+        .delete(format!("{}/api/service-monitors/{}", base_url, monitor_id))
+        .send()
+        .await
+        .expect("DELETE /api/service-monitors/{id} failed");
+
+    assert_eq!(delete_resp.status(), 200, "delete monitor should succeed");
+
+    // Verify it's gone
+    let list_after = client
+        .get(format!("{}/api/service-monitors", base_url))
+        .send()
+        .await
+        .unwrap();
+    let list_after_body: serde_json::Value = list_after.json().await.unwrap();
+    let monitors_after = list_after_body["data"].as_array().unwrap();
+    assert!(
+        !monitors_after
+            .iter()
+            .any(|m| m["id"].as_str() == Some(monitor_id)),
+        "Deleted monitor should not appear in list"
+    );
+}
+
+#[tokio::test]
+async fn test_traffic_overview_api() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // ── Step 1: GET /api/traffic/overview — no servers with billing cycles ──
+    let overview_resp = client
+        .get(format!("{}/api/traffic/overview", base_url))
+        .send()
+        .await
+        .expect("GET /api/traffic/overview failed");
+
+    assert_eq!(
+        overview_resp.status(),
+        200,
+        "traffic overview should return 200"
+    );
+    let overview_body: serde_json::Value = overview_resp.json().await.unwrap();
+    let overview_data = overview_body["data"]
+        .as_array()
+        .expect("data should be an array");
+    assert!(
+        overview_data.is_empty(),
+        "overview should be empty when no servers have billing cycles"
+    );
+
+    // ── Step 2: Register agent and configure billing cycle ──
+    let enrollment_code = mint_enrollment_code(&client, &base_url).await;
+    let register_resp = client
+        .post(format!("{}/api/agent/register", base_url))
+        .header("Authorization", format!("Bearer {enrollment_code}"))
+        .json(&json!({
+            "proposed_run_token": format!("integration-token-{}", uuid::Uuid::new_v4())
+        }))
+        .send()
+        .await
+        .expect("Register failed");
+    assert_eq!(register_resp.status(), 200);
+    let body: serde_json::Value = register_resp.json().await.unwrap();
+    let server_id = body["data"]["server_id"].as_str().unwrap();
+
+    // Set billing_cycle on the server
+    let update_resp = client
+        .put(format!("{}/api/servers/{}", base_url, server_id))
+        .json(&json!({
+            "billing_cycle": "monthly",
+            "billing_start_day": 1,
+            "traffic_limit": 1_099_511_627_776_i64
+        }))
+        .send()
+        .await
+        .expect("Update server failed");
+    assert_eq!(update_resp.status(), 200);
+
+    // ── Step 3: GET /api/traffic/overview — should now include the server ──
+    let overview_resp2 = client
+        .get(format!("{}/api/traffic/overview", base_url))
+        .send()
+        .await
+        .expect("GET /api/traffic/overview failed");
+
+    assert_eq!(overview_resp2.status(), 200);
+    let overview_body2: serde_json::Value = overview_resp2.json().await.unwrap();
+    let overview_data2 = overview_body2["data"].as_array().unwrap();
+    assert_eq!(
+        overview_data2.len(),
+        1,
+        "overview should include 1 server after billing config"
+    );
+    assert_eq!(overview_data2[0]["server_id"], server_id);
+    assert_eq!(overview_data2[0]["billing_cycle"], "monthly");
+    assert!(overview_data2[0]["cycle_in"].is_number());
+    assert!(overview_data2[0]["cycle_out"].is_number());
+    assert!(overview_data2[0]["days_remaining"].is_number());
+    assert!(overview_data2[0]["traffic_limit"].is_number());
+
+    // ── Step 4: GET /api/traffic/overview/daily — valid structure ──
+    let daily_resp = client
+        .get(format!("{}/api/traffic/overview/daily?days=30", base_url))
+        .send()
+        .await
+        .expect("GET /api/traffic/overview/daily failed");
+
+    assert_eq!(daily_resp.status(), 200);
+    let daily_body: serde_json::Value = daily_resp.json().await.unwrap();
+    assert!(
+        daily_body["data"].is_array(),
+        "daily overview data should be an array"
+    );
+}
+
+#[tokio::test]
+async fn test_server_billing_start_day() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // Register agent
+    let enrollment_code = mint_enrollment_code(&client, &base_url).await;
+    let register_resp = client
+        .post(format!("{}/api/agent/register", base_url))
+        .header("Authorization", format!("Bearer {enrollment_code}"))
+        .json(&json!({
+            "proposed_run_token": format!("integration-token-{}", uuid::Uuid::new_v4())
+        }))
+        .send()
+        .await
+        .expect("Register failed");
+    let body: serde_json::Value = register_resp.json().await.unwrap();
+    let server_id = body["data"]["server_id"].as_str().unwrap();
+
+    // Update server with billing_start_day
+    let update_resp = client
+        .put(format!("{}/api/servers/{}", base_url, server_id))
+        .json(&json!({
+            "billing_start_day": 15,
+            "billing_cycle": "monthly",
+            "traffic_limit": 1099511627776_i64
+        }))
+        .send()
+        .await
+        .expect("Update server failed");
+
+    assert_eq!(update_resp.status(), 200);
+    let updated: serde_json::Value = update_resp.json().await.unwrap();
+    assert_eq!(updated["data"]["billing_start_day"].as_i64(), Some(15));
+
+    // Verify traffic API reflects the billing cycle
+    let traffic_resp = client
+        .get(format!("{}/api/servers/{}/traffic", base_url, server_id))
+        .send()
+        .await
+        .expect("Traffic query failed");
+    assert_eq!(traffic_resp.status(), 200);
+    let traffic: serde_json::Value = traffic_resp.json().await.unwrap();
+    assert!(traffic["data"]["traffic_limit"].as_i64().is_some());
+}
+
+// ── Dashboard integration tests ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_dashboard_crud_cycle() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // ── Step 1: POST /api/dashboards — create a dashboard ──
+    let create_resp = client
+        .post(format!("{}/api/dashboards", base_url))
+        .json(&json!({ "name": "Test Dashboard" }))
+        .send()
+        .await
+        .expect("POST /api/dashboards failed");
+
+    assert_eq!(
+        create_resp.status(),
+        200,
+        "dashboard creation should succeed"
+    );
+    let create_body: serde_json::Value = create_resp.json().await.unwrap();
+    let dash_id = create_body["data"]["id"]
+        .as_str()
+        .expect("dashboard id missing");
+    assert_eq!(create_body["data"]["name"], "Test Dashboard");
+    // First dashboard created becomes default
+    assert_eq!(create_body["data"]["is_default"], true);
+
+    // ── Step 2: GET /api/dashboards/{id} — verify it exists with 0 widgets ──
+    let get_resp = client
+        .get(format!("{}/api/dashboards/{}", base_url, dash_id))
+        .send()
+        .await
+        .expect("GET /api/dashboards/{id} failed");
+
+    assert_eq!(get_resp.status(), 200);
+    let get_body: serde_json::Value = get_resp.json().await.unwrap();
+    assert_eq!(get_body["data"]["id"], dash_id);
+    assert_eq!(get_body["data"]["name"], "Test Dashboard");
+    let widgets = get_body["data"]["widgets"]
+        .as_array()
+        .expect("widgets should be array");
+    assert!(
+        widgets.is_empty(),
+        "Newly created dashboard should have 0 widgets"
+    );
+
+    // ── Step 3: PUT /api/dashboards/{id} — add 3 widgets ──
+    let update1_resp = client
+        .put(format!("{}/api/dashboards/{}", base_url, dash_id))
+        .json(&json!({
+            "widgets": [
+                {
+                    "widget_type": "stat-number",
+                    "config_json": {"metric": "server_count"},
+                    "grid_x": 0, "grid_y": 0, "grid_w": 2, "grid_h": 2, "sort_order": 0
+                },
+                {
+                    "widget_type": "gauge",
+                    "title": "CPU Gauge",
+                    "config_json": {"metric": "cpu"},
+                    "grid_x": 2, "grid_y": 0, "grid_w": 4, "grid_h": 3, "sort_order": 1
+                },
+                {
+                    "widget_type": "server-cards",
+                    "config_json": {"scope": "all"},
+                    "grid_x": 0, "grid_y": 3, "grid_w": 12, "grid_h": 6, "sort_order": 2
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("PUT /api/dashboards/{id} (add widgets) failed");
+
+    assert_eq!(update1_resp.status(), 200, "adding widgets should succeed");
+    let update1_body: serde_json::Value = update1_resp.json().await.unwrap();
+    let widgets1 = update1_body["data"]["widgets"].as_array().unwrap();
+    assert_eq!(
+        widgets1.len(),
+        3,
+        "should have 3 widgets after first update"
+    );
+
+    // Collect widget ids for the diff test
+    let widget_id_0 = widgets1[0]["id"].as_str().unwrap().to_string();
+    let widget_id_1 = widgets1[1]["id"].as_str().unwrap().to_string();
+    // widget_id_2 will be deleted
+
+    // ── Step 4: PUT /api/dashboards/{id} — widget diff: update 1, keep 1, delete 1, add 2 ──
+    let update2_resp = client
+        .put(format!("{}/api/dashboards/{}", base_url, dash_id))
+        .json(&json!({
+            "widgets": [
+                {
+                    "id": widget_id_0,
+                    "widget_type": "stat-number",
+                    "config_json": {"metric": "server_count"},
+                    "grid_x": 0, "grid_y": 0, "grid_w": 2, "grid_h": 2, "sort_order": 0
+                },
+                {
+                    "id": widget_id_1,
+                    "widget_type": "gauge",
+                    "title": "CPU Gauge Updated",
+                    "config_json": {"metric": "cpu", "server_id": "all"},
+                    "grid_x": 2, "grid_y": 0, "grid_w": 6, "grid_h": 3, "sort_order": 1
+                },
+                {
+                    "widget_type": "alert-list",
+                    "config_json": {"limit": 10},
+                    "grid_x": 0, "grid_y": 3, "grid_w": 6, "grid_h": 4, "sort_order": 2
+                },
+                {
+                    "widget_type": "markdown",
+                    "title": "Notes",
+                    "config_json": {"content": "# Hello"},
+                    "grid_x": 6, "grid_y": 3, "grid_w": 6, "grid_h": 4, "sort_order": 3
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("PUT /api/dashboards/{id} (widget diff) failed");
+
+    assert_eq!(
+        update2_resp.status(),
+        200,
+        "widget diff update should succeed"
+    );
+    let update2_body: serde_json::Value = update2_resp.json().await.unwrap();
+    let widgets2 = update2_body["data"]["widgets"].as_array().unwrap();
+    assert_eq!(
+        widgets2.len(),
+        4,
+        "should have 4 widgets after diff update (kept 2 + added 2, deleted 1)"
+    );
+
+    // ── Step 5: GET /api/dashboards/{id} — verify the final state ──
+    let get_final = client
+        .get(format!("{}/api/dashboards/{}", base_url, dash_id))
+        .send()
+        .await
+        .expect("GET /api/dashboards/{id} final failed");
+
+    assert_eq!(get_final.status(), 200);
+    let final_body: serde_json::Value = get_final.json().await.unwrap();
+    let final_widgets = final_body["data"]["widgets"].as_array().unwrap();
+    assert_eq!(final_widgets.len(), 4);
+
+    // The updated widget should have the new title and grid_w
+    let updated_gauge = final_widgets
+        .iter()
+        .find(|w| w["id"] == widget_id_1)
+        .unwrap();
+    assert_eq!(updated_gauge["title"], "CPU Gauge Updated");
+    assert_eq!(updated_gauge["grid_w"], 6);
+
+    // The kept stat-number widget should still be present
+    assert!(
+        final_widgets
+            .iter()
+            .any(|w| w["id"] == widget_id_0.as_str())
+    );
+
+    // The deleted server-cards widget should be gone
+    let widget_types: Vec<&str> = final_widgets
+        .iter()
+        .map(|w| w["widget_type"].as_str().unwrap())
+        .collect();
+    assert!(
+        !widget_types.contains(&"server-cards"),
+        "server-cards widget should have been deleted"
+    );
+    assert!(
+        widget_types.contains(&"alert-list"),
+        "alert-list widget should be present"
+    );
+    assert!(
+        widget_types.contains(&"markdown"),
+        "markdown widget should be present"
+    );
+
+    // ── Step 6: Create a second dashboard, then DELETE first (cannot delete default) ──
+    let create2_resp = client
+        .post(format!("{}/api/dashboards", base_url))
+        .json(&json!({ "name": "Second" }))
+        .send()
+        .await
+        .expect("POST /api/dashboards (second) failed");
+
+    assert_eq!(create2_resp.status(), 200);
+    let create2_body: serde_json::Value = create2_resp.json().await.unwrap();
+    let dash2_id = create2_body["data"]["id"].as_str().unwrap();
+
+    // Try to delete default dashboard — should fail
+    let del_default_resp = client
+        .delete(format!("{}/api/dashboards/{}", base_url, dash_id))
+        .send()
+        .await
+        .expect("DELETE /api/dashboards (default) failed");
+
+    assert_eq!(
+        del_default_resp.status(),
+        400,
+        "Deleting default dashboard should fail with 400"
+    );
+
+    // Delete the non-default second dashboard — should succeed
+    let del_resp = client
+        .delete(format!("{}/api/dashboards/{}", base_url, dash2_id))
+        .send()
+        .await
+        .expect("DELETE /api/dashboards (non-default) failed");
+
+    assert_eq!(
+        del_resp.status(),
+        200,
+        "Deleting non-default dashboard should succeed"
+    );
+
+    // Verify it's gone from the list
+    let list_resp = client
+        .get(format!("{}/api/dashboards", base_url))
+        .send()
+        .await
+        .expect("GET /api/dashboards failed");
+
+    assert_eq!(list_resp.status(), 200);
+    let list_body: serde_json::Value = list_resp.json().await.unwrap();
+    let dashboards = list_body["data"].as_array().unwrap();
+    assert_eq!(dashboards.len(), 1, "Should have 1 dashboard after delete");
+    assert!(
+        !dashboards
+            .iter()
+            .any(|d| d["id"].as_str() == Some(dash2_id)),
+        "Deleted dashboard should not appear in list"
+    );
+}
+
+#[tokio::test]
+async fn test_dashboard_default_auto_creates() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // ── Step 1: GET /api/dashboards/default — first call auto-creates ──
+    let resp1 = client
+        .get(format!("{}/api/dashboards/default", base_url))
+        .send()
+        .await
+        .expect("GET /api/dashboards/default (first) failed");
+
+    assert_eq!(resp1.status(), 200, "default dashboard should auto-create");
+    let body1: serde_json::Value = resp1.json().await.unwrap();
+    let dash_id = body1["data"]["id"].as_str().expect("id missing");
+    assert_eq!(body1["data"]["is_default"], true);
+    assert_eq!(body1["data"]["name"], "Dashboard");
+
+    let widgets1 = body1["data"]["widgets"]
+        .as_array()
+        .expect("widgets should be array");
+    assert_eq!(
+        widgets1.len(),
+        6,
+        "Default dashboard should have 6 preset widgets"
+    );
+
+    // Verify widget types match expected presets
+    let types: Vec<&str> = widgets1
+        .iter()
+        .map(|w| w["widget_type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types.iter().filter(|&&t| t == "stat-number").count(),
+        5,
+        "Should have 5 stat-number widgets"
+    );
+    assert_eq!(
+        types.iter().filter(|&&t| t == "server-cards").count(),
+        1,
+        "Should have 1 server-cards widget"
+    );
+
+    // ── Step 2: GET /api/dashboards/default — second call returns same dashboard ──
+    let resp2 = client
+        .get(format!("{}/api/dashboards/default", base_url))
+        .send()
+        .await
+        .expect("GET /api/dashboards/default (second) failed");
+
+    assert_eq!(resp2.status(), 200);
+    let body2: serde_json::Value = resp2.json().await.unwrap();
+    assert_eq!(
+        body2["data"]["id"].as_str().unwrap(),
+        dash_id,
+        "Second call should return the same dashboard id"
+    );
+
+    let widgets2 = body2["data"]["widgets"].as_array().unwrap();
+    assert_eq!(
+        widgets2.len(),
+        6,
+        "Second call should still return 6 widgets"
+    );
+}
+
+#[tokio::test]
+async fn test_dashboard_rbac_member_cannot_write() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin_client = http_client();
+
+    // Login as admin and create a member user
+    login_admin(&admin_client, &base_url).await;
+
+    let create_user_resp = admin_client
+        .post(format!("{}/api/users", base_url))
+        .json(&json!({
+            "username": "dashmember",
+            "password": "memberpass123",
+            "role": "member"
+        }))
+        .send()
+        .await
+        .expect("POST /api/users failed");
+
+    assert_eq!(
+        create_user_resp.status(),
+        200,
+        "Admin should be able to create member"
+    );
+
+    // Create a dashboard as admin to use for PUT/DELETE tests
+    let dash_resp = admin_client
+        .post(format!("{}/api/dashboards", base_url))
+        .json(&json!({ "name": "Admin Dashboard" }))
+        .send()
+        .await
+        .expect("POST /api/dashboards failed");
+
+    assert_eq!(dash_resp.status(), 200);
+    let dash_body: serde_json::Value = dash_resp.json().await.unwrap();
+    let dash_id = dash_body["data"]["id"].as_str().unwrap();
+
+    // Login as the member user in a separate client
+    let member_client = http_client();
+    let member_login = member_client
+        .post(format!("{}/api/auth/login", base_url))
+        .json(&json!({
+            "username": "dashmember",
+            "password": "memberpass123"
+        }))
+        .send()
+        .await
+        .expect("Member login request failed");
+
+    assert_eq!(member_login.status(), 200, "Member login should succeed");
+
+    // ── Member can READ dashboards ──
+    let get_resp = member_client
+        .get(format!("{}/api/dashboards/{}", base_url, dash_id))
+        .send()
+        .await
+        .expect("GET /api/dashboards/{id} as member failed");
+
+    assert_eq!(
+        get_resp.status(),
+        200,
+        "Member should be able to read dashboards"
+    );
+
+    // ── Member cannot POST /api/dashboards ──
+    let post_resp = member_client
+        .post(format!("{}/api/dashboards", base_url))
+        .json(&json!({ "name": "Member Dashboard" }))
+        .send()
+        .await
+        .expect("POST /api/dashboards as member failed");
+
+    assert_eq!(
+        post_resp.status(),
+        403,
+        "Member should receive 403 when attempting to create dashboard"
+    );
+
+    // ── Member cannot PUT /api/dashboards/{id} ──
+    let put_resp = member_client
+        .put(format!("{}/api/dashboards/{}", base_url, dash_id))
+        .json(&json!({
+            "widgets": [{
+                "widget_type": "markdown",
+                "config_json": {"content": "hack"},
+                "grid_x": 0, "grid_y": 0, "grid_w": 4, "grid_h": 3, "sort_order": 0
+            }]
+        }))
+        .send()
+        .await
+        .expect("PUT /api/dashboards/{id} as member failed");
+
+    assert_eq!(
+        put_resp.status(),
+        403,
+        "Member should receive 403 when attempting to update dashboard"
+    );
+
+    // ── Member cannot DELETE /api/dashboards/{id} ──
+    let delete_resp = member_client
+        .delete(format!("{}/api/dashboards/{}", base_url, dash_id))
+        .send()
+        .await
+        .expect("DELETE /api/dashboards/{id} as member failed");
+
+    assert_eq!(
+        delete_resp.status(),
+        403,
+        "Member should receive 403 when attempting to delete dashboard"
+    );
+}
+
+#[tokio::test]
+async fn test_alert_events_endpoint() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // ── Step 1: GET /api/alert-events?limit=5 — empty initially ──
+    let events_resp = client
+        .get(format!("{}/api/alert-events?limit=5", base_url))
+        .send()
+        .await
+        .expect("GET /api/alert-events failed");
+
+    assert_eq!(events_resp.status(), 200, "alert-events should return 200");
+    let events_body: serde_json::Value = events_resp.json().await.unwrap();
+    let events = events_body["data"]
+        .as_array()
+        .expect("data should be array");
+    assert!(events.is_empty(), "alert events should be empty initially");
+
+    // ── Step 2: GET /api/alert-events without limit — should use default limit ──
+    let events_default_resp = client
+        .get(format!("{}/api/alert-events", base_url))
+        .send()
+        .await
+        .expect("GET /api/alert-events (no limit) failed");
+
+    assert_eq!(
+        events_default_resp.status(),
+        200,
+        "alert-events with default limit should return 200"
+    );
+    let events_default_body: serde_json::Value = events_default_resp.json().await.unwrap();
+    assert!(
+        events_default_body["data"].is_array(),
+        "data should be an array"
+    );
+
+    // ── Step 3: Create alert infrastructure to seed events ──
+    // Create notification channel
+    let notif_resp = client
+        .post(format!("{}/api/notifications", base_url))
+        .json(&json!({
+            "name": "Events Test Webhook",
+            "notify_type": "webhook",
+            "config_json": {
+                "type": "webhook",
+                "url": "https://example.com/hook",
+                "method": "POST",
+                "headers": {},
+                "body_template": null
+            },
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("POST /api/notifications failed");
+
+    assert_eq!(notif_resp.status(), 200);
+    let notif_body: serde_json::Value = notif_resp.json().await.unwrap();
+    let notif_id = notif_body["data"]["id"].as_str().unwrap();
+
+    // Create notification group
+    let group_resp = client
+        .post(format!("{}/api/notification-groups", base_url))
+        .json(&json!({
+            "name": "Events Test Group",
+            "notification_ids": [notif_id]
+        }))
+        .send()
+        .await
+        .expect("POST /api/notification-groups failed");
+
+    assert_eq!(group_resp.status(), 200);
+
+    // Create alert rules
+    let rule_resp = client
+        .post(format!("{}/api/alert-rules", base_url))
+        .json(&json!({
+            "name": "CPU Alert for Events",
+            "rules": [{"rule_type": "cpu", "min": 90.0}],
+            "cover_type": "all",
+            "trigger_mode": "always"
+        }))
+        .send()
+        .await
+        .expect("POST /api/alert-rules failed");
+
+    assert_eq!(rule_resp.status(), 200);
+    let rule_body: serde_json::Value = rule_resp.json().await.unwrap();
+    let _rule_id = rule_body["data"]["id"].as_str().unwrap();
+
+    // ── Step 4: GET /api/alert-events?limit=5 — still empty (no states triggered) ──
+    let events_resp2 = client
+        .get(format!("{}/api/alert-events?limit=5", base_url))
+        .send()
+        .await
+        .expect("GET /api/alert-events failed");
+
+    assert_eq!(events_resp2.status(), 200);
+    let events_body2: serde_json::Value = events_resp2.json().await.unwrap();
+    let events2 = events_body2["data"].as_array().unwrap();
+    // Alert events require alert_state records (created by the evaluator when rules fire).
+    // Without agent reports triggering the evaluator, there are no states, so events remain empty.
+    assert!(
+        events2.is_empty(),
+        "alert events should be empty when no alert states exist"
+    );
+}
+
+#[tokio::test]
+async fn test_uptime_daily_requires_auth() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    // Without login, should get 401
+    let resp = client
+        .get(format!("{}/api/servers/nonexistent/uptime-daily", base_url))
+        .send()
+        .await
+        .expect("GET /api/servers/{id}/uptime-daily failed");
+
+    assert_eq!(
+        resp.status(),
+        401,
+        "Unauthenticated request should return 401"
+    );
+}
+
+#[tokio::test]
+async fn test_uptime_daily_server_not_found() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    let resp = client
+        .get(format!(
+            "{}/api/servers/nonexistent-server-id/uptime-daily",
+            base_url
+        ))
+        .send()
+        .await
+        .expect("GET /api/servers/{id}/uptime-daily failed");
+
+    assert_eq!(resp.status(), 404, "Non-existent server should return 404");
+}
+
+#[tokio::test]
+async fn test_uptime_daily_returns_data() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+    login_admin(&client, &base_url).await;
+
+    // Register agent to create a server
+    let enrollment_code = mint_enrollment_code(&client, &base_url).await;
+    let register_resp = client
+        .post(format!("{}/api/agent/register", base_url))
+        .header("Authorization", format!("Bearer {enrollment_code}"))
+        .json(&json!({
+            "proposed_run_token": format!("integration-token-{}", uuid::Uuid::new_v4())
+        }))
+        .send()
+        .await
+        .expect("Register failed");
+    assert_eq!(register_resp.status(), 200);
+    let body: serde_json::Value = register_resp.json().await.unwrap();
+    let server_id = body["data"]["server_id"].as_str().unwrap();
+
+    // ── Test: days=0 should return 400 ──
+    let resp_zero = client
+        .get(format!(
+            "{}/api/servers/{}/uptime-daily?days=0",
+            base_url, server_id
+        ))
+        .send()
+        .await
+        .expect("GET uptime-daily?days=0 failed");
+    assert_eq!(resp_zero.status(), 400, "days=0 should return 400");
+
+    // ── Test: days=366 should return 400 ──
+    let resp_over = client
+        .get(format!(
+            "{}/api/servers/{}/uptime-daily?days=366",
+            base_url, server_id
+        ))
+        .send()
+        .await
+        .expect("GET uptime-daily?days=366 failed");
+    assert_eq!(resp_over.status(), 400, "days=366 should return 400");
+
+    // ── Test: default (no days param) should return 200 with 90 entries ──
+    let resp_default = client
+        .get(format!(
+            "{}/api/servers/{}/uptime-daily",
+            base_url, server_id
+        ))
+        .send()
+        .await
+        .expect("GET uptime-daily (default) failed");
+    assert_eq!(
+        resp_default.status(),
+        200,
+        "Default request should return 200"
+    );
+
+    let resp_body: serde_json::Value = resp_default.json().await.unwrap();
+    let entries = resp_body["data"].as_array().expect("data should be array");
+    assert_eq!(entries.len(), 90, "Default should return 90 entries");
+
+    // Each entry should have the expected fields, all zero-filled
+    let first = &entries[0];
+    assert!(first["date"].is_string(), "date should be a string");
+    assert_eq!(first["total_minutes"].as_i64(), Some(0));
+    assert_eq!(first["online_minutes"].as_i64(), Some(0));
+    assert_eq!(first["downtime_incidents"].as_i64(), Some(0));
+
+    // ── Test: days=7 should return 7 entries ──
+    let resp_7 = client
+        .get(format!(
+            "{}/api/servers/{}/uptime-daily?days=7",
+            base_url, server_id
+        ))
+        .send()
+        .await
+        .expect("GET uptime-daily?days=7 failed");
+    assert_eq!(resp_7.status(), 200);
+
+    let resp_7_body: serde_json::Value = resp_7.json().await.unwrap();
+    let entries_7 = resp_7_body["data"].as_array().unwrap();
+    assert_eq!(entries_7.len(), 7, "days=7 should return 7 entries");
+}
+
+// ── GeoIP integration tests ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_geoip_status_endpoint() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = http_client();
+
+    // Login as admin
+    login_admin(&client, &base_url).await;
+
+    // GET /api/geoip/status — should return not installed initially
+    let resp = client
+        .get(format!("{}/api/geoip/status", base_url))
+        .send()
+        .await
+        .expect("GET /api/geoip/status failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["data"]["installed"], false);
+    assert!(
+        body["data"]["source"].is_null(),
+        "source should be absent when not installed"
+    );
+    assert!(
+        body["data"]["file_size"].is_null(),
+        "file_size should be absent when not installed"
+    );
+}
+
+#[tokio::test]
+async fn test_geoip_status_accessible_by_member() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin_client = http_client();
+
+    // Login as admin and create a member user
+    login_admin(&admin_client, &base_url).await;
+
+    let create_resp = admin_client
+        .post(format!("{}/api/users", base_url))
+        .json(&json!({
+            "username": "geoipmember",
+            "password": "memberpass123",
+            "role": "member"
+        }))
+        .send()
+        .await
+        .expect("POST /api/users failed");
+
+    assert_eq!(
+        create_resp.status(),
+        200,
+        "Admin should be able to create member"
+    );
+
+    // Login as the member user in a separate client
+    let member_client = http_client();
+    let member_login = member_client
+        .post(format!("{}/api/auth/login", base_url))
+        .json(&json!({
+            "username": "geoipmember",
+            "password": "memberpass123"
+        }))
+        .send()
+        .await
+        .expect("Member login request failed");
+
+    assert_eq!(member_login.status(), 200, "Member login should succeed");
+
+    // Member can access geoip status (read-only route)
+    let resp = member_client
+        .get(format!("{}/api/geoip/status", base_url))
+        .send()
+        .await
+        .expect("GET /api/geoip/status as member failed");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "Member should be able to read geoip status"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["data"]["installed"], false);
+}
+
+#[tokio::test]
+async fn test_geoip_download_requires_admin() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin_client = http_client();
+
+    // Login as admin and create a member user
+    login_admin(&admin_client, &base_url).await;
+
+    let create_resp = admin_client
+        .post(format!("{}/api/users", base_url))
+        .json(&json!({
+            "username": "geoipmember2",
+            "password": "memberpass123",
+            "role": "member"
+        }))
+        .send()
+        .await
+        .expect("POST /api/users failed");
+
+    assert_eq!(
+        create_resp.status(),
+        200,
+        "Admin should be able to create member"
+    );
+
+    // Login as the member user in a separate client
+    let member_client = http_client();
+    let member_login = member_client
+        .post(format!("{}/api/auth/login", base_url))
+        .json(&json!({
+            "username": "geoipmember2",
+            "password": "memberpass123"
+        }))
+        .send()
+        .await
+        .expect("Member login request failed");
+
+    assert_eq!(member_login.status(), 200, "Member login should succeed");
+
+    // Member cannot trigger geoip download (admin-only write route)
+    let resp = member_client
+        .post(format!("{}/api/geoip/download", base_url))
+        .send()
+        .await
+        .expect("POST /api/geoip/download as member failed");
+
+    assert_eq!(
+        resp.status(),
+        403,
+        "Member should receive 403 when attempting geoip download"
+    );
+}
+
+#[tokio::test]
+async fn test_security_headers_present() {
+    let (base_url, _dir) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/healthz", base_url))
+        .send()
+        .await
+        .expect("healthz request failed");
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-frame-options")
+            .map(|v| v.to_str().unwrap()),
+        Some("DENY"),
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-content-type-options")
+            .map(|v| v.to_str().unwrap()),
+        Some("nosniff"),
+    );
+    assert_eq!(
+        resp.headers()
+            .get("referrer-policy")
+            .map(|v| v.to_str().unwrap()),
+        Some("strict-origin-when-cross-origin"),
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-permitted-cross-domain-policies")
+            .map(|v| v.to_str().unwrap()),
+        Some("none"),
+    );
+}
+
+// ── Server tags (Task 19) ────────────────────────────────────────────────────
+
+/// Admin creates a new member user and returns a fresh logged-in member client.
+/// Uses the admin-only POST /api/users endpoint because no public registration
+/// endpoint exists in this project (mirrors the pattern from `test_member_read_only`).
+async fn register_member(base_url: &str) -> reqwest::Client {
+    let admin = http_client();
+    login_admin(&admin, base_url).await;
+
+    let username = format!("member-{}", uuid::Uuid::new_v4().simple());
+    let create_resp = admin
+        .post(format!("{}/api/users", base_url))
+        .json(&json!({
+            "username": username,
+            "password": "memberpass",
+            "role": "member"
+        }))
+        .send()
+        .await
+        .expect("admin should create member user");
+    assert_eq!(
+        create_resp.status(),
+        200,
+        "admin-created member user should succeed"
+    );
+
+    let member = http_client();
+    let login_resp = member
+        .post(format!("{}/api/auth/login", base_url))
+        .json(&json!({ "username": username, "password": "memberpass" }))
+        .send()
+        .await
+        .expect("login member failed");
+    assert_eq!(login_resp.status(), 200, "member login should succeed");
+    member
+}
+
+#[tokio::test]
+async fn unauthenticated_get_tags_returns_401() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("plain http client");
+    let resp = client
+        .get(format!("{}/api/servers/unknown/tags", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn unauthenticated_put_tags_returns_401() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("plain http client");
+    let resp = client
+        .put(format!("{}/api/servers/unknown/tags", base_url))
+        .json(&json!({ "tags": ["a"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn admin_put_then_get_roundtrips() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin = http_client();
+    login_admin(&admin, &base_url).await;
+
+    let (server_id, _token) = register_agent(&admin, &base_url).await;
+
+    let resp = admin
+        .put(format!("{}/api/servers/{server_id}/tags", base_url))
+        .json(&json!({ "tags": ["b", "a", "b", " c "] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let data: Vec<String> = serde_json::from_value(body["data"].clone()).unwrap();
+    assert_eq!(data, vec!["a", "b", "c"]);
+
+    let resp = admin
+        .get(format!("{}/api/servers/{server_id}/tags", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let data: Vec<String> = serde_json::from_value(body["data"].clone()).unwrap();
+    assert_eq!(data, vec!["a", "b", "c"]);
+}
+
+#[tokio::test]
+async fn admin_put_rejects_too_many_tags() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin = http_client();
+    login_admin(&admin, &base_url).await;
+    let (server_id, _token) = register_agent(&admin, &base_url).await;
+    let many: Vec<String> = (0..9).map(|i| format!("t{i}")).collect();
+    let resp = admin
+        .put(format!("{}/api/servers/{server_id}/tags", base_url))
+        .json(&json!({ "tags": many }))
+        .send()
+        .await
+        .unwrap();
+    // AppError::Validation maps to 422 UNPROCESSABLE_ENTITY per crates/server/src/error.rs.
+    assert_eq!(resp.status(), 422);
+}
+
+#[tokio::test]
+async fn admin_put_rejects_invalid_char() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin = http_client();
+    login_admin(&admin, &base_url).await;
+    let (server_id, _token) = register_agent(&admin, &base_url).await;
+    let resp = admin
+        .put(format!("{}/api/servers/{server_id}/tags", base_url))
+        .json(&json!({ "tags": ["has space"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422);
+}
+
+#[tokio::test]
+async fn admin_put_rejects_too_long_tag() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin = http_client();
+    login_admin(&admin, &base_url).await;
+    let (server_id, _token) = register_agent(&admin, &base_url).await;
+    let seventeen = "a".repeat(17);
+    let resp = admin
+        .put(format!("{}/api/servers/{server_id}/tags", base_url))
+        .json(&json!({ "tags": [seventeen] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422);
+}
+
+#[tokio::test]
+async fn member_get_tags_returns_200() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin = http_client();
+    login_admin(&admin, &base_url).await;
+    let (server_id, _token) = register_agent(&admin, &base_url).await;
+    admin
+        .put(format!("{}/api/servers/{server_id}/tags", base_url))
+        .json(&json!({ "tags": ["prod"] }))
+        .send()
+        .await
+        .unwrap();
+
+    let member = register_member(&base_url).await;
+    let resp = member
+        .get(format!("{}/api/servers/{server_id}/tags", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let data: Vec<String> = serde_json::from_value(body["data"].clone()).unwrap();
+    assert_eq!(data, vec!["prod"]);
+}
+
+#[tokio::test]
+async fn member_put_tags_returns_403() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin = http_client();
+    login_admin(&admin, &base_url).await;
+    let (server_id, _token) = register_agent(&admin, &base_url).await;
+
+    let member = register_member(&base_url).await;
+    let resp = member
+        .put(format!("{}/api/servers/{server_id}/tags", base_url))
+        .json(&json!({ "tags": ["prod"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn browser_ws_full_sync_includes_tags_and_cpu_cores() {
+    let (base_url, _tmp) = start_test_server().await;
+    let admin = http_client();
+    login_admin(&admin, &base_url).await;
+    let (server_id, _token) = register_agent(&admin, &base_url).await;
+
+    // Seed tags via the REST endpoint.
+    let resp = admin
+        .put(format!("{}/api/servers/{server_id}/tags", base_url))
+        .json(&json!({ "tags": ["alpha", "beta"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Acquire a raw Set-Cookie header (reqwest's cookie jar isn't directly readable).
+    let raw_client = reqwest::Client::builder()
+        .cookie_store(false)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let login_resp = raw_client
+        .post(format!("{}/api/auth/login", base_url))
+        .json(&json!({ "username": "admin", "password": "testpass" }))
+        .send()
+        .await
+        .unwrap();
+    let set_cookie = login_resp
+        .headers()
+        .get("set-cookie")
+        .expect("set-cookie header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cookie_value = set_cookie.split(';').next().unwrap().to_string();
+
+    let ws_url = base_url.replace("http://", "ws://") + "/api/ws/servers";
+    let mut request = ws_url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("Cookie", HeaderValue::from_str(&cookie_value).unwrap());
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("browser ws should connect");
+
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("ws recv timeout")
+        .expect("ws closed")
+        .expect("ws error");
+    let text = msg.to_text().unwrap().to_string();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+    assert_eq!(json["type"], "full_sync");
+    let servers = json["servers"].as_array().expect("servers array present");
+    let ours = servers
+        .iter()
+        .find(|s| s["id"].as_str() == Some(&server_id))
+        .expect("our server present in full_sync");
+    assert_eq!(
+        ours["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta"],
+    );
+    assert!(
+        ours.get("cpu_cores")
+            .is_some_and(|v| v.is_null() || v.is_i64()),
+        "cpu_cores field must be present (null or integer), got {:?}",
+        ours.get("cpu_cores"),
+    );
+}
+
+mod firewall_tests {
+    //! Integration tests for the firewall blocklist feature. Exercises the
+    //! full REST + WS pipeline: guardrail, dedup, cap/proto gating, ack
+    //! handling, and reset/sync on (re)connect & cap transition.
+    use super::*;
+    use serverbee_common::constants::CAP_FIREWALL_BLOCK;
+
+    /// Send a `SystemInfo` with a caller-chosen `protocol_version` so the
+    /// "old agent" scenario can pin v1.
+    async fn send_system_info_pv(
+        sink: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::Message,
+        >,
+        msg_id: &str,
+        agent_local_capabilities: Option<u32>,
+        protocol_version: u32,
+    ) {
+        let system_info = json!({
+            "type": "system_info",
+            "msg_id": msg_id,
+            "cpu_name": "Test CPU",
+            "cpu_cores": 4,
+            "cpu_arch": "x86_64",
+            "os": "Ubuntu 22.04",
+            "kernel_version": "5.15.0",
+            "mem_total": 8_000_000_000_i64,
+            "swap_total": 0_i64,
+            "disk_total": 50_000_000_000_i64,
+            "ipv4": "203.0.113.10",
+            "ipv6": null,
+            "virtualization": "kvm",
+            "agent_version": "0.1.0",
+            "protocol_version": protocol_version,
+            "features": [],
+            "agent_local_capabilities": agent_local_capabilities
+        });
+
+        sink.send(tungstenite::Message::Text(system_info.to_string().into()))
+            .await
+            .expect("send SystemInfo");
+    }
+
+    /// Drain messages from `reader` until a `system_info` `Ack` for `msg_id`
+    /// is observed, then keep draining until the socket stays quiet for a
+    /// beat (the post-connect reconcile pushes arrive back-to-back). Returns
+    /// every non-ack message read along the way (in order) so the caller can
+    /// inspect post-connect server pushes such as `BlocklistReset` /
+    /// `BlocklistSync`, without hard-coding how many sync frames a connect
+    /// currently produces.
+    async fn drain_through_ack(
+        reader: &mut futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+        msg_id: &str,
+    ) -> Vec<serde_json::Value> {
+        let mut collected: Vec<serde_json::Value> = Vec::new();
+        let mut acked = false;
+        loop {
+            let timeout = if acked {
+                // Post-ack pushes are emitted by the same handler in one
+                // burst; a quiet gap this long means the connect flow is done.
+                Duration::from_millis(800)
+            } else {
+                Duration::from_secs(3)
+            };
+            let msg = match tokio::time::timeout(timeout, reader.next()).await {
+                Ok(msg) => msg.expect("ws closed").expect("ws read error"),
+                Err(_) if acked => break,
+                Err(_) => panic!("timeout waiting for ws message"),
+            };
+            let text = match msg {
+                tungstenite::Message::Text(t) => t.to_string(),
+                tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) => continue,
+                other => panic!("unexpected message kind: {:?}", other),
+            };
+            let parsed: serde_json::Value = serde_json::from_str(&text).expect("parse json");
+            if parsed["type"] == "ack" && parsed["msg_id"] == msg_id {
+                acked = true;
+                continue;
+            }
+            collected.push(parsed);
+        }
+        collected
+    }
+
+    /// Read a single text frame from the agent ws and parse it as JSON.
+    /// Returns None on timeout.
+    async fn try_recv_one(
+        reader: &mut futures_util::stream::SplitStream<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        >,
+        ms: u64,
+    ) -> Option<serde_json::Value> {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_millis(ms), reader.next())
+                .await
+                .ok()??
+                .ok()?;
+            return match msg {
+                tungstenite::Message::Text(t) => serde_json::from_str(t.as_str()).ok(),
+                tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) => continue,
+                _ => None,
+            };
+        }
+    }
+
+    /// Register an agent and return (client cookied as admin, server_id, token).
+    async fn register_for_admin(base_url: &str) -> (reqwest::Client, String, String) {
+        let admin = http_client();
+        login_admin(&admin, base_url).await;
+        let (server_id, token) = register_agent(&admin, base_url).await;
+        (admin, server_id, token)
+    }
+
+    #[tokio::test]
+    async fn post_block_inserts_and_pushes() {
+        let (base_url, _tmp) = start_test_server().await;
+        let (admin, _server_id, token) = register_for_admin(&base_url).await;
+
+        // Capabilities are agent-owned: the agent declaring CAP_FIREWALL_BLOCK
+        // in its reported caps is all that's needed.
+        let (mut sink, mut reader) = connect_agent(&base_url, &token).await;
+        // Read Welcome.
+        let _welcome = recv_agent_text(&mut reader).await;
+        send_system_info_pv(
+            &mut sink,
+            "pb-1",
+            Some(serverbee_common::constants::CAP_DEFAULT | CAP_FIREWALL_BLOCK),
+            serverbee_common::constants::PROTOCOL_VERSION,
+        )
+        .await;
+        // AgentReady reconciliation pushes follow the ack (ping/network/IP
+        // quality sync, BlocklistReset+BlocklistSync); drain them all.
+        let _ = drain_through_ack(&mut reader, "pb-1").await;
+
+        // Now POST a block and assert the agent receives BlocklistAdd.
+        let resp = admin
+            .post(format!("{}/api/firewall/blocks", base_url))
+            .json(&json!({ "target": "203.0.113.4", "cover_type": "all" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "POST block should 200");
+
+        let push = try_recv_one(&mut reader, 2000)
+            .await
+            .expect("expected BlocklistAdd push");
+        assert_eq!(push["type"], "blocklist_add");
+        assert_eq!(push["entry"]["target"], "203.0.113.4/32");
+    }
+
+    #[tokio::test]
+    async fn guardrail_returns_409_for_loopback() {
+        let (base_url, _tmp) = start_test_server().await;
+        let admin = http_client();
+        login_admin(&admin, &base_url).await;
+
+        let resp = admin
+            .post(format!("{}/api/firewall/blocks", base_url))
+            .json(&json!({ "target": "127.0.0.1", "cover_type": "all" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn duplicate_target_returns_409() {
+        let (base_url, _tmp) = start_test_server().await;
+        let admin = http_client();
+        login_admin(&admin, &base_url).await;
+
+        let first = admin
+            .post(format!("{}/api/firewall/blocks", base_url))
+            .json(&json!({ "target": "198.51.100.0/24", "cover_type": "all" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), 200);
+
+        // Same canonical CIDR — must conflict on the UNIQUE(target) index.
+        let dup = admin
+            .post(format!("{}/api/firewall/blocks", base_url))
+            .json(&json!({ "target": "198.51.100.7/24", "cover_type": "all" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(dup.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn member_post_returns_403() {
+        let (base_url, _tmp) = start_test_server().await;
+        let admin = http_client();
+        login_admin(&admin, &base_url).await;
+        // Create member user.
+        let resp = admin
+            .post(format!("{}/api/users", base_url))
+            .json(&json!({
+                "username": "fwmember",
+                "password": "memberpass123",
+                "role": "member"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let member = http_client();
+        let login = member
+            .post(format!("{}/api/auth/login", base_url))
+            .json(&json!({ "username": "fwmember", "password": "memberpass123" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login.status(), 200);
+
+        let post = member
+            .post(format!("{}/api/firewall/blocks", base_url))
+            .json(&json!({ "target": "198.51.100.42", "cover_type": "all" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(post.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn agent_connect_triggers_reset_then_sync() {
+        let (base_url, _tmp) = start_test_server().await;
+        let (admin, _server_id, token) = register_for_admin(&base_url).await;
+
+        // Pre-insert a block before the agent connects.
+        let resp = admin
+            .post(format!("{}/api/firewall/blocks", base_url))
+            .json(&json!({ "target": "203.0.113.55", "cover_type": "all" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // The agent declares CAP_FIREWALL_BLOCK in its reported caps below; the
+        // server no longer gates this from its side.
+        let (mut sink, mut reader) = connect_agent(&base_url, &token).await;
+        let _welcome = recv_agent_text(&mut reader).await;
+        send_system_info_pv(
+            &mut sink,
+            "connect-sync",
+            Some(serverbee_common::constants::CAP_DEFAULT | CAP_FIREWALL_BLOCK),
+            serverbee_common::constants::PROTOCOL_VERSION,
+        )
+        .await;
+
+        let extras = drain_through_ack(&mut reader, "connect-sync").await;
+        // Reset, then Sync are appended after the ack handler runs.
+        let types: Vec<&str> = extras
+            .iter()
+            .map(|m| m["type"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            types.contains(&"blocklist_reset"),
+            "expected blocklist_reset, got {types:?}"
+        );
+        assert!(
+            types.contains(&"blocklist_sync"),
+            "expected blocklist_sync, got {types:?}"
+        );
+        let sync = extras
+            .iter()
+            .find(|m| m["type"] == "blocklist_sync")
+            .unwrap();
+        let entries = sync["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "expected exactly one synced entry");
+        assert_eq!(entries[0]["target"], "203.0.113.55/32");
+    }
+
+    #[tokio::test]
+    async fn ack_failed_records_audit_and_keeps_row() {
+        let (base_url, _tmp) = start_test_server().await;
+        let (admin, _server_id, token) = register_for_admin(&base_url).await;
+
+        let (mut sink, mut reader) = connect_agent(&base_url, &token).await;
+        let _welcome = recv_agent_text(&mut reader).await;
+        send_system_info_pv(
+            &mut sink,
+            "ack-1",
+            Some(serverbee_common::constants::CAP_DEFAULT | CAP_FIREWALL_BLOCK),
+            serverbee_common::constants::PROTOCOL_VERSION,
+        )
+        .await;
+        let _drain = drain_through_ack(&mut reader, "ack-1").await;
+
+        let resp = admin
+            .post(format!("{}/api/firewall/blocks", base_url))
+            .json(&json!({ "target": "203.0.113.99", "cover_type": "all" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let id = body["data"]["id"].as_str().unwrap().to_string();
+
+        // Consume the BlocklistAdd that the server just pushed.
+        let _add = try_recv_one(&mut reader, 2000)
+            .await
+            .expect("expected BlocklistAdd push");
+
+        // Send a failed BlocklistAck.
+        let ack = json!({
+            "type": "blocklist_ack",
+            "results": [{
+                "id": id,
+                "state": "failed",
+                "reason": "nft permission denied",
+            }]
+        });
+        sink.send(tungstenite::Message::Text(ack.to_string().into()))
+            .await
+            .unwrap();
+
+        // Allow time for the server to process the ack and write audit.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Row still exists.
+        let get = admin
+            .get(format!("{}/api/firewall/blocks/{}", base_url, id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.status(), 200, "row must still exist after failed ack");
+
+        // Audit log contains firewall_block_rejected_agent.
+        let entries = list_audit_entries(&admin, &base_url).await;
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["action"] == "firewall_block_rejected_agent"),
+            "expected firewall_block_rejected_agent audit entry, got {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_agent_no_firewall_messages() {
+        let (base_url, _tmp) = start_test_server().await;
+        let (admin, _server_id, token) = register_for_admin(&base_url).await;
+        // Pre-insert a block so a sync would otherwise have content.
+        let resp = admin
+            .post(format!("{}/api/firewall/blocks", base_url))
+            .json(&json!({ "target": "203.0.113.77", "cover_type": "all" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let (mut sink, mut reader) = connect_agent(&base_url, &token).await;
+        let _welcome = recv_agent_text(&mut reader).await;
+        // SystemInfo with protocol_version = 1 → below FIREWALL_MIN_PROTOCOL = 2.
+        send_system_info_pv(
+            &mut sink,
+            "old-1",
+            Some(serverbee_common::constants::CAP_DEFAULT | CAP_FIREWALL_BLOCK),
+            1,
+        )
+        .await;
+        let extras = drain_through_ack(&mut reader, "old-1").await;
+        let types: Vec<&str> = extras
+            .iter()
+            .map(|m| m["type"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            !types.iter().any(|t| t.starts_with("blocklist_")),
+            "no blocklist_* messages expected for protocol v1, got {types:?}"
+        );
+
+        // Even after a fresh POST, no push should arrive at this old agent.
+        let resp = admin
+            .post(format!("{}/api/firewall/blocks", base_url))
+            .json(&json!({ "target": "203.0.113.78", "cover_type": "all" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let leak = try_recv_one(&mut reader, 500).await;
+        assert!(
+            !leak
+                .as_ref()
+                .is_some_and(|m| m["type"].as_str().unwrap_or("").starts_with("blocklist_")),
+            "old protocol agent must not receive blocklist_* push, saw {leak:?}"
+        );
+    }
+}
+
+mod onboarding_tests {
+    use super::*;
+    use serverbee_server::service::auth::AuthService;
+
+    #[tokio::test]
+    async fn flagged_admin_is_blocked_and_can_onboard() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let db_url = format!("sqlite://{}/test.db?mode=rwc", data_dir);
+        let mut opt = sea_orm::ConnectOptions::new(&db_url);
+        opt.max_connections(5);
+        opt.sqlx_logging(false);
+        let db = sea_orm::Database::connect(opt).await.expect("connect");
+        db.execute_unprepared("PRAGMA foreign_keys=ON").await.unwrap();
+        serverbee_server::migration::Migrator::up(&db, None)
+            .await
+            .expect("migrate");
+
+        let generated = AuthService::init_admin(&db)
+            .await
+            .expect("init_admin")
+            .expect("password generated");
+
+        let config = AppConfig {
+            server: ServerConfig {
+                listen: "127.0.0.1:0".to_string(),
+                data_dir: data_dir.clone(),
+                trusted_proxies: Vec::new(),
+            },
+            database: DatabaseConfig {
+                path: "test.db".to_string(),
+                max_connections: 5,
+            },
+            auth: AuthConfig {
+                session_ttl: 86400,
+                secure_cookie: false,
+                max_servers: 0,
+            },
+            ..AppConfig::default()
+        };
+        let state = serverbee_server::state::AppState::new(db, config)
+            .await
+            .expect("state");
+        let app = serverbee_server::router::create_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}", addr);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = http_client();
+
+        let login: serde_json::Value = client
+            .post(format!("{}/api/auth/login", base_url))
+            .json(&json!({ "username": "admin", "password": generated }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            login["data"]["must_change_password"], true,
+            "login response must flag the account"
+        );
+
+        let me: serde_json::Value = client
+            .get(format!("{}/api/auth/me", base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(me["data"]["must_change_password"], true);
+
+        let blocked = client
+            .get(format!("{}/api/servers", base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), 403, "protected route must be blocked");
+        let body: serde_json::Value = blocked.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "MUST_CHANGE_PASSWORD");
+
+        let mobile = client
+            .post(format!("{}/api/mobile/auth/login", base_url))
+            .json(&json!({
+                "username": "admin",
+                "password": generated,
+                "installation_id": "test-install",
+                "device_name": "test-device"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(mobile.status(), 403, "mobile login must be blocked");
+
+        let ob = client
+            .post(format!("{}/api/auth/onboarding", base_url))
+            .json(&json!({ "new_password": "Fresh-Pass-12345", "new_username": "rootadmin" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ob.status(), 200, "onboarding should succeed");
+
+        let ok_after = client
+            .get(format!("{}/api/servers", base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_after.status(), 200, "unblocked after onboarding");
+
+        let relog = client
+            .post(format!("{}/api/auth/login", base_url))
+            .json(&json!({ "username": "rootadmin", "password": "Fresh-Pass-12345" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(relog.status(), 200);
+        let relog_body: serde_json::Value = relog.json().await.unwrap();
+        assert_eq!(relog_body["data"]["must_change_password"], false);
+
+        let mobile_ok = client
+            .post(format!("{}/api/mobile/auth/login", base_url))
+            .json(&json!({
+                "username": "rootadmin",
+                "password": "Fresh-Pass-12345",
+                "installation_id": "test-install",
+                "device_name": "test-device"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(mobile_ok.status(), 200, "mobile login works post-onboarding");
+
+        drop(tmp);
+    }
+}
