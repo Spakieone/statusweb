@@ -1,77 +1,114 @@
-<p align="center">
-  <a href="docs/CONTRIBUTING.en.md"><img src="https://flagcdn.com/20x15/gb.png" width="16" alt="EN"> English</a> | <img src="https://flagcdn.com/20x15/ru.png" width="16" alt="RU"> Русский
-</p>
+# Contributing to DockPanel
 
-# Как помочь проекту (Telegram VPS Management Bot)
+Thanks for your interest in contributing! This guide covers development setup, code style, and the PR process.
 
-Добро пожаловать! Мы всегда рады вашей помощи и идеям! Мы хотим сделать процесс участия максимально простым и прозрачным, будь то:
-- Сообщение об ошибке (баг-репорт)
-- Обсуждение текущего состояния кода
-- Отправка исправления
-- Предложение новых функций
+## Development Setup
 
-## Архитектура и стек технологий
+### Prerequisites
 
-Проект разделен на несколько логических компонентов:
-* **Ядро бота (`bot.py`, `core/`)**: Построено на `aiogram 3.x` для взаимодействия с Telegram.
-* **WebUI (`core/web/`, `core/static/`)**: Реализовано с помощью `aiohttp` и шаблонов `Jinja2`. Фронтенд использует TailwindCSS и ванильный JS.
-* **База данных**: `tortoise-orm` с поддержкой SQLite/PostgreSQL (через `aiosqlite`).
-* **Агент мониторинга (`node/`)**: Легковесный скрипт, устанавливаемый на удаленные VPS для мониторинга и общения с главным ботом.
+- **Rust 1.94+**: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+- **Node.js 20+**: For building the frontend
+- **Docker**: For running PostgreSQL locally
+- **Build tools**: `build-essential cmake pkg-config` (Ubuntu/Debian) or `gcc gcc-c++ cmake make` (RHEL/Fedora)
 
-### Структура проекта
-* `core/`: Базовый функционал, Web API, локализация (i18n), конфиги и middlewares.
-* `modules/`: Специфичные модули (selftest, биллинг, мониторинг сервисов).
-* `node/`: Скрипт-агент, устанавливаемый на управляемые серверы (VPS).
-* `watchdog.py`: Демон авто-перезапуска и самовосстановления.
-* `manage.py`: CLI-утилита для миграций БД и администрирования.
+### Getting Started
 
-## Настройка среды разработки
+```bash
+git clone https://github.com/ovexro/dockpanel.git
+cd dockpanel
 
-1. **Требования**: Python 3.10 или новее.
-2. **Клонирование репозитория**:
-   ```bash
-   git clone https://github.com/your-username/tgbotvpscp.git
-   cd tgbotvpscp
-   ```
-3. **Настройка виртуального окружения**:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # На Windows: `venv\Scripts\activate`
-   ```
-4. **Установка зависимостей**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-5. **Конфигурация**:
-   Скопируйте файл `.env.example` в `.env` и заполните токен бота и ваш Telegram User ID.
-6. **Запуск бота**:
-   ```bash
-   python bot.py
-   ```
+# Enable the repo's git hooks (secrets scan, version consistency,
+# npm audit + cargo audit). See scripts/hooks/README.md.
+git config core.hooksPath scripts/hooks
+cargo install cargo-audit   # otherwise the Rust half of the audit gate only warns
 
-## Правила разработки
+# Start PostgreSQL
+docker run -d --name dockpanel-postgres \
+  -e POSTGRES_USER=dockpanel \
+  -e POSTGRES_PASSWORD=dockpanel \
+  -e POSTGRES_DB=dockpanel \
+  -p 5450:5432 postgres:16
 
-### Стиль кода
-- Мы следуем стандартам **PEP 8**.
-- Для линтинга используется **Ruff**. Перед отправкой кода убедитесь, что он проходит проверки:
-  ```bash
-  ruff check . --fix
-  ```
-- Используйте аннотации типов везде, где это возможно (например: `def handler(message: types.Message) -> None:`).
+# Create config
+sudo mkdir -p /etc/dockpanel
+cat <<EOF | sudo tee /etc/dockpanel/api.env
+DATABASE_URL=postgresql://dockpanel:dockpanel@127.0.0.1:5450/dockpanel
+JWT_SECRET=$(openssl rand -hex 32)
+AGENT_SOCKET=/var/run/dockpanel/agent.sock
+AGENT_TOKEN=$(uuidgen)
+LISTEN_ADDR=127.0.0.1:3080
+EOF
 
-### Оформление коммитов
-Мы используем стандарт [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/):
-- `feat(web): add dark mode toggle` для новых функций.
-- `fix(core): resolve null pointer exception` для исправления ошибок.
-- `docs: update readme` для изменения документации.
-- `style: auto-fix safe ruff linting errors` для форматирования или работы линтера.
+# Build everything
+cargo build --release --manifest-path panel/agent/Cargo.toml
+cargo build --release --manifest-path panel/backend/Cargo.toml
+cargo build --release --manifest-path panel/cli/Cargo.toml
+cd panel/frontend && npm install && npx vite build && cd ../..
 
-### Pull Requests
-1. Сделайте Fork репозитория и создайте свою ветку от `main`.
-2. Называйте ветку логично: `feature/ваша-функция` или `bugfix/номер-issue`.
-3. Обязательно тщательно протестируйте свои изменения (особенно WebUI и скрипты агента ноды).
-4. По возможности обновите `docs/CHANGELOG.md`, описав, что вы изменили.
-5. Откройте Pull Request!
+# Run (agent needs root for system operations)
+sudo ./panel/agent/target/release/dockpanel-agent &
+./panel/backend/target/release/dockpanel-api &
+cd panel/frontend && npm run dev
+```
 
-## Переводы и локализация (i18n)
-Все текстовые константы и переводы интерфейса находятся в файле `core/i18n.py`. Если вы добавляете новый текст в UI, пожалуйста, пропишите его в словарях для обоих языков (`en` и `ru`), а не вшивайте жестко (хардкод) в HTML или код.
+The frontend dev server proxies `/api` to `127.0.0.1:3080` (see `panel/frontend/vite.config.ts`).
+
+## Architecture
+
+```
+panel/
+├── agent/       # Rust — host-level operations (Docker, Nginx, SSL, terminal)
+│   ├── src/routes/     # HTTP endpoint handlers (39 files)
+│   └── src/services/   # Business logic (40 files)
+├── backend/     # Rust — API server, auth, DB, multi-server dispatch
+│   ├── src/routes/     # REST endpoints (62 files)
+│   ├── src/services/   # Background tasks (36 files)
+│   └── migrations/     # SQL migrations (138 files)
+├── cli/         # Rust — CLI tool (clap-based)
+│   └── src/commands/   # Subcommand handlers (11 files)
+└── frontend/    # React 19 + TypeScript + Tailwind 4
+    └── src/pages/      # Lazy-loaded page components (52 files)
+```
+
+**Agent** handles host-level operations: Docker, Nginx config, SSL certificates, file system, terminal (PTY), backups. Runs as root. Communicates via Unix socket (local) or HTTPS (remote servers).
+
+**Backend** handles coordination: auth (JWT + 2FA), PostgreSQL persistence, multi-server agent dispatch, background services (alerts, monitoring, auto-healing, scheduled backups/deploys). Runs as unprivileged user.
+
+**Frontend** is a React SPA with lazy-loaded pages. Each major feature maps to a page file in `src/pages/`.
+
+## Code Style
+
+- **Rust**: Edition 2024. Run `cargo fmt` before committing. `cargo clippy` warnings should be addressed.
+- **TypeScript**: Strict mode enabled. Minimize `as any` casts. No `console.log` in production code (use `logger.ts`).
+- **SQL migrations**: Use `IF NOT EXISTS` / `IF EXISTS` where possible. Timestamp prefix format: `YYYYMMDDHHMMSS_description.sql`.
+
+## Making Changes
+
+1. **Fork and branch**: Create a feature branch from `main`.
+2. **Read before editing**: Understand existing code before modifying. Check `FEATURES.md` for the feature manifest.
+3. **Keep it focused**: One feature or fix per PR. Don't bundle unrelated changes.
+4. **Build all crates**: Changes to shared types or agent routes may affect multiple crates.
+5. **Test manually**: Run the panel locally and verify your changes work end-to-end.
+
+## Pull Request Process
+
+1. Describe what the PR does and why.
+2. List any new environment variables, migrations, or dependencies.
+3. Confirm you've built and tested locally.
+4. Keep PRs reasonably sized — large PRs are harder to review.
+
+## Filing Issues
+
+- **Bug reports**: Include OS, DockPanel version, steps to reproduce, and relevant logs (`journalctl -u dockpanel-api -n 50`).
+- **Feature requests**: Describe the use case, not just the solution.
+
+## Key Files
+
+| What | Where |
+|------|-------|
+| Feature manifest | `FEATURES.md` |
+| API config | `panel/backend/src/config.rs` |
+| Agent startup | `panel/agent/src/main.rs` |
+| API startup | `panel/backend/src/main.rs` |
+| DB schema | `panel/backend/migrations/` |
+| Frontend routes | `panel/frontend/src/main.tsx` |

@@ -1,111 +1,92 @@
-version: '3.8'
-x-bot-base: &bot-base
-  build: .
-  image: tg-vps-bot:latest
-  restart: always
-  env_file: .env
-  depends_on:
-    docker-proxy:
-      condition: service_started
-  environment:
-    DOCKER_HOST: tcp://docker-proxy:2375
-    DEPLOY_MODE: docker
-  security_opt:
-    - no-new-privileges:true
-  cap_drop:
-    - ALL
-  tmpfs:
-    - /tmp
-  networks:
-    - app
-    - docker-api
 services:
-  docker-proxy:
-    image: tecnativa/docker-socket-proxy:0.3.0
-    container_name: tg-docker-proxy
-    restart: always
-    security_opt:
-      - no-new-privileges:true
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dockpanel
+      POSTGRES_USER: dockpanel
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dockpanel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     cap_drop:
       - ALL
-    tmpfs:
-      - /run
-      - /tmp
-    environment:
-      CONTAINERS: 1
-      EVENTS: 1
-      INFO: 1
-      PING: 1
-      POST: 1
-      VERSION: 1
-      IMAGES: 0
-      NETWORKS: 0
-      SERVICES: 0
-      TASKS: 0
-      VOLUMES: 0
-      SYSTEM: 0
-      NODES: 0
-      SECRETS: 0
-      SWARM: 0
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - docker-api
-  bot-secure:
-    <<: *bot-base
-    container_name: tg-bot-secure
-    profiles: ["secure"]
-    user: "tgbot"
-    pid: host
-    ports:
-      - "${WEB_PORT}:${WEB_PORT}"
-    environment:
-      - INSTALL_MODE=secure
-      - TG_BOT_CONTAINER_NAME=tg-bot-secure
-    volumes:
-      - ./config:/opt/tg-bot/config
-      - ./logs/bot:/opt/tg-bot/logs/bot
-      - ./core/templates:/opt/tg-bot/core/templates:ro
-      - ./core/static:/opt/tg-bot/core/static:ro
-      - ./core/static/favicons:/opt/tg-bot/core/static/favicons
-      - /proc:/proc_host:ro
-      - /var/log/journal:/var/log/journal:ro
-      - /run/log/journal:/run/log/journal:ro
-      - /etc/machine-id:/etc/machine-id:ro
-    group_add:
-      - "999"
     cap_add:
-      - NET_RAW
-  bot-root:
-    <<: *bot-base
-    container_name: tg-bot-root
-    profiles: ["root"]
-    user: "root"
-    ports:
-      - "${WEB_PORT}:${WEB_PORT}"
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+
+  server:
+    build:
+      context: ./website/server
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
-      - INSTALL_MODE=root
-      - TG_BOT_CONTAINER_NAME=tg-bot-root
-    volumes:
-      - ./config:/opt/tg-bot/config
-      - ./logs/bot:/opt/tg-bot/logs/bot
-      - /proc/uptime:/proc_host/uptime:ro
-      - /proc/stat:/proc_host/stat:ro
-      - /proc/meminfo:/proc_host/meminfo:ro
-      - /proc/net/dev:/proc_host/net/dev:ro
-      - /etc/hostname:/host/etc/hostname:ro
-      - /etc/os-release:/host/etc/os-release:ro
-  watchdog:
-    <<: *bot-base
-    container_name: tg-watchdog
-    command: python watchdog.py
-    user: "root"
-    volumes:
-      - ./config:/opt/tg-bot/config
-      - ./logs/watchdog:/opt/tg-bot/logs/watchdog
+      NODE_ENV: production
+      PORT: 3061
+      DATABASE_URL: postgresql://dockpanel:${DB_PASSWORD}@db:5432/dockpanel
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+    ports:
+      - "127.0.0.1:3061:3061"
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  client:
+    build:
+      context: ./website/client
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3060:80"
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pgdata:
+
 networks:
-  app:
-    driver: bridge
-  docker-api:
-    driver: bridge
-    internal: true
+  backend:
