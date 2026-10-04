@@ -32,6 +32,8 @@ export const Route = createFileRoute('/_authed/servers/')({
   component: ServersListPage,
   validateSearch: (search: Record<string, unknown>) => ({
     ...search,
+    project:
+      search.project === 'PEPE' || search.project === 'No-Touch' ? search.project : undefined,
     // Coerce at runtime, not just via a type assertion: the router parses a
     // numeric URL param (e.g. ?q=1) into a number, and `as string` would let it
     // through, crashing the filter's `search.toLowerCase()`.
@@ -48,7 +50,7 @@ function ServersListPage() {
   const [addOpen, setAddOpen] = useState(false)
   const [selectMode, setSelectMode] = useState(false)
   const navigate = Route.useNavigate()
-  const { q: search, view: viewParam } = Route.useSearch()
+  const { q: search, view: viewParam, project: projectFilter } = Route.useSearch()
   const { ref: fillRef, height: viewportHeight } = useScrollViewportHeight<HTMLDivElement>()
 
   const [viewMode, setViewModeState] = useState<'table' | 'grid'>(() =>
@@ -80,6 +82,8 @@ function ServersListPage() {
   const { data: networkSetting } = useNetworkSetting()
 
   const setSearch = (value: string) => navigate({ search: (prev) => ({ ...prev, q: value }) })
+  const setProjectFilter = (value: 'PEPE' | 'No-Touch' | undefined) =>
+    navigate({ search: (prev) => ({ ...prev, project: value }) })
   const [editingId, setEditingId] = useState<string | null>(null)
 
   const groupMap = useMemo(() => new Map(groups?.map((g) => [g.id, g.name]) ?? []), [groups])
@@ -98,11 +102,14 @@ function ServersListPage() {
   const networkBucketSeconds = Math.max(networkSetting?.interval ?? 60, 60)
 
   const filtered = useMemo(() => {
+    const byProject = projectFilter
+      ? servers.filter((s) => s.tags?.includes(projectFilter))
+      : servers
     const q = search.toLowerCase()
     if (!q) {
-      return servers
+      return byProject
     }
-    return servers.filter(
+    return byProject.filter(
       (s) =>
         s.name.toLowerCase().includes(q) ||
         s.os?.toLowerCase().includes(q) ||
@@ -110,7 +117,7 @@ function ServersListPage() {
         s.region?.toLowerCase().includes(q) ||
         (s.group_id && groupMap.get(s.group_id)?.toLowerCase().includes(q))
     )
-  }, [servers, search, groupMap])
+  }, [servers, search, groupMap, projectFilter])
 
   const groupOptions = useMemo(
     () =>
@@ -227,6 +234,29 @@ function ServersListPage() {
         {/* The toolbar carries no visible title; without it the heading outline
           starts at the card/table headings. */}
         <h1 className="sr-only">{t('servers:title')}</h1>
+        <div className="mb-2 flex gap-1.5">
+          {(
+            [
+              { label: t('servers:project_filter_all'), value: undefined },
+              { label: 'PEPE', value: 'PEPE' as const },
+              { label: 'No-Touch', value: 'No-Touch' as const }
+            ] as const
+          ).map((opt) => (
+            <button
+              className={cn(
+                'rounded-md border px-2.5 py-1 font-medium text-xs transition-colors',
+                projectFilter === opt.value
+                  ? 'border-primary bg-primary text-primary-foreground'
+                  : 'border-border bg-card text-muted-foreground hover:bg-accent'
+              )}
+              key={opt.label}
+              onClick={() => setProjectFilter(opt.value)}
+              type="button"
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
         <ServersPageToolbar
           batchDeletePending={batchDeleteMutation.isPending}
           cleanupPending={cleanupMutation.isPending}

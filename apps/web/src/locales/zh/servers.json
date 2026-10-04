@@ -1,5 +1,6 @@
 {
   "title": "服务器",
+  "project_filter_all": "全部",
   "add_server.button": "添加服务器",
   "add_server.title": "添加服务器",
   "add_server.description": "注册一台新的服务器，然后在 VPS 上执行安装命令以接入 Agent。",

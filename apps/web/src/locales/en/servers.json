@@ -1,5 +1,6 @@
 {
   "title": "Servers",
+  "project_filter_all": "All",
   "add_server.button": "Add server",
   "add_server.title": "Add server",
   "add_server.description": "Register a new server, then run the install command on your VPS to connect the agent.",
