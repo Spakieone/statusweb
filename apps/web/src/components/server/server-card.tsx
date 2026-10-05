@@ -1,6 +1,8 @@
 import { Link } from '@tanstack/react-router'
+import { Copy } from 'lucide-react'
 import { memo, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
 import { CompactMetric } from '@/components/server/compact-metric'
 import { MetricValue } from '@/components/server/metric-value'
 import { useNetworkRealtime } from '@/hooks/use-network-realtime'
@@ -85,6 +87,15 @@ const ServerCardInner = ({
   const { data: realtimeData } = useNetworkRealtime(server.id)
   const upgradeJob = useUpgradeJobsStore((state) => state.jobs.get(server.id))
 
+  const copyIp = async (ip: string) => {
+    try {
+      await navigator.clipboard.writeText(ip)
+      toast.success(t('copied', { defaultValue: 'Скопировано' }))
+    } catch {
+      // Clipboard access denied
+    }
+  }
+
   const status = useEffectiveServerStatus(server)
   const isPending = status === 'pending'
   const isOffline = status === 'offline'
@@ -129,26 +140,39 @@ const ServerCardInner = ({
         isTspu && 'ring-orange-500/40 dark:ring-orange-400/40'
       )}
     >
-      <div className="flex items-center justify-between">
-        <Link
-          className={cn(
-            'flex items-center gap-1 truncate border-transparent border-b pb-px hover:border-current',
-            isOffline && 'text-muted-foreground'
+      <div className="flex items-start justify-between">
+        <div className="flex min-w-0 flex-col gap-0.5">
+          <Link
+            className={cn(
+              'flex items-center gap-1 truncate border-transparent border-b pb-px hover:border-current',
+              isOffline && 'text-muted-foreground'
+            )}
+            params={{ id: server.id }}
+            search={{ range: 'realtime' }}
+            to="/servers/$id"
+          >
+            <CountryFlag className="text-sm" code={server.country_code} />
+            {osEmoji && (
+              <span aria-hidden="true" className="shrink-0 text-sm" title={server.os ?? ''}>
+                {osEmoji}
+              </span>
+            )}
+            <h3 className="truncate font-semibold text-sm" title={server.name}>
+              {server.name}
+            </h3>
+          </Link>
+          {server.ipv4 && (
+            <button
+              className="flex w-fit items-center gap-1 text-[11px] text-muted-foreground tabular-nums hover:text-foreground"
+              onClick={() => copyIp(server.ipv4 ?? '')}
+              title={t('copy_ip', { defaultValue: 'Скопировать IP' })}
+              type="button"
+            >
+              {server.ipv4}
+              <Copy className="size-2.5 shrink-0" />
+            </button>
           )}
-          params={{ id: server.id }}
-          search={{ range: 'realtime' }}
-          to="/servers/$id"
-        >
-          <CountryFlag className="text-sm" code={server.country_code} />
-          {osEmoji && (
-            <span aria-hidden="true" className="shrink-0 text-sm" title={server.os ?? ''}>
-              {osEmoji}
-            </span>
-          )}
-          <h3 className="truncate font-semibold text-sm" title={server.name}>
-            {server.name}
-          </h3>
-        </Link>
+        </div>
         <div className="flex items-center gap-1.5">
           <UpgradeJobBadge job={upgradeJob} />
           <StatusBadge status={status} />

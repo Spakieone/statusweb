@@ -1,8 +1,9 @@
 import { useQuery } from '@tanstack/react-query'
 import { getRouteApi, Link } from '@tanstack/react-router'
-import { Container, FileText, Pencil, Terminal as TerminalIcon } from 'lucide-react'
+import { Container, Copy, FileText, Pencil, Terminal as TerminalIcon } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
 import { ServerDetailSkeleton } from '@/components/boneyard/page-skeletons'
 import { CountryFlag } from '@/components/country-flag'
 import { NetworkTab } from '@/components/network/network-tab'
@@ -37,6 +38,16 @@ interface ServerWithCaps {
 
 function ServerInfoMeta({ server }: { server: ServerResponse }) {
   const { t } = useTranslation('servers')
+
+  const copyIp = async (ip: string) => {
+    try {
+      await navigator.clipboard.writeText(ip)
+      toast.success(t('copied', { defaultValue: 'Скопировано' }))
+    } catch {
+      // Clipboard access denied
+    }
+  }
+
   return (
     <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground text-sm">
       {server.os && (
@@ -57,9 +68,15 @@ function ServerInfoMeta({ server }: { server: ServerResponse }) {
         </span>
       )}
       {server.ipv4 && (
-        <span>
+        <button
+          className="inline-flex items-center gap-1 tabular-nums hover:text-foreground"
+          onClick={() => copyIp(server.ipv4 ?? '')}
+          title={t('copy_ip', { defaultValue: 'Скопировать IP' })}
+          type="button"
+        >
           {t('detail_ipv4_label')} {server.ipv4}
-        </span>
+          <Copy className="size-3 shrink-0" />
+        </button>
       )}
       {server.ipv6 && (
         <span>
