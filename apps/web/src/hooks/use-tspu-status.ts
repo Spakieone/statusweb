@@ -9,6 +9,11 @@ import type { NetworkProbeTarget } from '@/lib/network-types'
 const RU_AGENT_ID = '1953d108-796f-40c3-98d6-aebc1f83c856'
 const EU_AGENT_ID = '35056fb5-fad3-4f96-96aa-267abdccd1e1'
 
+// These two agents exist to probe OTHER servers (see tspu-add-node.sh), so
+// their own "network quality" card section would show an aggregate of every
+// node they check, not their own link — misleading rather than useful.
+export const PROBE_POINT_AGENT_IDS: ReadonlySet<string> = new Set([RU_AGENT_ID, EU_AGENT_ID])
+
 export type TspuStatus = 'blocked' | 'ok' | 'unavailable' | 'unknown'
 
 function isTargetAvailable(

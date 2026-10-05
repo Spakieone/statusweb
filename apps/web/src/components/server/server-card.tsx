@@ -6,7 +6,7 @@ import { toast } from 'sonner'
 import { CompactMetric } from '@/components/server/compact-metric'
 import { MetricValue } from '@/components/server/metric-value'
 import { useNetworkRealtime } from '@/hooks/use-network-realtime'
-import { useEffectiveServerStatus } from '@/hooks/use-tspu-status'
+import { PROBE_POINT_AGENT_IDS, useEffectiveServerStatus } from '@/hooks/use-tspu-status'
 import type { TrafficOverviewItem } from '@/hooks/use-traffic-overview'
 import type { ServerCostOverview } from '@/lib/api-schema'
 import { getLossTextClass, isLatencyFailure } from '@/lib/network-latency-constants'
@@ -100,6 +100,10 @@ const ServerCardInner = ({
   const isPending = status === 'pending'
   const isOffline = status === 'offline'
   const isTspu = status === 'tspu'
+  // Probe-point agents (RU-Panel-SPb, Vienna-EU) check OTHER nodes' ports —
+  // their own network-quality grid would show an aggregate of everything
+  // they probe, not their own link, so it's hidden rather than misleading.
+  const isProbePoint = PROBE_POINT_AGENT_IDS.has(server.id)
 
   const memoryPct = server.mem_total > 0 ? (server.mem_used / server.mem_total) * 100 : 0
   const diskPct = server.disk_total > 0 ? (server.disk_used / server.disk_total) * 100 : 0
@@ -260,34 +264,38 @@ const ServerCardInner = ({
           {/* Always reserve this slot (even with empty/padded probe history) so
               online and offline cards keep the same body structure and height.
               Offline tiles keep the visuals but drop tooltips — stale probe
-              breakdowns are not actionable while the agent is down. */}
-          <section aria-label={t('card_network_quality')} className="grid grid-cols-2 gap-x-3 gap-y-1">
-            <div className="flex items-baseline justify-between">
-              <span className="text-[10px] text-muted-foreground">{t('card_latency')}</span>
-              <NetworkMetricValue targets={currentTargets} tooltips={!isOffline}>
-                <span
-                  className={`cursor-default font-semibold text-xs tabular-nums ${latencyColorClass(currentAvgLatency, {
-                    failed: isLatencyFailure(currentAvgLossRatio)
-                  })}`}
-                >
-                  {formatLatency(currentAvgLatency)}
-                  <span className="ml-0.5 font-medium text-[10px] text-muted-foreground">ms</span>
-                </span>
-              </NetworkMetricValue>
-            </div>
-            <div className="flex items-baseline justify-between">
-              <span className="text-[10px] text-muted-foreground">{t('card_packet_loss')}</span>
-              <NetworkMetricValue targets={currentTargets} tooltips={!isOffline}>
-                <span
-                  className={`cursor-default font-semibold text-xs tabular-nums ${getLossTextClass(currentAvgLossRatio)}`}
-                >
-                  {formatPacketLoss(currentAvgLossRatio)}
-                </span>
-              </NetworkMetricValue>
-            </div>
-            <NetworkSquareGrid kind="latency" points={latencyPoints} tooltips={!isOffline} />
-            <NetworkSquareGrid kind="loss" points={lossPoints} tooltips={!isOffline} />
-          </section>
+              breakdowns are not actionable while the agent is down. Skipped
+              entirely for probe-point agents (see isProbePoint above) since
+              their own grid would mix every node they check into one trend. */}
+          {!isProbePoint && (
+            <section aria-label={t('card_network_quality')} className="grid grid-cols-2 gap-x-3 gap-y-1">
+              <div className="flex items-baseline justify-between">
+                <span className="text-[10px] text-muted-foreground">{t('card_latency')}</span>
+                <NetworkMetricValue targets={currentTargets} tooltips={!isOffline}>
+                  <span
+                    className={`cursor-default font-semibold text-xs tabular-nums ${latencyColorClass(currentAvgLatency, {
+                      failed: isLatencyFailure(currentAvgLossRatio)
+                    })}`}
+                  >
+                    {formatLatency(currentAvgLatency)}
+                    <span className="ml-0.5 font-medium text-[10px] text-muted-foreground">ms</span>
+                  </span>
+                </NetworkMetricValue>
+              </div>
+              <div className="flex items-baseline justify-between">
+                <span className="text-[10px] text-muted-foreground">{t('card_packet_loss')}</span>
+                <NetworkMetricValue targets={currentTargets} tooltips={!isOffline}>
+                  <span
+                    className={`cursor-default font-semibold text-xs tabular-nums ${getLossTextClass(currentAvgLossRatio)}`}
+                  >
+                    {formatPacketLoss(currentAvgLossRatio)}
+                  </span>
+                </NetworkMetricValue>
+              </div>
+              <NetworkSquareGrid kind="latency" points={latencyPoints} tooltips={!isOffline} />
+              <NetworkSquareGrid kind="loss" points={lossPoints} tooltips={!isOffline} />
+            </section>
+          )}
 
           <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
             <div className="flex items-baseline justify-between">
