@@ -57,6 +57,7 @@ export interface ServerMetrics extends LiveMetrics {
   features?: string[]
   group_id: string | null
   has_token?: boolean
+  ipv4?: string | null
   mem_total: number
   os: string | null
   outstanding_enrollment?: OutstandingEnrollmentSummary | null
@@ -114,6 +115,7 @@ function blankServerMetrics(id: string): ServerMetrics {
     group_id: null,
     has_token: false,
     id,
+    ipv4: null,
     last_active: 0,
     load1: 0,
     load5: 0,
@@ -159,6 +161,7 @@ function projectRestServer(current: ServerMetrics, server: ServerResponse): Serv
     features: [...server.features],
     group_id: server.group_id === undefined ? current.group_id : server.group_id,
     has_token: server.has_token,
+    ipv4: server.ipv4 === undefined ? current.ipv4 : server.ipv4,
     mem_total: server.mem_total === undefined ? current.mem_total : (server.mem_total ?? 0),
     name: server.name,
     os: server.os === undefined ? current.os : server.os,
@@ -186,6 +189,7 @@ function projectFullSyncServerToRest(current: ServerResponse, server: ServerMetr
     features: server.features === undefined ? current.features : [...server.features],
     group_id: server.group_id,
     has_token: server.has_token === undefined ? current.has_token : server.has_token,
+    ipv4: server.ipv4 === undefined ? current.ipv4 : server.ipv4,
     name: server.name,
     os: server.os,
     outstanding_enrollment:

@@ -87,7 +87,7 @@ const ServerCardInner = ({
   const upgradeJob = useUpgradeJobsStore((state) => state.jobs.get(server.id))
 
   const rawStatus = deriveServerStatus(server)
-  const tspuStatus = useTspuStatus(server.name)
+  const tspuStatus = useTspuStatus(server.ipv4 ?? null)
   // 'blocked' means the EU vantage point reaches the node but RU doesn't, so
   // it overrides offline/pending too — an agent that can never reach the
   // panel because of the same RU block would otherwise show as a plain
