@@ -371,10 +371,10 @@ function AddServerBasicFields({
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="__none__">{t('add_server.category_none')}</SelectItem>
-            <SelectItem value="Сайт">{t('add_server.category_site')}</SelectItem>
-            <SelectItem value="Нода">{t('add_server.category_node')}</SelectItem>
-            <SelectItem value="Бот">{t('add_server.category_bot')}</SelectItem>
-            <SelectItem value="Панель Remnawave">{t('add_server.category_panel')}</SelectItem>
+            <SelectItem value="site">{t('add_server.category_site')}</SelectItem>
+            <SelectItem value="node">{t('add_server.category_node')}</SelectItem>
+            <SelectItem value="bot">{t('add_server.category_bot')}</SelectItem>
+            <SelectItem value="remnawave-panel">{t('add_server.category_panel')}</SelectItem>
           </SelectContent>
         </Select>
       </Field>

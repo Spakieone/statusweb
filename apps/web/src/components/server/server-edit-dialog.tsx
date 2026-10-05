@@ -271,13 +271,13 @@ function ServerEditBasicFields({
             if (value === null) {
               return
             }
-            const CATEGORY_VALUES = ['Сайт', 'Нода', 'Бот', 'Панель Remnawave']
+            const CATEGORY_VALUES = ['site', 'node', 'bot', 'remnawave-panel']
             const existing = parseTagsInput(tagsInput).tags.filter((tag) => !CATEGORY_VALUES.includes(tag))
             const next = value === '__none__' ? existing : [...new Set([value, ...existing])].sort()
             dispatch({ type: 'patch', value: { tagsDraft: { dirty: true, value: next.join(', ') } } })
           }}
           value={
-            ['Сайт', 'Нода', 'Бот', 'Панель Remnawave'].find((cat) => parseTagsInput(tagsInput).tags.includes(cat)) ??
+            ['site', 'node', 'bot', 'remnawave-panel'].find((cat) => parseTagsInput(tagsInput).tags.includes(cat)) ??
             '__none__'
           }
         >
@@ -286,10 +286,10 @@ function ServerEditBasicFields({
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="__none__">{t('add_server.category_none', { defaultValue: 'Без категории' })}</SelectItem>
-            <SelectItem value="Сайт">{t('add_server.category_site', { defaultValue: 'Сайт' })}</SelectItem>
-            <SelectItem value="Нода">{t('add_server.category_node', { defaultValue: 'Нода' })}</SelectItem>
-            <SelectItem value="Бот">{t('add_server.category_bot', { defaultValue: 'Бот' })}</SelectItem>
-            <SelectItem value="Панель Remnawave">
+            <SelectItem value="site">{t('add_server.category_site', { defaultValue: 'Сайт' })}</SelectItem>
+            <SelectItem value="node">{t('add_server.category_node', { defaultValue: 'Нода' })}</SelectItem>
+            <SelectItem value="bot">{t('add_server.category_bot', { defaultValue: 'Бот' })}</SelectItem>
+            <SelectItem value="remnawave-panel">
               {t('add_server.category_panel', { defaultValue: 'Панель Remnawave' })}
             </SelectItem>
           </SelectContent>
