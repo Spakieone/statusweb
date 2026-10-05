@@ -1,4 +1,5 @@
 import { useNetworkServerSummary, useNetworkTargets } from '@/hooks/use-network-api'
+import type { NetworkProbeTarget } from '@/lib/network-types'
 
 // Hardcoded probe-point agents used as RU/EU vantage points for TSPU (DPI
 // blocking) detection. There is no DB field yet marking which servers act as
@@ -19,28 +20,44 @@ function isTargetAvailable(
   return matches.every((t) => t.availability > 0)
 }
 
+// A server never reports ipv4 over REST until its own agent has connected at
+// least once — but a server that's permanently TSPU-blocked may never get
+// that far (that's the whole point: it can't reach the panel from RU). Fall
+// back to matching the probe target's name against the server name (the
+// convention tspu-add-node.sh uses: "<server-name>-<port>") so a blocked,
+// never-connected server can still surface as 'blocked' instead of forever
+// looking like an unrelated 'pending' ghost card.
+function targetIdsByName(targets: NetworkProbeTarget[], serverName: string): Set<string> {
+  return new Set(targets.filter((t) => t.name.startsWith(`${serverName}-`)).map((t) => t.id))
+}
+
+function targetIdsByIp(targets: NetworkProbeTarget[], serverIp: string): Set<string> {
+  return new Set(targets.filter((t) => t.target.startsWith(`${serverIp}:`)).map((t) => t.id))
+}
+
 // Compares the same node's reachability as seen from the RU vantage point vs
-// the EU (Vienna) vantage point. Matches by IP (via the target's "ip:port"
-// field), not by server name — tspu-add-node.sh bakes the node's name into
-// the target name at creation time, and names get renamed in the UI, but a
-// server's IP is stable, so matching on it survives renames.
-export function useTspuStatus(serverIp: string | null): TspuStatus {
+// the EU (Vienna) vantage point. Prefers matching by IP (stable across
+// renames), falling back to name-based matching for servers that have no
+// ipv4 yet (see targetIdsByName above).
+export function useTspuStatus(serverName: string, serverIp: string | null): TspuStatus {
   const { data: allTargets } = useNetworkTargets()
   const { data: ruSummary } = useNetworkServerSummary(RU_AGENT_ID)
   const { data: euSummary } = useNetworkServerSummary(EU_AGENT_ID)
 
-  const targetIdsForIp = new Set(
-    (allTargets ?? [])
-      .filter((t) => serverIp && t.target.startsWith(`${serverIp}:`))
-      .map((t) => t.id)
-  )
+  const targets = allTargets ?? []
+  const targetIds = serverIp ? targetIdsByIp(targets, serverIp) : new Set<string>()
+  if (targetIds.size === 0) {
+    for (const id of targetIdsByName(targets, serverName)) {
+      targetIds.add(id)
+    }
+  }
 
-  if (targetIdsForIp.size === 0) {
+  if (targetIds.size === 0) {
     return 'unknown'
   }
 
-  const ruOk = isTargetAvailable(ruSummary?.targets, targetIdsForIp)
-  const euOk = isTargetAvailable(euSummary?.targets, targetIdsForIp)
+  const ruOk = isTargetAvailable(ruSummary?.targets, targetIds)
+  const euOk = isTargetAvailable(euSummary?.targets, targetIds)
 
   if (ruOk === null || euOk === null) {
     return 'unknown'
