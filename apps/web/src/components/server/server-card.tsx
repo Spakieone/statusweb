@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { CompactMetric } from '@/components/server/compact-metric'
 import { MetricValue } from '@/components/server/metric-value'
 import { useNetworkRealtime } from '@/hooks/use-network-realtime'
+import { useTspuStatus } from '@/hooks/use-tspu-status'
 import type { TrafficOverviewItem } from '@/hooks/use-traffic-overview'
 import type { ServerCostOverview } from '@/lib/api-schema'
 import { getLossTextClass, isLatencyFailure } from '@/lib/network-latency-constants'
@@ -85,9 +86,12 @@ const ServerCardInner = ({
   const { data: realtimeData } = useNetworkRealtime(server.id)
   const upgradeJob = useUpgradeJobsStore((state) => state.jobs.get(server.id))
 
-  const status = deriveServerStatus(server)
+  const rawStatus = deriveServerStatus(server)
+  const tspuStatus = useTspuStatus(server.name)
+  const status = rawStatus === 'online' && tspuStatus === 'blocked' ? 'tspu' : rawStatus
   const isPending = status === 'pending'
   const isOffline = status === 'offline'
+  const isTspu = status === 'tspu'
 
   const memoryPct = server.mem_total > 0 ? (server.mem_used / server.mem_total) * 100 : 0
   const diskPct = server.disk_total > 0 ? (server.disk_used / server.disk_total) * 100 : 0
@@ -121,7 +125,11 @@ const ServerCardInner = ({
         // card is scannable next to online tiles. Keep the StatusBadge (and
         // title) outside any grayscale filter so the red offline pill stays
         // saturated — that is the primary status cue.
-        isOffline && 'bg-muted/70 ring-destructive/35 dark:bg-muted/55 dark:ring-destructive/45'
+        isOffline && 'bg-muted/70 ring-destructive/35 dark:bg-muted/55 dark:ring-destructive/45',
+        // TSPU: the node itself is up (EU vantage point reaches it), only RU
+        // reachability is blocked, so tint the ring orange without dimming
+        // the metrics the way a real offline card is dimmed.
+        isTspu && 'ring-orange-500/40 dark:ring-orange-400/40'
       )}
     >
       <div className="flex items-center justify-between">

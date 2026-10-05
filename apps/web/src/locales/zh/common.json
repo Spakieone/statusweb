@@ -59,6 +59,7 @@
     "online": "在线",
     "offline": "离线",
     "pending": "待检查",
+    "tspu": "疑似被封锁",
     "ok": "正常",
     "never": "从未",
     "notChecked": "未检查"

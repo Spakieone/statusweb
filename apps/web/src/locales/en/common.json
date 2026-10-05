@@ -84,6 +84,7 @@
     "online": "Online",
     "offline": "Offline",
     "pending": "Pending",
+    "tspu": "Blocked (DPI)",
     "ok": "OK",
     "never": "Never",
     "notChecked": "Not checked"
