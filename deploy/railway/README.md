@@ -124,7 +124,7 @@ There is no admin username/password variable. On first start the server auto-cre
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SERVERBEE_UPGRADE__RELEASE_BASE_URL` | `https://github.com/ZingerLittleBee/ServerBee/releases` | Base URL for agent upgrade release assets |
+| `SERVERBEE_UPGRADE__RELEASE_BASE_URL` | `https://github.com/Spakieone/statusweb/releases` | Base URL for agent upgrade release assets |
 
 </details>
 

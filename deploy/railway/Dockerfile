@@ -91,7 +91,7 @@ ENV SERVERBEE_LOG__LEVEL=info
 
 # ── Upgrade ─────────────────────────────────────────────────────
 # Base URL for agent upgrade release assets
-ENV SERVERBEE_UPGRADE__RELEASE_BASE_URL=https://github.com/ZingerLittleBee/ServerBee/releases
+ENV SERVERBEE_UPGRADE__RELEASE_BASE_URL=https://github.com/Spakieone/statusweb/releases
 
 # Railway assigns a dynamic PORT — bridge it to SERVERBEE_SERVER__LISTEN
 CMD ["sh", "-c", "SERVERBEE_SERVER__LISTEN=0.0.0.0:${PORT:-9527} exec serverbee-server"]

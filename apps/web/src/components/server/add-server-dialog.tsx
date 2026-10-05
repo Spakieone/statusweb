@@ -618,7 +618,7 @@ export function AddServerDialog({ open, onClose }: { onClose: () => void; open: 
   const capabilitySelection = resolveAgentCapabilitySelection(state.selectedCaps)
   const issued = state.issued
   const installCommand = issued?.enrollment
-    ? `curl -fsSL https://raw.githubusercontent.com/ZingerLittleBee/ServerBee/main/deploy/install.sh | sudo bash -s -- agent --server-url '${origin}' --enrollment-code '${issued.enrollment.code}'${capabilitySelection.installArgument}`
+    ? `curl -fsSL https://raw.githubusercontent.com/Spakieone/statusweb/main/deploy/install.sh | sudo bash -s -- agent --server-url '${origin}' --enrollment-code '${issued.enrollment.code}'${capabilitySelection.installArgument}`
     : ''
 
   const toggleCap = (key: string) => {

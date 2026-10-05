@@ -199,7 +199,7 @@ pub struct UpgradeConfig {
 
 fn default_release_repo() -> String {
     option_env!("SERVERBEE_RELEASE_REPO")
-        .unwrap_or("https://github.com/ZingerLittleBee/ServerBee/releases")
+        .unwrap_or("https://github.com/Spakieone/statusweb/releases")
         .to_string()
 }
 
@@ -438,7 +438,7 @@ mod tests {
         let c = UpgradeConfig::default();
         assert_eq!(
             c.release_repo_url,
-            "https://github.com/ZingerLittleBee/ServerBee/releases"
+            "https://github.com/Spakieone/statusweb/releases"
         );
         assert!(c.release_cert_spki_sha256.is_empty());
     }

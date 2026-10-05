@@ -243,7 +243,7 @@ function AgentReenrollmentDialogContent({
   const origin = typeof window !== 'undefined' ? window.location.origin : ''
   const capabilitySelection = resolveAgentCapabilitySelection(selectedCaps)
   const installCommand = issued
-    ? `curl -fsSL https://raw.githubusercontent.com/ZingerLittleBee/ServerBee/main/deploy/install.sh | sudo bash -s -- agent --server-url '${origin}' --enrollment-code '${issued.enrollment.code}'${capabilitySelection.installArgument}`
+    ? `curl -fsSL https://raw.githubusercontent.com/Spakieone/statusweb/main/deploy/install.sh | sudo bash -s -- agent --server-url '${origin}' --enrollment-code '${issued.enrollment.code}'${capabilitySelection.installArgument}`
     : ''
 
   const toggleCap = (key: string) => {

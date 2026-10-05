@@ -678,7 +678,7 @@ mod tests {
         assert_eq!(
             derived,
             Some(
-                "https://api.github.com/repos/ZingerLittleBee/ServerBee/releases/latest"
+                "https://api.github.com/repos/Spakieone/statusweb/releases/latest"
                     .to_string()
             )
         );

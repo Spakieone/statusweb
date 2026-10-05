@@ -298,7 +298,7 @@ pub struct UpgradeConfig {
 }
 
 fn default_release_base_url() -> String {
-    "https://github.com/ZingerLittleBee/ServerBee/releases".to_string()
+    "https://github.com/Spakieone/statusweb/releases".to_string()
 }
 
 impl Default for UpgradeConfig {
