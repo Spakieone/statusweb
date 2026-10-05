@@ -88,7 +88,11 @@ const ServerCardInner = ({
 
   const rawStatus = deriveServerStatus(server)
   const tspuStatus = useTspuStatus(server.name)
-  const status = rawStatus === 'online' && tspuStatus === 'blocked' ? 'tspu' : rawStatus
+  // 'blocked' means the EU vantage point reaches the node but RU doesn't, so
+  // it overrides offline/pending too — an agent that can never reach the
+  // panel because of the same RU block would otherwise show as a plain
+  // "pending" ghost card forever instead of the more informative TSPU badge.
+  const status = tspuStatus === 'blocked' ? 'tspu' : rawStatus
   const isPending = status === 'pending'
   const isOffline = status === 'offline'
   const isTspu = status === 'tspu'
