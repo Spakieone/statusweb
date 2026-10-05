@@ -1,4 +1,6 @@
 import { useNetworkServerSummary, useNetworkTargets } from '@/hooks/use-network-api'
+import { deriveServerStatus, type StatusKind } from '@/components/server/status-dot-utils'
+import type { AgentAuthorityStateSummary } from '@/lib/api-schema'
 import type { NetworkProbeTarget } from '@/lib/network-types'
 
 // Hardcoded probe-point agents used as RU/EU vantage points for TSPU (DPI
@@ -69,4 +71,20 @@ export function useTspuStatus(serverName: string, serverIp: string | null): Tspu
     return 'blocked'
   }
   return 'unavailable'
+}
+
+// Shared by every place that renders a server's status dot/badge (server
+// cards, the servers table's status column and name cell) so TSPU overrides
+// offline/pending consistently everywhere instead of only on the dashboard
+// cards.
+export function useEffectiveServerStatus(server: {
+  agent_authority?: AgentAuthorityStateSummary
+  has_token?: boolean
+  ipv4?: string | null
+  name: string
+  online: boolean
+}): StatusKind | 'tspu' {
+  const rawStatus = deriveServerStatus(server)
+  const tspuStatus = useTspuStatus(server.name, server.ipv4 ?? null)
+  return tspuStatus === 'blocked' ? 'tspu' : rawStatus
 }

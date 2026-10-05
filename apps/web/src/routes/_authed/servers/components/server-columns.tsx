@@ -3,14 +3,19 @@ import { CircleDot, ExternalLink, Tag } from 'lucide-react'
 import { DataTableColumnHeader } from '@/components/data-table/data-table-column-header'
 import { CostCell } from '@/components/server/cost-cell'
 import { StatusDot } from '@/components/server/status-dot'
-import { deriveServerStatus } from '@/components/server/status-dot-utils'
 import { Checkbox } from '@/components/ui/checkbox'
+import { useEffectiveServerStatus } from '@/hooks/use-tspu-status'
 import type { TrafficOverviewItem } from '@/hooks/use-traffic-overview'
 import type { ServerCostOverview } from '@/lib/api-schema'
 import type { ServerMetrics } from '@/lib/server-catalog'
 import { cn } from '@/lib/utils'
 import { CpuCell, DiskCell, MemoryCell, NameCell, NetworkCell, UptimeCell } from './index-cells'
 import { UpgradeBadgeCell } from './upgrade-badge-cell'
+
+function StatusDotCell({ server }: { server: ServerMetrics }) {
+  const status = useEffectiveServerStatus(server)
+  return <StatusDot status={status} />
+}
 
 const arrayIncludesFilter = (row: { getValue: (id: string) => unknown }, id: string, value: unknown) => {
   if (!Array.isArray(value) || value.length === 0) {
@@ -72,7 +77,7 @@ export function buildServerColumns({
       accessorFn: (row) => (row.online ? 'online' : 'offline'),
       enableSorting: false,
       header: () => null,
-      cell: ({ row }) => <StatusDot status={deriveServerStatus(row.original)} />,
+      cell: ({ row }) => <StatusDotCell server={row.original} />,
       filterFn: arrayIncludesFilter,
       enableColumnFilter: true,
       size: 36,

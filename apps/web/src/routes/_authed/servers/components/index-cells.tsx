@@ -5,8 +5,8 @@ import { useTranslation } from 'react-i18next'
 import { CountryFlag } from '@/components/country-flag'
 import { MetricValue } from '@/components/server/metric-value'
 import { StatusDot } from '@/components/server/status-dot'
-import { deriveServerStatus } from '@/components/server/status-dot-utils'
 import { TagChipRow } from '@/components/server/tag-chip'
+import { useEffectiveServerStatus } from '@/hooks/use-tspu-status'
 import type { TrafficOverviewItem } from '@/hooks/use-traffic-overview'
 import type { ServerMetrics } from '@/lib/server-catalog'
 import { computeTrafficQuota } from '@/lib/traffic'
@@ -244,9 +244,10 @@ export function UptimeCell({ server }: { server: ServerMetrics }) {
 }
 
 export function NameCell({ server, rightSlot }: { rightSlot?: ReactNode; server: ServerMetrics }) {
+  const status = useEffectiveServerStatus(server)
   return (
     <div className="flex min-w-0 items-center gap-2">
-      <StatusDot className="flex-none" status={deriveServerStatus(server)} />
+      <StatusDot className="flex-none" status={status} />
       <div className="flex min-w-0 flex-col">
         <div className="flex min-w-0 items-center gap-1.5">
           <Link

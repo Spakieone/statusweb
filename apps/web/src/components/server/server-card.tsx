@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { CompactMetric } from '@/components/server/compact-metric'
 import { MetricValue } from '@/components/server/metric-value'
 import { useNetworkRealtime } from '@/hooks/use-network-realtime'
-import { useTspuStatus } from '@/hooks/use-tspu-status'
+import { useEffectiveServerStatus } from '@/hooks/use-tspu-status'
 import type { TrafficOverviewItem } from '@/hooks/use-traffic-overview'
 import type { ServerCostOverview } from '@/lib/api-schema'
 import { getLossTextClass, isLatencyFailure } from '@/lib/network-latency-constants'
@@ -23,7 +23,6 @@ import { PendingEnrollmentSummary } from './pending-enrollment-summary'
 import { RingMetric } from './ring-metric'
 import { buildServerCardNetworkState } from './server-card-network-data'
 import { StatusBadge } from './status-badge'
-import { deriveServerStatus } from './status-dot-utils'
 import { TagChips } from './tag-chips'
 import { UpgradeJobBadge } from './upgrade-job-badge'
 
@@ -86,13 +85,7 @@ const ServerCardInner = ({
   const { data: realtimeData } = useNetworkRealtime(server.id)
   const upgradeJob = useUpgradeJobsStore((state) => state.jobs.get(server.id))
 
-  const rawStatus = deriveServerStatus(server)
-  const tspuStatus = useTspuStatus(server.name, server.ipv4 ?? null)
-  // 'blocked' means the EU vantage point reaches the node but RU doesn't, so
-  // it overrides offline/pending too — an agent that can never reach the
-  // panel because of the same RU block would otherwise show as a plain
-  // "pending" ghost card forever instead of the more informative TSPU badge.
-  const status = tspuStatus === 'blocked' ? 'tspu' : rawStatus
+  const status = useEffectiveServerStatus(server)
   const isPending = status === 'pending'
   const isOffline = status === 'offline'
   const isTspu = status === 'tspu'
